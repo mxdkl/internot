@@ -1,0 +1,7 @@
+---
+source: procedural_core/tests/snapshot.rs
+expression: snapshot
+---
+where_eq(a, 3) count = 16, sorted = [3, 19, 35, 51, 67, 83, 99, 115, 131, 147, 163, 179, 195, 211, 227, 243]
+where_eq(a, 3) + where_range(b, 5, 10) count = 6, sorted = [83, 99, 115, 131, 147, 163]
+where_in(a, [1,2]) + where_in(b, [0,4,8]) count = 6, sorted = [1, 2, 65, 66, 129, 130]

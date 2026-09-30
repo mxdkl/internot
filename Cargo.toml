@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "procedural_core",
+    "procedural_overlay",
+    "internot",
+    "internot_mcp",
+    "internot_renderer",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+ordered-float = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Opt-in profile for sampling profilers (samply, perf). Inherits release
+# optimizations, adds full debug info so source-level call stacks resolve.
+# Combine with `RUSTFLAGS="-C force-frame-pointers=yes"` when profiling on
+# x86_64 — the default release profile omits frame pointers, which causes
+# samply/perf to collapse stacks. Use:
+#   RUSTFLAGS="-C force-frame-pointers=yes" \
+#     cargo build --profile profiling --example profile_harness -p procedural_core
+[profile.profiling]
+inherits = "release"
+debug = 2
+split-debuginfo = "off"
+strip = false

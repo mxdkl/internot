@@ -1,0 +1,135 @@
+{
+  "US": {
+    "native": true
+  },
+  "GB": {
+    "native": true
+  },
+  "JP": {
+    "native": false,
+    "epi_score": 446,
+    "distribution": {
+      "Fluent": 0.05,
+      "Conversational": 0.2,
+      "Basic": 0.3,
+      "None": 0.45
+    }
+  },
+  "DE": {
+    "native": false,
+    "epi_score": 615,
+    "distribution": {
+      "Fluent": 0.55,
+      "Conversational": 0.3,
+      "Basic": 0.1,
+      "None": 0.05
+    }
+  },
+  "FR": {
+    "native": false,
+    "epi_score": 539,
+    "distribution": {
+      "Fluent": 0.2,
+      "Conversational": 0.4,
+      "Basic": 0.25,
+      "None": 0.15
+    }
+  },
+  "BR": {
+    "native": false,
+    "epi_score": 482,
+    "distribution": {
+      "Fluent": 0.1,
+      "Conversational": 0.3,
+      "Basic": 0.3,
+      "None": 0.3
+    }
+  },
+  "IN": {
+    "native": false,
+    "epi_score": 484,
+    "distribution": {
+      "Fluent": 0.1,
+      "Conversational": 0.3,
+      "Basic": 0.3,
+      "None": 0.3
+    }
+  },
+  "CN": {
+    "native": false,
+    "epi_score": 464,
+    "distribution": {
+      "Fluent": 0.1,
+      "Conversational": 0.3,
+      "Basic": 0.3,
+      "None": 0.3
+    }
+  },
+  "MX": {
+    "native": false,
+    "epi_score": 440,
+    "distribution": {
+      "Fluent": 0.05,
+      "Conversational": 0.2,
+      "Basic": 0.3,
+      "None": 0.45
+    }
+  },
+  "ES": {
+    "native": false,
+    "epi_score": 540,
+    "distribution": {
+      "Fluent": 0.2,
+      "Conversational": 0.4,
+      "Basic": 0.25,
+      "None": 0.15
+    }
+  },
+  "IT": {
+    "native": false,
+    "epi_score": 513,
+    "distribution": {
+      "Fluent": 0.2,
+      "Conversational": 0.4,
+      "Basic": 0.25,
+      "None": 0.15
+    }
+  },
+  "CA": {
+    "native": true
+  },
+  "AR": {
+    "native": false,
+    "epi_score": 575,
+    "distribution": {
+      "Fluent": 0.35,
+      "Conversational": 0.4,
+      "Basic": 0.15,
+      "None": 0.1
+    }
+  },
+  "NG": {
+    "native": true
+  },
+  "KR": {
+    "native": false,
+    "epi_score": 522,
+    "distribution": {
+      "Fluent": 0.2,
+      "Conversational": 0.4,
+      "Basic": 0.25,
+      "None": 0.15
+    }
+  },
+  "EG": {
+    "native": false,
+    "epi_score": 459,
+    "distribution": {
+      "Fluent": 0.1,
+      "Conversational": 0.3,
+      "Basic": 0.3,
+      "None": 0.3
+    }
+  },
+  "_doc": "English-as-second-language proficiency by country, calibrated to EF EPI 2025 score bands. 'distribution' fields sum to 1.0; substrate hash-picks each person's level. Source: https://en.wikipedia.org/wiki/EF_English_Proficiency_Index"
+}

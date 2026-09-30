@@ -1,0 +1,13 @@
+[project]
+name = "mcp-harness"
+version = "0.1.0"
+description = "OpenAI scenarios driving the internot-mcp stdio server"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.50",
+    "mcp>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[tool.uv]
+package = false

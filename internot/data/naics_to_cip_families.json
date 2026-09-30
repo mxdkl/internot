@@ -1,0 +1,26 @@
+{
+  "_doc": "Maps NAICS sector index (0..19) to a list of CIP 2-digit family codes that commonly lead to that industry. Hand-curated based on common career-pathway intuition. Used to weight a person's field-of-study toward their cohort industry.",
+  "_source": "Internot synthesis from NCES CIP + NAICS conventions",
+  "mapping": [
+    ["01", "03", "26"],
+    ["14", "15", "40"],
+    ["14", "15"],
+    ["04", "14", "15", "46"],
+    ["14", "15", "47", "48"],
+    ["52"],
+    ["52", "12"],
+    ["49", "14", "52"],
+    ["11", "09", "50", "27"],
+    ["52", "27", "45"],
+    ["52", "04"],
+    ["11", "14", "22", "26", "27", "40", "42", "45", "52"],
+    ["52"],
+    ["52", "11"],
+    ["13", "24"],
+    ["51", "26", "42", "31"],
+    ["50", "09", "31"],
+    ["12", "52"],
+    ["52", "47", "12"],
+    ["44", "22", "45"]
+  ]
+}

@@ -1,0 +1,12 @@
+---
+source: procedural_core/tests/snapshot.rs
+assertion_line: 135
+expression: snapshot
+---
+hash_float(0x123456789abcdeffedcba9876543210, "age") = 0.7264784849161814
+hash_int(0x123456789abcdeffedcba9876543210, "locale", 256) = 166
+hash_gaussian(0x123456789abcdeffedcba9876543210, "z") = 0.7249119443992658
+smooth(0x123456789abcdeffedcba9876543210, t0, 1.0, 30d) = 0.43413374198999805
+pareto(0x123456789abcdeffedcba9876543210, "size", 1.5, 1.0) = 1.101322466872525
+lognormal(0x123456789abcdeffedcba9876543210, "income", 10.0, 0.5) = 19446.308549410685
+BitLayout<u128>.compose(a=0xAB, b=0xFFFF, c=0xCDE, d=0x0FFFFFFFFFFFFFFF) = 0xfffffffffffffffcdeffffab

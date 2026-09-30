@@ -1,0 +1,114 @@
+{
+  "US": [
+    {
+      "code": "eng",
+      "name": "English"
+    }
+  ],
+  "GB": [
+    {
+      "code": "eng",
+      "name": "English"
+    }
+  ],
+  "JP": [
+    {
+      "code": "jpn",
+      "name": "Japanese"
+    }
+  ],
+  "DE": [
+    {
+      "code": "deu",
+      "name": "German"
+    }
+  ],
+  "FR": [
+    {
+      "code": "fra",
+      "name": "French"
+    }
+  ],
+  "BR": [
+    {
+      "code": "por",
+      "name": "Portuguese"
+    }
+  ],
+  "IN": [
+    {
+      "code": "eng",
+      "name": "English"
+    },
+    {
+      "code": "hin",
+      "name": "Hindi"
+    },
+    {
+      "code": "tam",
+      "name": "Tamil"
+    }
+  ],
+  "CN": [
+    {
+      "code": "zho",
+      "name": "Chinese"
+    }
+  ],
+  "MX": [
+    {
+      "code": "spa",
+      "name": "Spanish"
+    }
+  ],
+  "ES": [
+    {
+      "code": "spa",
+      "name": "Spanish"
+    }
+  ],
+  "IT": [
+    {
+      "code": "ita",
+      "name": "Italian"
+    }
+  ],
+  "CA": [
+    {
+      "code": "eng",
+      "name": "English"
+    },
+    {
+      "code": "fra",
+      "name": "French"
+    }
+  ],
+  "AR": [
+    {
+      "code": "grn",
+      "name": "Guaran\u00ed"
+    },
+    {
+      "code": "spa",
+      "name": "Spanish"
+    }
+  ],
+  "NG": [
+    {
+      "code": "eng",
+      "name": "English"
+    }
+  ],
+  "KR": [
+    {
+      "code": "kor",
+      "name": "Korean"
+    }
+  ],
+  "EG": [
+    {
+      "code": "ara",
+      "name": "Arabic"
+    }
+  ]
+}
