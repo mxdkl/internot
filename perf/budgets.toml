@@ -220,6 +220,10 @@ max_allocs = 0
 # design change (arrival cohorts, arrival cells and plans): 0.90 s, budget
 # ~2.2x. The spec's full-scale target is < 30 s and < 100 MB (§16.2); this
 # prototype budget guards the per-region cost.
+# R1c (2026-09-30): second unions took it to 4.28 s; the build work brought
+# it to 1.45 s on 16 threads (rayon; 3.44 s on one thread, 1.64 s on four).
+# The committed 1.04 s baseline predates R1c; it is re-recorded once the
+# stage B lookup regressions are fixed (AGENTS.md, R1c).
 [budget."kinship/world_build"]
 mode = "warm"
 p99_ns = 2_000_000_000

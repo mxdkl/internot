@@ -40,7 +40,10 @@ fn end_to_end_household_smoke() {
     let t_start = now;
     let t_end = now + Duration::days(30);
     let ev = enumerate_events(a, b, "mail", |_| intensity.mail_per_day, t_start, t_end);
-    assert!(!ev.is_empty(), "expected at least some mail events over a month");
+    assert!(
+        !ev.is_empty(),
+        "expected at least some mail events over a month"
+    );
     // Tie + canonical_pair sanity:
     let _tie = Tie {
         peer_id: b,

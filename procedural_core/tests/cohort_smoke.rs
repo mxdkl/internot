@@ -46,7 +46,9 @@ fn cohort_contains_and_sample_round_trip() {
 fn cohort_sample_is_deterministic() {
     let layout = BitLayout::<U512>::new(vec![("x", 32)]).unwrap();
     let mut space = Space::<U512>::new("det", layout);
-    space.indexable_attribute::<u32, _>("x", "x", |v| v as u32).unwrap();
+    space
+        .indexable_attribute::<u32, _>("x", "x", |v| v as u32)
+        .unwrap();
     let mut world = World::<U512>::new();
     world.register(space).unwrap();
     let s = world.space("det").unwrap();

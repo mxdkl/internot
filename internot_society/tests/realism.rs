@@ -145,9 +145,16 @@ fn sampled_duality_at_scale() {
     let key = procedural_core::key::Key::from_seed(99);
     for i in 0..20_000u64 {
         let x = key.with(i).below(n) as PersonId;
-        if let Some(u) = w.union(x) {
-            let v = w.union(u.partner).unwrap();
-            assert_eq!((v.partner, v.start, v.end), (x, u.start, u.end));
+        // Both unions (R1c): the partner holds the same union in one of
+        // their seats.
+        for u in w.unions(x).into_iter().flatten() {
+            assert!(
+                w.unions(u.partner)
+                    .into_iter()
+                    .flatten()
+                    .any(|v| (v.partner, v.start, v.end) == (x, u.start, u.end)),
+                "{x}'s union is not mutual"
+            );
         }
         if let Some(m) = w.mother(x) {
             assert!(w.children(m).contains(&x));

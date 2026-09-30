@@ -55,7 +55,9 @@ fn u256_layout_round_trip_compose_extract() {
 #[test]
 fn u256_world_registers_space() {
     let mut world = World::<U256>::new();
-    world.register(build_wide_space()).expect("register wide space");
+    world
+        .register(build_wide_space())
+        .expect("register wide space");
     assert!(world.has_space("wide"));
 }
 

@@ -100,8 +100,7 @@ fn composite_attribute_routes_through_world() {
     use procedural_core::space::Space;
     use procedural_core::world::World;
 
-    let layout =
-        BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("entropy", 8)]).unwrap();
+    let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("entropy", 8)]).unwrap();
     let mut space = Space::<u64>::new("s", layout.clone());
     space
         .indexable_composite_attribute::<String, _>("label", "own", &["shared"], |own, dep| {

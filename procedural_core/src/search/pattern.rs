@@ -91,7 +91,11 @@ impl BitPattern {
     /// Cost is O(free_bits).
     pub fn sample(&self, seed: u64, width: u8) -> u64 {
         assert!(width <= 64, "width must be ≤ 64");
-        let domain_mask: u64 = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let domain_mask: u64 = if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
         let free_mask = !self.mask & domain_mask;
         let mut id = self.fixed;
         let mut k: u32 = 0;
@@ -204,7 +208,10 @@ mod tests {
         assert_eq!(s0 & 0xFF00, 0xAB00, "pinned bits");
         assert_eq!(s1 & 0xFF00, 0xAB00, "pinned bits");
         assert_eq!(s99 & 0xFF00, 0xAB00, "pinned bits");
-        assert!(s0 != s1 || s0 != s99, "samples didn't vary — collision or bug");
+        assert!(
+            s0 != s1 || s0 != s99,
+            "samples didn't vary — collision or bug"
+        );
     }
 
     #[test]

@@ -126,19 +126,15 @@ fn composite_attribute_as_context_dim_scores_correctly() {
     use procedural_core::space::context::{ContextDim, Metric, Normalization};
     use procedural_core::space::Space;
 
-    let layout =
-        BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("entropy", 8)]).unwrap();
+    let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("entropy", 8)]).unwrap();
     let mut space = Space::<u64>::new("p", layout.clone());
 
     // Composite value = own * 16 + shared — a simple bijection onto [0, 255)
     // so we can predict similarity results.
     space
-        .indexable_composite_attribute::<u64, _>(
-            "encoded",
-            "own",
-            &["shared"],
-            |own, shared| own * 16 + shared[0],
-        )
+        .indexable_composite_attribute::<u64, _>("encoded", "own", &["shared"], |own, shared| {
+            own * 16 + shared[0]
+        })
         .unwrap();
     space
         .context(
@@ -174,7 +170,9 @@ fn composite_attribute_as_context_dim_scores_correctly() {
         assert!(
             (score - expected).abs() < 1e-9,
             "score for id with encoded={} should be {} but was {}",
-            encoded, expected, score
+            encoded,
+            expected,
+            score
         );
     }
 }
@@ -187,16 +185,12 @@ fn composite_attribute_with_u128_layout() {
     use procedural_core::space::Space;
     use procedural_core::world::World;
 
-    let layout =
-        BitLayout::<u128>::new(vec![("own", 6), ("shared", 8), ("entropy", 16)]).unwrap();
+    let layout = BitLayout::<u128>::new(vec![("own", 6), ("shared", 8), ("entropy", 16)]).unwrap();
     let mut space = Space::<u128>::new("wide", layout.clone());
     space
-        .indexable_composite_attribute::<String, _>(
-            "label",
-            "own",
-            &["shared"],
-            |own, shared| format!("w{}.{}", own, shared[0]),
-        )
+        .indexable_composite_attribute::<String, _>("label", "own", &["shared"], |own, shared| {
+            format!("w{}.{}", own, shared[0])
+        })
         .unwrap();
 
     let id = layout.compose(&[("own", 12u64), ("shared", 200u64)]);

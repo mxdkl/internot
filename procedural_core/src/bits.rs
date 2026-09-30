@@ -107,7 +107,10 @@ impl<W: BitWord> BitLayout<W> {
             debug_assert!(
                 width as u32 == 64 || *value < (1u64 << width),
                 "value {} overflows field {:?} of width {} (max {}) — caller bug",
-                value, name, width, (1u64 << width).saturating_sub(1)
+                value,
+                name,
+                width,
+                (1u64 << width).saturating_sub(1)
             );
             result = result.insert_bits(offset as u32, width as u32, *value);
         }

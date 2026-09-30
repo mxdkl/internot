@@ -51,7 +51,15 @@ pub fn enumerate_events<F>(
 where
     F: Fn(DateTime<Utc>) -> f64,
 {
-    enumerate_events_keyed(Key::from_seed(0), a, b, namespace, intensity, t_start, t_end)
+    enumerate_events_keyed(
+        Key::from_seed(0),
+        a,
+        b,
+        namespace,
+        intensity,
+        t_start,
+        t_end,
+    )
 }
 
 /// [`enumerate_events`] under an explicit world key.
@@ -82,7 +90,11 @@ where
     raw.into_iter()
         .map(|e| CommEvent {
             at: from_secs(e.t),
-            initiator: if e.key.with(INITIATOR).unit() < 0.5 { 0 } else { 1 },
+            initiator: if e.key.with(INITIATOR).unit() < 0.5 {
+                0
+            } else {
+                1
+            },
         })
         .collect()
 }

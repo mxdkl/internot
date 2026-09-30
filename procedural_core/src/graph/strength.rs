@@ -85,7 +85,8 @@ pub fn tie_strength(profile: &TieStrengthProfile, t_days: u32) -> f64 {
                 // Post-cohabit decay back to floor.
                 let elapsed_days = (t_days - end) as f64;
                 let head = profile.cohabit_peak - profile.base_floor;
-                let decay = head * crate::dmath::exp(-elapsed_days / profile.decay_tau_days.max(0.001));
+                let decay =
+                    head * crate::dmath::exp(-elapsed_days / profile.decay_tau_days.max(0.001));
                 s = profile.base_floor + decay.max(0.0);
             }
             // else t_days < start: pre-window, fall through to base_floor.

@@ -259,6 +259,18 @@ pub struct CompactPerm {
     b: u32,
 }
 
+/// A [`CompactPerm`] without its size: 24 bytes, for callers that already
+/// store the size (a table of many small permutations). Rebuild the
+/// permutation with [`CompactPerm::from_parts`]; that is a copy, not a
+/// recomputation.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactParts {
+    a_inv: u64,
+    seed: u64,
+    a: u32,
+    b: u32,
+}
+
 impl CompactPerm {
     /// A permutation of `[0, n)` keyed by `key`.
     pub fn new(n: u64, key: Key) -> Self {
@@ -269,6 +281,29 @@ impl CompactPerm {
             seed: key.bits(),
             a: a as u32,
             b: b as u32,
+        }
+    }
+
+    /// The permutation without its size (see [`CompactParts`]).
+    pub fn parts(&self) -> CompactParts {
+        CompactParts {
+            a_inv: self.a_inv,
+            seed: self.seed,
+            a: self.a,
+            b: self.b,
+        }
+    }
+
+    /// The permutation of `[0, n)` whose parts are `p`; `n` must be the size
+    /// it was built with.
+    #[inline]
+    pub fn from_parts(n: u64, p: CompactParts) -> Self {
+        Self {
+            n,
+            a_inv: p.a_inv,
+            seed: p.seed,
+            a: p.a,
+            b: p.b,
         }
     }
 
@@ -543,6 +578,19 @@ mod tests {
         assert_eq!(std::mem::size_of::<CompactPerm>(), 32);
         for n in 0..=2000u64 {
             assert_bijection(&CompactPerm::new(n, Key::from_seed(n)));
+        }
+    }
+
+    #[test]
+    fn compact_parts_rebuild_the_same_permutation() {
+        assert_eq!(std::mem::size_of::<CompactParts>(), 24);
+        for n in [1u64, 2, 7, 1000, 123_457] {
+            let p = CompactPerm::new(n, Key::from_seed(n));
+            let q = CompactPerm::from_parts(n, p.parts());
+            for x in (0..n).step_by((n as usize / 97).max(1)) {
+                assert_eq!(p.fwd(x), q.fwd(x));
+                assert_eq!(p.inv(x), q.inv(x));
+            }
         }
     }
 

@@ -995,8 +995,8 @@ mod tests {
         space.attribute::<i8, _>("a_i8", |_| 0).unwrap();
         space.attribute::<bool, _>("a_bool", |_| false).unwrap();
         let dims = [
-            "a_f64", "a_f32", "a_u64", "a_u32", "a_u16", "a_u8", "a_i64", "a_i32", "a_i16",
-            "a_i8", "a_bool",
+            "a_f64", "a_f32", "a_u64", "a_u32", "a_u16", "a_u8", "a_i64", "a_i32", "a_i16", "a_i8",
+            "a_bool",
         ]
         .iter()
         .map(|n| ContextDim {
@@ -1005,7 +1005,9 @@ mod tests {
             normalize: Normalization::None,
         })
         .collect();
-        space.context("everything", dims, Metric::Euclidean).unwrap();
+        space
+            .context("everything", dims, Metric::Euclidean)
+            .unwrap();
         assert!(space.has_context("everything"));
     }
 
@@ -1141,8 +1143,7 @@ mod tests {
         // attribute schema, so every registration path must surface its type.
         use crate::world::World;
         use std::any::TypeId;
-        let layout =
-            BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("rest", 56)]).unwrap();
+        let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4), ("rest", 56)]).unwrap();
         let mut space = Space::<u64>::new("p", layout);
         // Static
         space.attribute::<f64, _>("static_f64", |_| 0.0).unwrap();
@@ -1175,11 +1176,26 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(space.attribute_type_id("static_f64"), Some(TypeId::of::<f64>()));
-        assert_eq!(space.attribute_type_id("temporal_i64"), Some(TypeId::of::<i64>()));
-        assert_eq!(space.attribute_type_id("indexable_u64"), Some(TypeId::of::<u64>()));
-        assert_eq!(space.attribute_type_id("composite_str"), Some(TypeId::of::<String>()));
-        assert_eq!(space.attribute_type_id("cross_static_bool"), Some(TypeId::of::<bool>()));
+        assert_eq!(
+            space.attribute_type_id("static_f64"),
+            Some(TypeId::of::<f64>())
+        );
+        assert_eq!(
+            space.attribute_type_id("temporal_i64"),
+            Some(TypeId::of::<i64>())
+        );
+        assert_eq!(
+            space.attribute_type_id("indexable_u64"),
+            Some(TypeId::of::<u64>())
+        );
+        assert_eq!(
+            space.attribute_type_id("composite_str"),
+            Some(TypeId::of::<String>())
+        );
+        assert_eq!(
+            space.attribute_type_id("cross_static_bool"),
+            Some(TypeId::of::<bool>())
+        );
         assert_eq!(
             space.attribute_type_id("cross_temporal_f32"),
             Some(TypeId::of::<f32>())
@@ -1196,7 +1212,9 @@ mod tests {
         let mut space = Space::<u64>::new("p", layout);
         space.attribute::<f64, _>("a", |_| 0.0).unwrap();
         space.temporal_attribute::<i64, _>("b", |_, _| 0).unwrap();
-        space.indexable_attribute::<u64, _>("c", "own", |b| b).unwrap();
+        space
+            .indexable_attribute::<u64, _>("c", "own", |b| b)
+            .unwrap();
         space
             .indexable_composite_attribute::<String, _>("d", "own", &["shared"], |_, _| {
                 String::new()
@@ -1209,15 +1227,30 @@ mod tests {
             .cross_space_temporal_attribute::<f32, _>("f", |_, _, _: &World<u64>| 0.0f32)
             .unwrap();
 
-        assert_eq!(space.attribute_type_name("a"), Some(std::any::type_name::<f64>()));
-        assert_eq!(space.attribute_type_name("b"), Some(std::any::type_name::<i64>()));
-        assert_eq!(space.attribute_type_name("c"), Some(std::any::type_name::<u64>()));
+        assert_eq!(
+            space.attribute_type_name("a"),
+            Some(std::any::type_name::<f64>())
+        );
+        assert_eq!(
+            space.attribute_type_name("b"),
+            Some(std::any::type_name::<i64>())
+        );
+        assert_eq!(
+            space.attribute_type_name("c"),
+            Some(std::any::type_name::<u64>())
+        );
         assert_eq!(
             space.attribute_type_name("d"),
             Some(std::any::type_name::<String>())
         );
-        assert_eq!(space.attribute_type_name("e"), Some(std::any::type_name::<bool>()));
-        assert_eq!(space.attribute_type_name("f"), Some(std::any::type_name::<f32>()));
+        assert_eq!(
+            space.attribute_type_name("e"),
+            Some(std::any::type_name::<bool>())
+        );
+        assert_eq!(
+            space.attribute_type_name("f"),
+            Some(std::any::type_name::<f32>())
+        );
         assert_eq!(space.attribute_type_name("missing"), None);
     }
 
@@ -1292,8 +1325,7 @@ mod tests {
 
     #[test]
     fn composite_attribute_with_multiple_shared_fields() {
-        let layout =
-            BitLayout::<u64>::new(vec![("own", 4), ("a", 4), ("b", 4), ("c", 4)]).unwrap();
+        let layout = BitLayout::<u64>::new(vec![("own", 4), ("a", 4), ("b", 4), ("c", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout.clone());
 
         space
@@ -1319,12 +1351,9 @@ mod tests {
         let mut space = Space::<u64>::new("p", layout);
         space.attribute::<f64, _>("dup", |_| 0.0).unwrap();
         let err = space
-            .indexable_composite_attribute::<String, _>(
-                "dup",
-                "own",
-                &["shared"],
-                |_, _| String::new(),
-            )
+            .indexable_composite_attribute::<String, _>("dup", "own", &["shared"], |_, _| {
+                String::new()
+            })
             .unwrap_err();
         assert!(matches!(err, SpaceError::DuplicateAttributeName(ref n) if n == "dup"));
     }
@@ -1334,12 +1363,9 @@ mod tests {
         let layout = BitLayout::<u64>::new(vec![("x", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout);
         let err = space
-            .indexable_composite_attribute::<String, _>(
-                "bad",
-                "nonexistent",
-                &["x"],
-                |_, _| String::new(),
-            )
+            .indexable_composite_attribute::<String, _>("bad", "nonexistent", &["x"], |_, _| {
+                String::new()
+            })
             .unwrap_err();
         assert!(matches!(err, SpaceError::UnknownBitField(ref n) if n == "nonexistent"));
     }
@@ -1349,12 +1375,9 @@ mod tests {
         let layout = BitLayout::<u64>::new(vec![("own", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout);
         let err = space
-            .indexable_composite_attribute::<String, _>(
-                "bad",
-                "own",
-                &["missing_dep"],
-                |_, _| String::new(),
-            )
+            .indexable_composite_attribute::<String, _>("bad", "own", &["missing_dep"], |_, _| {
+                String::new()
+            })
             .unwrap_err();
         assert!(matches!(err, SpaceError::UnknownBitField(ref n) if n == "missing_dep"));
     }
@@ -1381,12 +1404,9 @@ mod tests {
         let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout.clone());
         space
-            .indexable_composite_attribute::<String, _>(
-                "label",
-                "own",
-                &["shared"],
-                |own, _| format!("{}", own),
-            )
+            .indexable_composite_attribute::<String, _>("label", "own", &["shared"], |own, _| {
+                format!("{}", own)
+            })
             .unwrap();
         let id = layout.compose(&[("own", 1), ("shared", 0)]);
         let err = space.attribute_value::<u64>(id, "label", None).unwrap_err();
@@ -1396,17 +1416,13 @@ mod tests {
     #[test]
     fn attribute_indexable_fields_reports_deps() {
         let layout =
-            BitLayout::<u64>::new(vec![("own", 4), ("a", 4), ("b", 4), ("hash_attr", 4)])
-                .unwrap();
+            BitLayout::<u64>::new(vec![("own", 4), ("a", 4), ("b", 4), ("hash_attr", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout);
 
         space
-            .indexable_composite_attribute::<String, _>(
-                "composite",
-                "own",
-                &["a", "b"],
-                |_, _| String::new(),
-            )
+            .indexable_composite_attribute::<String, _>("composite", "own", &["a", "b"], |_, _| {
+                String::new()
+            })
             .unwrap();
         space
             .indexable_attribute::<String, _>("single", "a", |_| String::new())
@@ -1437,12 +1453,9 @@ mod tests {
         let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout);
         space
-            .indexable_composite_attribute::<String, _>(
-                "label",
-                "own",
-                &["shared"],
-                |_, _| String::new(),
-            )
+            .indexable_composite_attribute::<String, _>("label", "own", &["shared"], |_, _| {
+                String::new()
+            })
             .unwrap();
         assert_eq!(space.is_temporal("label"), Some(false));
     }
@@ -1473,12 +1486,9 @@ mod tests {
         let layout = BitLayout::<u64>::new(vec![("own", 4), ("shared", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout.clone());
         space
-            .indexable_composite_attribute::<u64, _>(
-                "sum",
-                "own",
-                &["shared"],
-                |own, shared| own + shared[0],
-            )
+            .indexable_composite_attribute::<u64, _>("sum", "own", &["shared"], |own, shared| {
+                own + shared[0]
+            })
             .unwrap();
 
         let id_a = layout.compose(&[("own", 3), ("shared", 1)]);
@@ -1493,24 +1503,18 @@ mod tests {
     fn two_composites_can_share_the_same_dependency_field() {
         // `country_idx` is read by both `first_name` and `last_name` in
         // internot_sql — make sure that pattern works at the framework level.
-        let layout = BitLayout::<u64>::new(vec![("a_own", 4), ("b_own", 4), ("shared", 4)])
-            .unwrap();
+        let layout =
+            BitLayout::<u64>::new(vec![("a_own", 4), ("b_own", 4), ("shared", 4)]).unwrap();
         let mut space = Space::<u64>::new("p", layout.clone());
         space
-            .indexable_composite_attribute::<String, _>(
-                "a",
-                "a_own",
-                &["shared"],
-                |own, s| format!("A:{}:{}", own, s[0]),
-            )
+            .indexable_composite_attribute::<String, _>("a", "a_own", &["shared"], |own, s| {
+                format!("A:{}:{}", own, s[0])
+            })
             .unwrap();
         space
-            .indexable_composite_attribute::<String, _>(
-                "b",
-                "b_own",
-                &["shared"],
-                |own, s| format!("B:{}:{}", own, s[0]),
-            )
+            .indexable_composite_attribute::<String, _>("b", "b_own", &["shared"], |own, s| {
+                format!("B:{}:{}", own, s[0])
+            })
             .unwrap();
 
         let id = layout.compose(&[("a_own", 1), ("b_own", 2), ("shared", 3)]);

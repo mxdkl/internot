@@ -59,7 +59,10 @@ impl SlotLayout {
             (idx_width as u32 + owner_width as u32) <= 63,
             "SlotLayout: total width must be <= 63 to leave room for the Session sentinel bit"
         );
-        Self { idx_width, owner_width }
+        Self {
+            idx_width,
+            owner_width,
+        }
     }
 
     /// Maximum number of populated slots per owner: `2^idx_width`.
@@ -86,10 +89,8 @@ impl SlotLayout {
     /// Compose a slot id from `(owner_mail_id, idx)`. Identity:
     /// `(owner_of(compose(o, i)), idx_of(compose(o, i))) == (o, i)`.
     pub fn compose(&self, owner_mail_id: u32, idx: u32) -> u64 {
-        self.layout("").compose(&[
-            ("owner_mail_id", owner_mail_id as u64),
-            ("idx", idx as u64),
-        ])
+        self.layout("")
+            .compose(&[("owner_mail_id", owner_mail_id as u64), ("idx", idx as u64)])
     }
 
     pub fn owner_of(&self, slot_id: u64) -> u32 {

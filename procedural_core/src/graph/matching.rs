@@ -22,7 +22,9 @@ use std::cmp::Ordering;
 
 /// Match a cohort via stable-roommates. Returns matched pairs as
 /// `(min_id, max_id)`. Unmatched cohort members are silently omitted.
-#[deprecated(note = "exact stable matching is provably non-local; use procedural_core::pairing::Coupling (see specs/2026-09-29-society-as-a-function.md §4)")]
+#[deprecated(
+    note = "exact stable matching is provably non-local; use procedural_core::pairing::Coupling (see specs/2026-09-29-society-as-a-function.md §4)"
+)]
 pub fn stable_roommates_match<F>(cohort: &[u32], pref: F) -> Vec<(u32, u32)>
 where
     F: Fn(u32, u32) -> f64,

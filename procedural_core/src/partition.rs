@@ -12,6 +12,11 @@
 //!   products of split fractions, so they are roughly lognormal; nesting
 //!   (region → neighbourhood → block) comes free.
 //!
+//! - [`apportion_systematic`] and [`contingency_systematic`]: keyed, unbiased
+//!   integer splits with exact totals (one margin, or two), for counts that
+//!   both sides of a relation must agree on. [`SystematicShares`] precomputes
+//!   the shares for many splits over the same weights.
+//!
 //! See `docs/superpowers/research/2026-09-29-local-access-and-bijections.md` §4.
 
 use std::ops::Range;
@@ -161,6 +166,162 @@ pub fn histogram_from_pmf(n: u64, pmf: &[(u64, f64)]) -> Vec<(u64, u64)> {
     out
 }
 
+/// Fixed-point scale of [`apportion_systematic`]'s cumulative shares.
+const SHARE_ONE: u128 = 1 << 40;
+
+/// Keyed systematic apportionment: split `n` into integer parts
+/// proportional to `weights`, written to `out` (same length).
+///
+/// With cumulative shares `F_c` and one keyed uniform `u`, part `c` is
+/// `⌊n·F_c + u⌋ − ⌊n·F_{c−1} + u⌋`. The parts sum to `n` exactly; each is
+/// within 1 of `n·p_c`, and its mean over keys is `n·p_c`. Largest
+/// remainder, by contrast, gives a one-member split to the modal class
+/// every time, so small splits never reach the rarer classes. Shares are
+/// fixed-point (2⁻⁴⁰) and the rounding is integer arithmetic, so the result
+/// is exact and portable. Non-positive (and NaN) weights get nothing.
+///
+/// Panics if `n > 0` and no weight is positive, or if the lengths differ.
+pub fn apportion_systematic(n: u64, weights: &[f64], key: Key, out: &mut [u64]) {
+    assert_eq!(weights.len(), out.len(), "one part per weight");
+    out.fill(0);
+    if n == 0 {
+        return;
+    }
+    let u = key.below(SHARE_ONE as u64) as u128;
+    let mut prev = 0u128;
+    cumulative_shares(weights, |i, share| {
+        let cur = (n as u128 * share + u) / SHARE_ONE;
+        out[i] = (cur - prev) as u64;
+        prev = cur;
+    });
+}
+
+/// The fixed-point cumulative share at the end of each part, in order:
+/// nondecreasing, and exactly [`SHARE_ONE`] from the last positive weight
+/// on. Panics if no weight is positive.
+fn cumulative_shares(weights: &[f64], mut f: impl FnMut(usize, u128)) {
+    let w = |x: f64| if x > 0.0 { x } else { 0.0 };
+    let total: f64 = weights.iter().map(|&x| w(x)).sum();
+    assert!(total > 0.0 && total.is_finite(), "no positive weight");
+    let last = weights.iter().rposition(|&x| x > 0.0).unwrap();
+    let (mut acc, mut prev_share) = (0.0f64, 0u128);
+    for (i, &x) in weights.iter().enumerate() {
+        acc += w(x);
+        let share = if i >= last {
+            SHARE_ONE
+        } else {
+            ((acc / total * SHARE_ONE as f64) as u128).clamp(prev_share, SHARE_ONE)
+        };
+        f(i, share);
+        prev_share = share;
+    }
+}
+
+/// [`apportion_systematic`] with the cumulative shares computed once, for
+/// many splits over the same weights. Gives exactly the same parts, densely
+/// ([`Self::apportion`]) or as the nonzero parts only
+/// ([`Self::for_each_part`], `O(parts · log len)`, for small `n`).
+#[derive(Clone, Debug)]
+pub struct SystematicShares {
+    /// Cumulative fixed-point share at the end of each part.
+    cum: Vec<u64>,
+}
+
+impl SystematicShares {
+    /// Shares of `weights`. Panics if no weight is positive.
+    pub fn new(weights: &[f64]) -> Self {
+        let mut cum = Vec::with_capacity(weights.len());
+        cumulative_shares(weights, |_, share| cum.push(share as u64));
+        Self { cum }
+    }
+
+    /// Number of parts.
+    pub fn len(&self) -> usize {
+        self.cum.len()
+    }
+
+    /// Whether there are no parts (never: some weight is positive).
+    pub fn is_empty(&self) -> bool {
+        self.cum.is_empty()
+    }
+
+    /// The parts of `n`, as [`apportion_systematic`] gives them.
+    pub fn apportion(&self, n: u64, key: Key, out: &mut [u64]) {
+        assert_eq!(self.cum.len(), out.len(), "one part per weight");
+        out.fill(0);
+        if n == 0 {
+            return;
+        }
+        let u = key.below(SHARE_ONE as u64) as u128;
+        let mut prev = 0u128;
+        for (&share, o) in self.cum.iter().zip(out.iter_mut()) {
+            let cur = (n as u128 * share as u128 + u) / SHARE_ONE;
+            *o = (cur - prev) as u64;
+            prev = cur;
+        }
+    }
+
+    /// Calls `f(part, count)` for each nonzero part of `n`, in part order:
+    /// the same parts as [`Self::apportion`]. Point `k` (`1..=n`) of the
+    /// systematic sample lands in the first part whose `⌊n·F + u⌋` reaches
+    /// `k`, so each run of points costs one binary search.
+    pub fn for_each_part(&self, n: u64, key: Key, mut f: impl FnMut(usize, u64)) {
+        if n == 0 {
+            return;
+        }
+        let u = key.below(SHARE_ONE as u64) as u128;
+        let n128 = n as u128;
+        let (mut k, mut lo) = (1u64, 0usize);
+        while k <= n {
+            let target = k as u128 * SHARE_ONE;
+            let i = lo + self.cum[lo..].partition_point(|&c| n128 * c as u128 + u < target);
+            let cur = ((n128 * self.cum[i] as u128 + u) / SHARE_ONE) as u64;
+            f(i, cur - (k - 1));
+            k = cur + 1;
+            lo = i + 1;
+        }
+    }
+}
+
+/// An integer table with exact margins: row `r` holds `rows[r]` in all,
+/// column `c` holds `cols[c]`. Rows are filled in order, each apportioned
+/// systematically (as in [`apportion_systematic`]) over what the columns
+/// have left: the hypergeometric mean, so each entry's mean over keys is
+/// `rows[r]·cols[c]/N`, and the last row takes exactly the remainder. `out` is
+/// row-major, `rows.len() × cols.len()`. Allocates one scratch vector; meant
+/// for build time.
+///
+/// Panics if the margins' totals differ or `out` has the wrong length.
+pub fn contingency_systematic(rows: &[u64], cols: &[u64], key: Key, out: &mut [u64]) {
+    let (nr, nc) = (rows.len(), cols.len());
+    assert_eq!(out.len(), nr * nc, "a row-major rows × cols table");
+    assert_eq!(
+        rows.iter().sum::<u64>(),
+        cols.iter().sum::<u64>(),
+        "margins must have the same total"
+    );
+    let mut left = cols.to_vec();
+    let mut remaining: u64 = cols.iter().sum();
+    for (r, &m) in rows.iter().enumerate() {
+        let row = &mut out[r * nc..(r + 1) * nc];
+        row.fill(0);
+        if m == 0 {
+            continue;
+        }
+        let total = remaining as u128;
+        let u = key.with(r as u64).below(remaining) as u128;
+        let (mut cum, mut prev) = (0u128, 0u128);
+        for (cell, l) in row.iter_mut().zip(left.iter_mut()) {
+            cum += *l as u128;
+            let cur = (m as u128 * cum + u) / total;
+            *cell = (cur - prev) as u64;
+            *l -= *cell;
+            prev = cur;
+        }
+        remaining -= m;
+    }
+}
+
 /// Recursive random splits of `[0, n)` (fragmentation partition).
 ///
 /// A node `[lo, hi)` becomes a leaf when its size is at most a size drawn
@@ -264,6 +425,149 @@ impl SplitTree {
 mod tests {
     use super::*;
     use crate::perm::{Bijection, FeistelPerm};
+
+    fn systematic(n: u64, w: &[f64], key: Key) -> Vec<u64> {
+        let mut out = vec![0; w.len()];
+        apportion_systematic(n, w, key, &mut out);
+        out
+    }
+
+    #[test]
+    fn systematic_parts_are_exact_and_within_one() {
+        let w = [0.6, 0.0, 0.18, 0.12, 0.07, 1e-9, 0.03];
+        let total: f64 = w.iter().sum();
+        for n in [0u64, 1, 2, 3, 17, 1000, 123_457, 4_000_000_000] {
+            for seed in 0..50 {
+                let v = systematic(n, &w, Key::from_seed(seed));
+                assert_eq!(v.iter().sum::<u64>(), n, "n {n}");
+                assert_eq!(v[1], 0, "zero weight");
+                for (&p, &x) in w.iter().zip(&v) {
+                    assert!((x as f64 - n as f64 * p / total).abs() < 1.0 + 1e-6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn systematic_small_splits_follow_the_weights() {
+        // One member lands in class c with probability p_c: the property
+        // largest remainder lacks.
+        let w = [0.6, 0.25, 0.1, 0.05];
+        let trials = 40_000u64;
+        let mut hits = [0u64; 4];
+        for seed in 0..trials {
+            let v = systematic(1, &w, Key::from_seed(seed));
+            hits[v.iter().position(|&x| x == 1).unwrap()] += 1;
+        }
+        for (h, p) in hits.iter().zip(w) {
+            let f = *h as f64 / trials as f64;
+            assert!((f - p).abs() < 0.01, "{f} vs {p}");
+        }
+        // And the mean of every part is n·p for small n.
+        let mut sums = [0u64; 4];
+        for seed in 0..trials {
+            for (s, x) in sums.iter_mut().zip(systematic(3, &w, Key::from_seed(seed))) {
+                *s += x;
+            }
+        }
+        for (s, p) in sums.iter().zip(w) {
+            let mean = *s as f64 / trials as f64;
+            assert!((mean - 3.0 * p).abs() < 0.02, "{mean} vs {}", 3.0 * p);
+        }
+    }
+
+    #[test]
+    fn precomputed_shares_give_the_same_parts() {
+        let weights: [&[f64]; 5] = [
+            &[0.6, 0.0, 0.18, 0.12, 0.07, 1e-9, 0.03],
+            &[0.0, 0.0, 1.0],
+            &[1.0, 0.0, 0.0, -2.0, f64::NAN],
+            &[0.3; 41],
+            &[1e-12, 5.0, 1e-12, 1e-12, 0.0, 7.0, 0.0, 1e-3],
+        ];
+        for w in weights {
+            let shares = SystematicShares::new(w);
+            assert_eq!(shares.len(), w.len());
+            let mut dense = vec![0; w.len()];
+            for n in (0u64..60).chain([97, 1000, 123_457, 4_000_000_000]) {
+                for seed in 0..40 {
+                    let key = Key::from_seed(seed ^ n << 8);
+                    let want = systematic(n, w, key);
+                    shares.apportion(n, key, &mut dense);
+                    assert_eq!(dense, want, "dense, n {n}");
+                    let mut sparse = vec![0; w.len()];
+                    let mut last = None;
+                    shares.for_each_part(n, key, |i, c| {
+                        assert!(c > 0 && last < Some(i), "nonzero, in order");
+                        last = Some(i);
+                        sparse[i] = c;
+                    });
+                    assert_eq!(sparse, want, "sparse, n {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "no positive weight")]
+    fn systematic_needs_a_positive_weight() {
+        systematic(3, &[0.0, -1.0, f64::NAN], Key::from_seed(1));
+    }
+
+    #[test]
+    fn systematic_golden() {
+        // Pinned: the ledger's counts depend on these exact values.
+        let w = [0.55, 0.2, 0.15, 0.1];
+        assert_eq!(systematic(10, &w, Key::from_seed(7)), GOLDEN_SYSTEMATIC[0]);
+        assert_eq!(systematic(3, &w, Key::from_seed(8)), GOLDEN_SYSTEMATIC[1]);
+        assert_eq!(
+            systematic(1_000_003, &w, Key::from_seed(9)),
+            GOLDEN_SYSTEMATIC[2]
+        );
+    }
+
+    const GOLDEN_SYSTEMATIC: [[u64; 4]; 3] = [
+        [6, 2, 1, 1],
+        [1, 1, 0, 1],
+        [550_001, 200_001, 150_000, 100_001],
+    ];
+    #[test]
+    fn contingency_has_exact_margins_and_the_right_means() {
+        let rows = [7u64, 0, 30, 1, 12];
+        let cols = [20u64, 3, 0, 27];
+        let n: u64 = rows.iter().sum();
+        let mut sums = vec![0u64; rows.len() * cols.len()];
+        let trials = 20_000;
+        for seed in 0..trials {
+            let mut t = vec![0u64; rows.len() * cols.len()];
+            contingency_systematic(&rows, &cols, Key::from_seed(seed), &mut t);
+            for (r, &m) in rows.iter().enumerate() {
+                assert_eq!(
+                    t[r * cols.len()..(r + 1) * cols.len()].iter().sum::<u64>(),
+                    m
+                );
+            }
+            for (c, &k) in cols.iter().enumerate() {
+                assert_eq!(
+                    (0..rows.len()).map(|r| t[r * cols.len() + c]).sum::<u64>(),
+                    k
+                );
+            }
+            for (s, x) in sums.iter_mut().zip(&t) {
+                *s += x;
+            }
+        }
+        for (r, &m) in rows.iter().enumerate() {
+            for (c, &k) in cols.iter().enumerate() {
+                let mean = sums[r * cols.len() + c] as f64 / trials as f64;
+                let want = m as f64 * k as f64 / n as f64;
+                assert!(
+                    (mean - want).abs() < 0.05 + 0.01 * want,
+                    "{r},{c}: {mean} vs {want}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn size_classes_tile_the_range_exactly() {

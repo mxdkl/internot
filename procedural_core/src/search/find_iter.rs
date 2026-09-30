@@ -419,7 +419,11 @@ mod tests {
             .take(8)
             .collect();
 
-        assert_eq!(results.len(), 8, "should yield exactly 8 ids despite huge free space");
+        assert_eq!(
+            results.len(),
+            8,
+            "should yield exactly 8 ids despite huge free space"
+        );
         for id in &results {
             assert_eq!(id.extract_bits(0, 12), 5, "field `a` mismatch");
         }

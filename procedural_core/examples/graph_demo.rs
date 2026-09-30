@@ -58,23 +58,23 @@ fn main() {
     let marriage_day: u32 = 365 * 5;
     let divorce_day: u32 = marriage_day + 365 * 12;
     let profile = TieStrengthProfile {
-        base_floor: 0.10,       // residual tie even post-divorce
-        cohabit_peak: 1.00,     // partner during marriage
+        base_floor: 0.10,   // residual tie even post-divorce
+        cohabit_peak: 1.00, // partner during marriage
         cohabit_start_day: Some(marriage_day),
         cohabit_end_day: Some(divorce_day),
-        decay_tau_days: 182.5,  // 6 months τ — Roberts & Dunbar 2011 post-divorce
+        decay_tau_days: 182.5, // 6 months τ — Roberts & Dunbar 2011 post-divorce
     };
 
     let timeline = [
-        ("3 years before marriage",  marriage_day - 365 * 3),
-        ("day before marriage",      marriage_day - 1),
-        ("marriage day",             marriage_day),
-        ("5 years into marriage",    marriage_day + 365 * 5),
-        ("last day of marriage",     divorce_day),
-        ("1 day post-divorce",       divorce_day + 1),
-        ("1 month post-divorce",     divorce_day + 30),
-        ("1 year post-divorce",      divorce_day + 365),
-        ("5 years post-divorce",     divorce_day + 365 * 5),
+        ("3 years before marriage", marriage_day - 365 * 3),
+        ("day before marriage", marriage_day - 1),
+        ("marriage day", marriage_day),
+        ("5 years into marriage", marriage_day + 365 * 5),
+        ("last day of marriage", divorce_day),
+        ("1 day post-divorce", divorce_day + 1),
+        ("1 month post-divorce", divorce_day + 30),
+        ("1 year post-divorce", divorce_day + 365),
+        ("5 years post-divorce", divorce_day + 365 * 5),
     ];
 
     println!("Step 2 — partner tie strength over lifecycle (couple {eli}↔{jamie})");
@@ -104,9 +104,9 @@ fn main() {
         chronotype: 0.75, // night-owl
     };
 
-    let monday_noon = utc(2025, 6, 2, 12);     // Mon (2025-06-02)
-    let sunday_3am = utc(2025, 6, 1, 3);       // Sun (2025-06-01)
-    let saturday_4pm = utc(2025, 6, 7, 16);    // Sat
+    let monday_noon = utc(2025, 6, 2, 12); // Mon (2025-06-02)
+    let sunday_3am = utc(2025, 6, 1, 3); // Sun (2025-06-01)
+    let saturday_4pm = utc(2025, 6, 7, 16); // Sat
 
     println!("Step 3 — comm intensity (events/day) — strength {strength:.3}");
     println!(
@@ -141,12 +141,8 @@ fn main() {
     let t_start = utc(2025, 1, 1, 0);
     let t_end = utc(2026, 1, 1, 0);
 
-    let mail_lambda = |t: DateTime<Utc>| {
-        comm_intensity(strength, &eli_p, &jamie_p, t).mail_per_day
-    };
-    let chat_lambda = |t: DateTime<Utc>| {
-        comm_intensity(strength, &eli_p, &jamie_p, t).chat_per_day
-    };
+    let mail_lambda = |t: DateTime<Utc>| comm_intensity(strength, &eli_p, &jamie_p, t).mail_per_day;
+    let chat_lambda = |t: DateTime<Utc>| comm_intensity(strength, &eli_p, &jamie_p, t).chat_per_day;
 
     let mail_events = enumerate_events(eli, jamie, "mail", mail_lambda, t_start, t_end);
     let chat_events = enumerate_events(eli, jamie, "chat", chat_lambda, t_start, t_end);
@@ -170,7 +166,8 @@ fn main() {
     println!("\n  First five mail events:");
     for e in mail_events.iter().take(5) {
         let who = if e.initiator == 0 { eli } else { jamie };
-        let dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][e.at.weekday().num_days_from_monday() as usize];
+        let dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            [e.at.weekday().num_days_from_monday() as usize];
         println!(
             "    {} {} {:02}:{:02}   from {}",
             e.at.format("%Y-%m-%d"),
@@ -183,7 +180,8 @@ fn main() {
     println!("\n  First five chat events:");
     for e in chat_events.iter().take(5) {
         let who = if e.initiator == 0 { eli } else { jamie };
-        let dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][e.at.weekday().num_days_from_monday() as usize];
+        let dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            [e.at.weekday().num_days_from_monday() as usize];
         println!(
             "    {} {} {:02}:{:02}   from {}",
             e.at.format("%Y-%m-%d"),
@@ -198,13 +196,21 @@ fn main() {
     // 5. Reproducibility check.
     // -------------------------------------------------------------
     let mail_events2 = enumerate_events(eli, jamie, "mail", mail_lambda, t_start, t_end);
-    assert_eq!(mail_events, mail_events2, "event stream must be reproducible");
+    assert_eq!(
+        mail_events, mail_events2,
+        "event stream must be reproducible"
+    );
     let pairs2 = stable_roommates_match(&cohort, pref);
     assert_eq!(pairs, pairs2, "matching must be deterministic");
-    let pairs_swapped = stable_roommates_match(&cohort.iter().rev().copied().collect::<Vec<_>>(), pref);
+    let pairs_swapped =
+        stable_roommates_match(&cohort.iter().rev().copied().collect::<Vec<_>>(), pref);
     assert_eq!(pairs, pairs_swapped, "matching must be order-invariant");
     let venue = canonical_pair(eli, jamie);
-    assert_eq!(venue, canonical_pair(jamie, eli), "canonical_pair must be symmetric");
+    assert_eq!(
+        venue,
+        canonical_pair(jamie, eli),
+        "canonical_pair must be symmetric"
+    );
 
     println!(
         "\nStep 5 — invariants verified:\n  \

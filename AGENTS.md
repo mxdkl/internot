@@ -19,7 +19,7 @@ A procedural-world substrate for AI-agent training and evaluation. The thesis: a
 - `internot_renderer` — shared LLM-render infrastructure: `OpenAiClient` (blocking reqwest; `with_base_url` lets it target any OpenAI-compatible API such as DeepSeek), on-disk `Cache` keyed by `(namespace, prompt_version, model_version, hashed-id)`, `RenderError`. **Currently has no consumer** (its only consumer, mail's renderer, was removed). Per-service renderers compose this; the same OpenAiClient + Cache instance is shared across services via the Services struct (see below).
 
 **New layers under construction (spec `specs/2026-09-29-society-as-a-function.md`):**
-- `internot_society` — the R1 kinship prototype: the demographic ledger (`ledger.rs`), schedules (`params.rs`), plan catalogs (`plan.rs`) and the lookups (`world.rs`). Population, unions (including same-sex and couples who arrived together), births, parents, children, siblings and deaths, for natives and immigrants, all as pure functions of `(seed, id, t)`. It depends only on `procedural_core`. Status and guarantees are under "Phase 1" below.
+- `internot_society` — the R1 kinship prototype: the demographic ledger (`ledger.rs`), schedules (`params.rs`), plan catalogs (`plan.rs`) and the lookups (`world.rs`). Population, unions (including same-sex and couples who arrived together), births, parents, children, siblings and deaths, for natives and immigrants, all as pure functions of `(seed, id, t)`. It depends on `procedural_core`, plus `rayon` for a parallel `World::build`. Status and guarantees are under "Phase 1" below.
 - `internot_perf` — the benchmark and profiling harness (`perf-gate` binary): suites `core_hash`, `primitives` and `kinship`, budgets in `perf/budgets.toml`, per-machine baselines in `perf/baselines/`, and flamegraphs. `perf/check.sh` runs all workspace tests and then the gate.
 
 **The world (one crate, services as folders):**
@@ -295,6 +295,75 @@ Adding the service automatically: registers spaces on the right world, exposes v
     - hot/cold splits of cells and cohorts into 64-byte headers plus per-block arenas.
   - **R1c warning:** second unions add sub-cells and plans to death and kin lookups. Keep every constraint local (see Lessons).
 
+**R1c (divorce re-partnering): IN PROGRESS, design written 2026-09-30** (`plans/2026-09-30-r1c-divorce-repartnering.md`; targets in `research/2026-09-30-remarriage-targets.md`).
+- **Mechanism:**
+  - dissolution years are exact classes on each partner slice, via keyed systematic apportionment;
+  - sub-cells are (cell, class): kin repair, coupling and plans work within them;
+  - isolated couples move to the nearest class, and one pass suffices;
+  - markets have a status dimension (never partnered or divorced), giving four kinds of opposite-sex cell;
+  - second-union membership comes from each first-union sub-cell's remarriage parts;
+  - every life constraint stays local.
+- **Scope:** at most two unions per person; no same-sex re-partnering. The founder is informed and it proceeds unless told otherwise.
+- **Build order:** primitive → ledger → world → realism → performance, tiny world first.
+- **Stage A DONE (2026-09-30): dissolution classes and class-cells, without remarriage.**
+  - Every test passes: the exhaustive kinship suite, closure per class, and zero close kin.
+  - Realism bands pass.
+  - **The layout that works:** one cell per (year, kind, class), in one cache line (64-byte `CellLayout`, arrays in per-block arenas), with coarse-indexed keys, cohort lines and birth rows.
+  - **Cost against pre-R1c:**
+    - union p99 +41% (4.4 µs) and father +55% (4.8 µs) against 5 µs budgets;
+    - children +20%;
+    - world build 1.52 s.
+  - Details and the three layouts tried are in the R1c plan, "Stage A outcome".
+- **Stage B BUILT, gates FAILING (2026-09-30): divorced pools, status markets, second unions.**
+  - Every test passes (845 in the workspace), including the exhaustive kinship suite with second unions: reciprocity on both unions, closure per (year, kind, class, block, block, sex), zero close kin, duality and life bounds.
+  - **Realism, calibrated** (targets in `research/2026-09-30-remarriage-targets.md`):
+
+    | Measure | Model | Target |
+    |---|---|---|
+    | remarried within 1 / 3 / 5 / 10 years of divorce | 17 / 39 / 52 / 69% | NSFG 15 / 39 / 54 / 75% |
+    | median age at second union, women / men | 34 / 36 | 33 / 36 |
+    | remarriages with the husband 10+ years older | 17.2% | 16% |
+    | second unions broken within 10 years | 36% | 39% |
+    | new unions with both / one partner previously partnered | 15 / 16% | Pew 20 / 20%; the gap is the widowed, deferred |
+
+    - Couples moved by de-isolation: 2.4%.
+    - CFR of the 1950 cohort: 2.31.
+    - Ever born: 12.06M.
+    - Provisional parameters: `SECOND_UNION_FERTILE` = 0.45, the remarriage hazard by duration, men ×1.2, status affinity 3.5 for two divorced partners, divorce ×1.35 in second unions, and remarriage age gaps ×0.6.
+  - **World build: 4.28 s → 1.45 s** (min of 3; 3.44 s on one thread, 1.64 s on four). Every change was checked bit-identical, by a checksum of the whole ledger and of 600k lookup answers:
+    - the IPF fuses its passes and sums eight rows side by side (a float sum is a serial add chain);
+    - market rounding skips the draw on zero cells;
+    - `procedural_core::partition::SystematicShares` (new, additive) computes shares once, with a sparse `for_each_part` for small splits. It is used by class splits, plan partitions (`plan::PlanShares`, `PlanTables`) and arrival classes;
+    - births are a dense year × block table;
+    - free couples come from one pass over single-member cells, replacing a search into another block's ledger cells for every one of 4M slices (20% of the build);
+    - **parallel, with `rayon`** (new dependency of `internot_society`): per-block layouts and tables, each block's side of a market group, all of a year's market solves (caps then apply in order), class splits and the year-end sort. Each task touches only its own block, and births merge as sums, so results don't depend on scheduling.
+  - **Gate, 2026-09-30** (performance governor). world_build 1.59 s, within the 2 s budget; its baseline (1.04 s) predates R1c. **Lookups fail:**
+
+    | Query | p99 | Budget |
+    |---|---|---|
+    | death | 1.77 µs | 1 µs |
+    | mother | 1.93 µs | 2 µs |
+    | father | 12.3 µs | 5 µs |
+    | union | 11.4 µs | 5 µs |
+    | children | 15.2 µs | 5 µs |
+    | siblings | 22.4 µs | 4 µs |
+
+  - **Memory: 890 MB peak RSS** (R1: 152 MB).
+    - Union cells: 1.30M (stage A: 592k).
+    - Partner slices: 4.77M, 4.0M of them a single couple.
+    - Cohort or source parts: 2.93M.
+    - Divorced sources: 656k, with 1.64M remarriage parts.
+    - The ledger's per-cell `Vec`s stay alive inside `World`.
+  - **Founder decision (2026-09-30): performance is good enough for now; the work is deferred.**
+    - The bar is "decent enough not to get in the way of high workloads", not extreme p99s.
+    - In absolute terms, lookups are fine: a family-heavy view call is a few ms, and bulk kin generation is about 20 s per million people on one thread.
+    - Deferred, in priority order:
+      1. **Memory**: 890 MB per process, so ~14 GB for 16 parallel MCP servers.
+      2. **Sharing one world across processes**: a memory-mapped build, or one server for many sessions.
+      3. **Full-scale estimates**: memory and build time grow with population, and the national market's rounding with regions².
+      4. **Lookup budgets sized to workloads**: about 25 µs for one-hop lookups and 2 µs for death, in place of the 4–5 µs caps.
+    - The kinship gate's lookup failures are known and accepted until then. Do not re-record baselines; that would hide them.
+
 **Blocked on founder decisions** (each written up, with options and a recommendation):
 1. ~~Residence and households~~ **Decided 2026-09-30: option B now, C prototyped as its upgrade** (`research/2026-09-30-residence-enumeration-problem.md`).
    - Kinship is exact by lineage region.
@@ -337,6 +406,17 @@ Adding the service automatically: registers spaces on the right world, exposes v
 - **Huge pages** (`MADV_COLLAPSE` over the heap) gave 10–20% on every lookup at 152 MB. That is worth having once the world lives in a few large arenas, but it is not a design lever.
 - **Measure changes under 10% with interleaved A/B runs** (`perf/ab.sh`, `examples/lookup_timing.rs`), not separate gate runs. Separate runs vary ~10%. In one case they showed a 13% "regression" in `father` that reversed when the run order was swapped.
 - **A search and the read after it should touch one array.** Parallel arrays (starts in one, payload in another) cost two dependent misses; interleave them with a sentinel.
+- **Finer structure costs lookups even when memory stays flat.** R1c's exact-year classes made about six times as many cells.
+  - Sub-cells nested inside cells doubled instructions.
+  - Flattening them into cells and then compacting to one cache line still left union at +41%: longer sorted arrays and colder cells.
+  - Index long sorted arrays (`Coarse`, every 16th value).
+  - Don't group columns to save memory if lookups must then scan the group.
+- **Largest remainder is biased on small partitions:** a one-member split always goes to the modal class. Use keyed systematic apportionment (`partition::apportion_systematic`) wherever cells can be small.
+- **Build-time work (2026-09-30):**
+  - **Prove refactors bit-identical with checksums**: a hash of the ledger's `Debug` output plus `examples/lookup_timing.rs`'s answer sum. All ten build changes passed this way, so no realism rerun was needed.
+  - **pprof line attribution is unreliable for inlined code.** It blamed `trim` for 18% when timers showed 64 ms. Mark candidates `#[inline(never)]` temporarily, or time them.
+  - **A search into another block's cells is a cache miss per step, even at build time.** Precompute cross-block facts in one pass instead.
+  - **Parallel tasks run ~1.7× slower each on this laptop** (turbo drops, memory contention), even at 8 threads. Parallelism pays only where the work is large. Keep glibc allocations and frees on the same thread; cross-thread frees lock the owner's arena.
 - **Guard shortcut predicates with an agreement test.** `same_mother`'s cell shortcut is checked against full mother resolution on two tiny seeds (`world::tests`), because R1c will give some women a second union cell and break its premise.
 - **Kin repair.** Pairs alone leave odd tails and one-couple cells unrepairable; the spec's 10⁻¹² estimate was wrong for small cells. What works is three layers:
   1. women's-side groups (pairs plus a trailing triple);

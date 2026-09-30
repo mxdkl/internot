@@ -27,27 +27,57 @@ fn age_at(w: &World, id: PersonId, t: i64) -> f64 {
 #[test]
 fn unions_are_mutual_and_agree_on_every_date() {
     let w = world();
-    let mut partnered = 0;
+    let (mut partnered, mut second) = (0, 0);
     for x in everyone(w) {
-        if let Some(u) = w.union(x) {
-            partnered += 1;
-            let v = w.union(u.partner).expect("partner has a union");
-            assert_eq!(v.partner, x, "partner of partner of {x}");
+        let us = w.unions(x);
+        let cells = w.union_cells(x);
+        for (k, (u, cell)) in us.iter().zip(cells).enumerate() {
+            let Some(u) = u else { continue };
+            let (_, kind) = cell.expect("a union has a cell");
+            if k == 0 {
+                partnered += 1;
+            } else {
+                second += 1;
+            }
+            // The partner holds the same union, in their first or second
+            // seat (a divorced partner in their second, R1c). A divorced
+            // couple can remarry each other, so match the start too.
+            let vs = w.unions(u.partner);
+            let j = vs
+                .iter()
+                .position(|v| v.is_some_and(|v| v.partner == x && v.start == u.start))
+                .unwrap_or_else(|| panic!("partner of partner of {x}"));
+            let v = vs[j].unwrap();
             assert_eq!(
                 (u.start, u.separation, u.end, u.key),
                 (v.start, v.separation, v.end, v.key),
                 "union facts differ for {x}"
             );
-            let (_, kind) = w.union_class(x).unwrap();
-            assert_eq!(w.union_class(u.partner).unwrap().1, kind.partner());
+            assert_eq!(w.union_cells(u.partner)[j].unwrap().1, kind.partner());
             assert_eq!(
                 w.sex(x) == w.sex(u.partner),
                 kind.same_sex(),
                 "{x}: sexes vs union kind"
             );
+            assert_eq!(
+                k == 1,
+                kind.second(),
+                "{x}: seat {k} holds a {kind:?} union"
+            );
+        }
+        // Availability (R1c): a second union follows the first's
+        // separation, in a later year, and starts while alive.
+        if let (Some(a), Some(b)) = (us[0], us[1]) {
+            let sep = a.separation.expect("a second union follows a separation");
+            assert!(
+                year_of(sep) < year_of(b.start),
+                "{x}: second union before the first separates"
+            );
+            assert!(b.start < w.death(x), "{x} dies before the second union");
         }
     }
     assert!(partnered > 1000, "only {partnered} partnered people");
+    assert!(second > 50, "only {second} second unions");
 }
 
 #[test]
@@ -300,25 +330,35 @@ fn people_per_block_match_the_ledger() {
             .expect("every person is in a block")
     };
     let mut per_block: HashMap<u32, (u64, u64)> = HashMap::new();
-    // (cell year, kind, left block, right block), counted from the
-    // left-role member of each couple.
-    let mut unions: HashMap<(i32, CellKind, u32, u32), u64> = HashMap::new();
+    // (cell year, kind, dissolution class, left block, right block, left
+    // sex), counted from the left-role member of each couple. An
+    // opposite-sex couple's class is its separation year after the cell
+    // year (0: none); same-sex cells record class 0, their dissolution being
+    // a keyed draw.
+    let mut unions: HashMap<(i32, CellKind, u8, u32, u32, Sex), u64> = HashMap::new();
     for x in everyone(w) {
         let e = per_block.entry(block(x)).or_default();
         e.0 += 1;
         if w.sex(x) == Sex::Female {
             e.1 += 1;
         }
-        if let Some((year, kind)) = w.union_class(x) {
+        // Both unions (R1c): each is counted from its left-role member.
+        for (cell, u) in w.union_cells(x).into_iter().zip(w.unions(x)) {
+            let (Some((year, kind)), Some(u)) = (cell, u) else {
+                continue;
+            };
             let left = match kind {
-                CellKind::InWorld | CellKind::Arrival => w.sex(x) == Sex::Female,
                 CellKind::SameLeft => true,
                 CellKind::SameRight => false,
+                _ => w.sex(x) == Sex::Female,
             };
             if left {
-                let partner = w.union(x).unwrap().partner;
+                let class = match (kind.same_sex(), u.separation) {
+                    (false, Some(s)) => (year_of(s) - year) as u8,
+                    _ => 0,
+                };
                 *unions
-                    .entry((year, kind, block(x), block(partner)))
+                    .entry((year, kind, class, block(x), block(u.partner), w.sex(x)))
                     .or_default() += 1;
             }
         }
@@ -336,16 +376,23 @@ fn people_per_block_match_the_ledger() {
             .union_f
             .iter()
             .filter(|c| c.kind != CellKind::SameRight)
-            .chain(b.union_m.iter().filter(|c| c.kind == CellKind::SameLeft));
-        for c in left_cells {
+            .map(|c| (c, Sex::Female))
+            .chain(
+                b.union_m
+                    .iter()
+                    .filter(|c| c.kind == CellKind::SameLeft)
+                    .map(|c| (c, Sex::Male)),
+            );
+        for (c, sex) in left_cells {
             for &(pb, n) in &c.partners {
+                let class = c.class;
                 assert_eq!(
                     unions
-                        .get(&(c.year, c.kind, bi as u32, pb))
+                        .get(&(c.year, c.kind, class, bi as u32, pb, sex))
                         .copied()
                         .unwrap_or(0),
                     n,
-                    "unions {} ({:?}): block {bi} × block {pb}",
+                    "unions {} ({:?}, class {class}): block {bi} × block {pb}",
                     c.year,
                     c.kind
                 );

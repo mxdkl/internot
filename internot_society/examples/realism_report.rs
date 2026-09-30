@@ -23,6 +23,20 @@ fn main() {
         w.population()
     );
     let ledger = w.ledger();
+    // Couples moved to a neighbouring dissolution class because they were
+    // alone on both sides of theirs (R1c de-isolation).
+    let opposite: u64 = ledger
+        .blocks
+        .iter()
+        .flat_map(|b| &b.union_f)
+        .filter(|c| !c.kind.same_sex())
+        .map(|c| c.total)
+        .sum();
+    println!(
+        "dissolution classes: {} of {opposite} opposite-sex couples moved by de-isolation ({:.3}%)",
+        ledger.class_moves,
+        100.0 * ledger.class_moves as f64 / opposite.max(1) as f64
+    );
     let names: Vec<&str> = ledger.params.regions.iter().map(|r| r.name).collect();
     for &year in &[1850, 1900, 1950, 1975, 2000, 2025, 2050, 2090] {
         let sizes: Vec<String> = ledger
@@ -170,6 +184,99 @@ fn main() {
             pct(fathered),
             pct(posthumous),
             pct(widowed)
+        );
+    }
+
+    // Re-partnering (R1c; targets in research/2026-09-30-remarriage-targets.md).
+    {
+        let year_of = |t: i64| internot_society::world::year_of(t);
+        // Women divorced from a first union in 1970-1995 before 45: share
+        // remarried within 1/3/5/10 years (NSFG 1995: .15/.39/.54/.75).
+        let mut within = [0u64; 4];
+        let mut divorced = 0u64;
+        let mut waits: Vec<i32> = Vec::new();
+        let mut ages2: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+        let (mut second_n, mut second_broken) = (0u64, 0u64);
+        let (mut gap_first, mut gap_first_10, mut gap_re, mut gap_re_10) = (0u64, 0u64, 0u64, 0u64);
+        for id in (0..w.population() as u32).step_by(7) {
+            let [first, second] = w.unions(id);
+            let sex = w.sex(id) as usize;
+            let birth_year = w.birth_year(id);
+            if let Some(f) = first {
+                if let Some(sep) = f.separation {
+                    let dy = year_of(sep);
+                    if w.sex(id) == Sex::Female
+                        && (1970..=1995).contains(&dy)
+                        && dy - birth_year < 45
+                        && w.death(id) > sep
+                    {
+                        divorced += 1;
+                        if let Some(s2) = second {
+                            let wait = year_of(s2.start) - dy;
+                            waits.push(wait);
+                            for (k, lim) in [1, 3, 5, 10].iter().enumerate() {
+                                within[k] += (wait <= *lim) as u64;
+                            }
+                        }
+                    }
+                }
+                if w.sex(id) == Sex::Male && (1980..2010).contains(&year_of(f.start)) {
+                    gap_first += 1;
+                    gap_first_10 += (w.birth_year(f.partner) - birth_year >= 10) as u64;
+                }
+            }
+            if let Some(s2) = second {
+                let y = year_of(s2.start);
+                if (1980..2010).contains(&y) {
+                    ages2[sex].push(y - birth_year);
+                    if w.sex(id) == Sex::Male {
+                        gap_re += 1;
+                        gap_re_10 += (w.birth_year(s2.partner) - birth_year >= 10) as u64;
+                    }
+                }
+                if (1960..1990).contains(&y) && w.sex(id) == Sex::Female {
+                    second_n += 1;
+                    second_broken += s2.separation.is_some_and(|t| year_of(t) - y <= 10) as u64;
+                }
+            }
+        }
+        let median = |v: &mut Vec<i32>| {
+            v.sort_unstable();
+            v.get(v.len() / 2).copied().unwrap_or(0)
+        };
+        let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+        println!(
+            "\nre-partnering: women divorced 1970-95 before 45, remarried within 1/3/5/10 y: {:.0}/{:.0}/{:.0}/{:.0}% (NSFG 15/39/54/75); median wait {} y (SIPP ~4)",
+            pct(within[0], divorced),
+            pct(within[1], divorced),
+            pct(within[2], divorced),
+            pct(within[3], divorced),
+            median(&mut waits)
+        );
+        println!(
+            "  median age at second union 1980-2009: women {}, men {} (SIPP 33/36); husband 10+ older: first unions {:.1}%, remarriages {:.1}% (Pew 4/16)",
+            median(&mut ages2[0]),
+            median(&mut ages2[1]),
+            pct(gap_first_10, gap_first),
+            pct(gap_re_10, gap_re)
+        );
+        println!(
+            "  second unions begun 1960-89 broken within 10 y: {:.0}% (NSFG ~39)",
+            pct(second_broken, second_n)
+        );
+        // New opposite-sex unions 2005-2014 by partners' previous marriage
+        // (Pew 2013: ~20% both previously married, ~20% one).
+        let mut by_kind = [0u64; 7];
+        for b in &ledger.blocks {
+            for c in b.union_f.iter().filter(|c| (2005..2015).contains(&c.year)) {
+                by_kind[c.kind as usize] += c.total;
+            }
+        }
+        let opposite = by_kind[0] + by_kind[4] + by_kind[5] + by_kind[6];
+        println!(
+            "  new unions 2005-14: both previously partnered {:.0}%, one {:.0}% (Pew ~20/20)",
+            pct(by_kind[6], opposite),
+            pct(by_kind[4] + by_kind[5], opposite)
         );
     }
 

@@ -267,8 +267,7 @@ impl BitWord for U256 {
             // Spill into upper limb
             let hi_bits = bit_off + width - 64;
             let hi_mask = (1u64 << hi_bits).wrapping_sub(1);
-            limbs[limb_lo + 1] =
-                (limbs[limb_lo + 1] & !hi_mask) | (value_masked >> (64 - bit_off));
+            limbs[limb_lo + 1] = (limbs[limb_lo + 1] & !hi_mask) | (value_masked >> (64 - bit_off));
         }
         Self(limbs)
     }
@@ -322,8 +321,7 @@ impl std::fmt::Debug for U512 {
         write!(
             f,
             "U512(0x{:016x}{:016x}{:016x}{:016x}{:016x}{:016x}{:016x}{:016x})",
-            self.0[7], self.0[6], self.0[5], self.0[4],
-            self.0[3], self.0[2], self.0[1], self.0[0]
+            self.0[7], self.0[6], self.0[5], self.0[4], self.0[3], self.0[2], self.0[1], self.0[0]
         )
     }
 }
@@ -399,7 +397,11 @@ impl BitWord for U512 {
         limbs[limb_lo] = (limbs[limb_lo] & !lo_mask) | (value_masked << bit_off);
         if bit_off + width > 64 {
             let hi_bits = (bit_off + width) - 64;
-            let hi_mask: u64 = if hi_bits == 64 { u64::MAX } else { (1u64 << hi_bits) - 1 };
+            let hi_mask: u64 = if hi_bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << hi_bits) - 1
+            };
             let hi_value = value_masked >> (64 - bit_off);
             limbs[limb_lo + 1] = (limbs[limb_lo + 1] & !hi_mask) | (hi_value & hi_mask);
         }

@@ -412,6 +412,84 @@ pub fn age_gap_weight(gap: i32) -> f64 {
     }
 }
 
+// --- re-partnering (R1c) -------------------------------------------------------
+
+/// Oldest age at which a divorced person starts a second union.
+pub const MAX_REMARRIAGE_AGE: i32 = 75;
+
+/// Annual hazard that a divorced person starts a second union, by sex, age,
+/// years since the divorce (`>= 1`) and year.
+///
+/// **Provisional.** Targets (`research/2026-09-30-remarriage-targets.md`):
+/// - NSFG 1995: 15 / 39 / 54 / 75% of divorced women (< 45) remarried
+///   within 1 / 3 / 5 / 10 years, i.e. about 15%/yr in years 1–3, 13% in
+///   4–5, 9% in 6–10;
+/// - lower after divorce at 25+;
+/// - men remarry more (Pew: 64% vs 52% of the previously married);
+/// - young remarriage fell steeply after 1960 (Pew: 75% → 43% at 25–34).
+pub fn remarriage_hazard(sex: Sex, age: i32, years: i32, year: i32) -> f64 {
+    (remarriage_duration(years) * remarriage_base(sex, age, year)).min(0.9)
+}
+
+/// The duration factor of [`remarriage_hazard`]: by years since divorce.
+pub fn remarriage_duration(years: i32) -> f64 {
+    match years {
+        ..=0 => 0.0,
+        1 => 0.15,
+        2 | 3 => 0.14,
+        4 | 5 => 0.13,
+        6..=10 => 0.12,
+        11..=20 => 0.05,
+        _ => 0.02,
+    }
+}
+
+/// The rest of [`remarriage_hazard`]: age, sex and era factors, the same
+/// for all of a block's divorced in a year.
+pub fn remarriage_base(sex: Sex, age: i32, year: i32) -> f64 {
+    if age > MAX_REMARRIAGE_AGE {
+        return 0.0;
+    }
+    let age_factor = match age {
+        ..=34 => 1.0,
+        35..=44 => 0.75,
+        45..=54 => 0.45,
+        55..=64 => 0.25,
+        _ => 0.1,
+    };
+    let sex_factor = if sex == Sex::Male { 1.2 } else { 1.0 };
+    let era = interp(
+        &[
+            (1900, 1.3),
+            (1960, 1.3),
+            (1990, 1.0),
+            (2020, 0.8),
+            (2100, 0.8),
+        ],
+        year,
+    );
+    age_factor * sex_factor * era
+}
+
+/// Relative affinity of a union between a woman and a man by whether each
+/// is divorced (`true`) or never partnered, multiplying the age-gap
+/// kernel. **Provisional.** Target (Pew 2014, ACS 2013): about 20% of new
+/// marriages have both spouses previously married and about 20% one.
+pub fn status_affinity(woman_divorced: bool, man_divorced: bool) -> f64 {
+    match (woman_divorced, man_divorced) {
+        (false, false) => 1.0,
+        (true, true) => 3.5,
+        _ => 1.0,
+    }
+}
+
+/// Age-gap kernel for unions with a divorced partner: wider than first
+/// unions. **Provisional.** Target (Pew 2014): 16% of newly remarried
+/// couples have a husband 10+ years older, against 4% of first marriages.
+pub fn remarriage_gap_weight(gap: i32) -> f64 {
+    age_gap_weight((gap as f64 * 0.6).round() as i32)
+}
+
 // --- fertility ---------------------------------------------------------------
 
 /// Parity pmf (0..=8) among women in a union, by union year. Anchors trace
@@ -432,11 +510,47 @@ pub fn union_parity_pmf(year: i32) -> [f64; 9] {
             [0.10, 0.20, 0.38, 0.20, 0.08, 0.03, 0.005, 0.0025, 0.0025],
         ),
     ];
+    // Linear interpolation between the bracketing anchors, all parities at
+    // once (no allocation: this runs for every plan cell).
+    let y = year as f64;
+    let (lo, hi) = match ANCHORS.iter().position(|&(ay, _)| y <= ay as f64) {
+        Some(0) => (0, 0),
+        Some(i) => (i - 1, i),
+        None => (ANCHORS.len() - 1, ANCHORS.len() - 1),
+    };
+    let f = if lo == hi {
+        0.0
+    } else {
+        (y - ANCHORS[lo].0 as f64) / (ANCHORS[hi].0 - ANCHORS[lo].0) as f64
+    };
     let mut out = [0.0; 9];
     for (k, o) in out.iter_mut().enumerate() {
-        let a: Vec<(i32, f64)> = ANCHORS.iter().map(|&(y, p)| (y, p[k])).collect();
-        *o = interp(&a, year);
+        *o = ANCHORS[lo].1[k] + f * (ANCHORS[hi].1[k] - ANCHORS[lo].1[k]);
     }
+    out
+}
+
+/// Share of women in a second union who plan any birth in it (R1c); the
+/// rest plan none. **Provisional**, and the calibration knob for completed
+/// fertility: a remarriage adds births on top of a first union cut short by
+/// the divorce. Unsourced (`research/2026-09-30-remarriage-targets.md` §6);
+/// the stepfamily literature puts the share of remarried women who have a
+/// child with the new partner at about a third to a half.
+pub const SECOND_UNION_FERTILE: f64 = 0.45;
+
+/// Parity pmf in a second union (R1c): with probability
+/// [`SECOND_UNION_FERTILE`], the union year's schedule moved one birth down
+/// (a remarriage starts later); otherwise no birth. **Provisional.**
+/// Mother-age truncation at [`MAX_BIRTH_AGE`] does the rest.
+pub fn second_union_parity_pmf(year: i32) -> [f64; 9] {
+    let p = union_parity_pmf(year);
+    let mut shifted = [0.0; 9];
+    for (k, &pk) in p.iter().enumerate() {
+        shifted[k.saturating_sub(1)] += pk;
+    }
+    let f = SECOND_UNION_FERTILE;
+    let mut out = shifted.map(|x| f * x);
+    out[0] += 1.0 - f;
     out
 }
 
@@ -504,6 +618,41 @@ pub fn dissolution_pmf(year: i32) -> [f64; 6] {
     out[0] = 1.0 - d;
     for k in 0..5 {
         out[k + 1] = d * within[k];
+    }
+    out
+}
+
+/// Dissolution classes (R1c): `0` means the union lasts until a partner
+/// dies; `k` in `1..=MAX_CLASS` means the couple separates in the `k`-th
+/// calendar year after the union year (after arrival, for couples who
+/// arrive together).
+pub const MAX_CLASS: usize = 40;
+
+/// Pmf over dissolution classes for a union formed in `year`: each band of
+/// [`dissolution_pmf`] spread evenly over its years. `remarriage` (either
+/// partner in a second union) raises the divorce share by 35%: NSFG 1995
+/// has 39% of second marriages disrupted within 10 years against 33% of
+/// first marriages (`research/2026-09-30-remarriage-targets.md` §5);
+/// calibrated on the realism report.
+pub fn dissolution_class_pmf(year: i32, remarriage: bool) -> [f64; MAX_CLASS + 1] {
+    let bands = dissolution_pmf(year);
+    let scale = if remarriage { 1.35 } else { 1.0 };
+    let divorce: f64 = bands[1..].iter().sum::<f64>() * scale;
+    let divorce = divorce.min(0.9);
+    let first_total: f64 = bands[1..].iter().sum();
+    let mut out = [0.0; MAX_CLASS + 1];
+    out[0] = 1.0 - divorce;
+    for (band, &w) in DISSOLUTION_BANDS.iter().zip(&bands) {
+        if let Some((lo, hi)) = band {
+            let share = if first_total > 0.0 {
+                divorce * w / first_total
+            } else {
+                0.0
+            };
+            for k in *lo..*hi {
+                out[k as usize] = share / (hi - lo) as f64;
+            }
+        }
     }
     out
 }
@@ -611,6 +760,14 @@ mod tests {
             assert!((s - 1.0).abs() < 1e-9, "{year} parity sum {s}");
             let s: f64 = dissolution_pmf(year).iter().sum();
             assert!((s - 1.0).abs() < 1e-9);
+            for remarriage in [false, true] {
+                let classes = dissolution_class_pmf(year, remarriage);
+                let s: f64 = classes.iter().sum();
+                assert!((s - 1.0).abs() < 1e-9, "{year} class sum {s}");
+            }
+            // The classes keep the bands' divorce share for first unions.
+            let classes = dissolution_class_pmf(year, false);
+            assert!((classes[0] - dissolution_pmf(year)[0]).abs() < 1e-12);
             let s: f64 = first_birth_offset_pmf(year).iter().sum();
             assert!((s - 1.0).abs() < 1e-9);
             let s: f64 = nonunion_count_pmf(year).iter().sum();

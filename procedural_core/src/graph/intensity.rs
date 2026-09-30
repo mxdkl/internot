@@ -83,7 +83,7 @@ pub fn comm_intensity(
     let ext = 0.5 * (self_p.extraversion + peer_p.extraversion);
     let cons = 0.5 * (self_p.conscientiousness + peer_p.conscientiousness);
     // 0.5 and 1.5 below are the slope/intercept of the linear blend — not base rates.
-    let person_chat = 0.5 + ext;          // 0.5x at ext=0, 1.5x at ext=1
+    let person_chat = 0.5 + ext; // 0.5x at ext=0, 1.5x at ext=1
     let person_mail = 0.5 + 0.5 * ext + 0.5 * cons;
     let person_cal = 0.5 + cons;
     // Diurnal: peak shifts with chronotype (early-bird → 12:00,
@@ -92,7 +92,8 @@ pub fn comm_intensity(
     let avg_chronotype = 0.5 * (self_p.chronotype + peer_p.chronotype);
     let peak_hour = DIURNAL_PEAK_BASE + DIURNAL_PEAK_SHIFT * avg_chronotype;
     let hour = t.hour() as f64;
-    let diurnal = (0.5 + 0.5 * crate::dmath::cos((hour - peak_hour) * std::f64::consts::PI / 12.0)).clamp(0.0, 1.0);
+    let diurnal = (0.5 + 0.5 * crate::dmath::cos((hour - peak_hour) * std::f64::consts::PI / 12.0))
+        .clamp(0.0, 1.0);
     // Weekly: weekdays slightly higher than weekends for mail/calendar;
     // chat slightly the other way.
     let weekday = t.weekday().num_days_from_monday(); // 0 (Mon) .. 6 (Sun)
@@ -127,8 +128,14 @@ mod tests {
 
     #[test]
     fn intensity_is_higher_for_extraverts() {
-        let intro = PersonalityProjection { extraversion: 0.1, ..Default::default() };
-        let extra = PersonalityProjection { extraversion: 0.9, ..Default::default() };
+        let intro = PersonalityProjection {
+            extraversion: 0.1,
+            ..Default::default()
+        };
+        let extra = PersonalityProjection {
+            extraversion: 0.9,
+            ..Default::default()
+        };
         let i_intro = comm_intensity(0.9, &intro, &intro, at(2025, 6, 1, 14));
         let i_extra = comm_intensity(0.9, &extra, &extra, at(2025, 6, 1, 14));
         assert!(i_extra.chat_per_day > i_intro.chat_per_day);
@@ -153,8 +160,14 @@ mod tests {
 
     #[test]
     fn calendar_rate_is_higher_for_conscientious() {
-        let lazy = PersonalityProjection { conscientiousness: 0.1, ..Default::default() };
-        let conscientious = PersonalityProjection { conscientiousness: 0.9, ..Default::default() };
+        let lazy = PersonalityProjection {
+            conscientiousness: 0.1,
+            ..Default::default()
+        };
+        let conscientious = PersonalityProjection {
+            conscientiousness: 0.9,
+            ..Default::default()
+        };
         let i_lazy = comm_intensity(0.9, &lazy, &lazy, at(2025, 6, 2, 14)); // weekday noon-ish
         let i_cons = comm_intensity(0.9, &conscientious, &conscientious, at(2025, 6, 2, 14));
         assert!(
@@ -169,8 +182,14 @@ mod tests {
     fn chronotype_shifts_diurnal_peak() {
         // At 10:00 (morning), an early-bird pair should have higher
         // chat rate than a night-owl pair (peak shifts from 12 to 16).
-        let early = PersonalityProjection { chronotype: 0.0, ..Default::default() };
-        let late = PersonalityProjection { chronotype: 1.0, ..Default::default() };
+        let early = PersonalityProjection {
+            chronotype: 0.0,
+            ..Default::default()
+        };
+        let late = PersonalityProjection {
+            chronotype: 1.0,
+            ..Default::default()
+        };
         let morning = at(2025, 6, 2, 10);
         let i_early = comm_intensity(0.9, &early, &early, morning);
         let i_late = comm_intensity(0.9, &late, &late, morning);
