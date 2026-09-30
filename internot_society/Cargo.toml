@@ -1,0 +1,16 @@
+[package]
+name = "internot_society"
+description = "Population and kinship as pure functions of (seed, id, t): counted unions and births, exact parents and partners."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+procedural_core = { path = "../procedural_core" }
+chrono = { workspace = true }
+rustc-hash = "2"
+
+[dev-dependencies]
+proptest = "1.4"

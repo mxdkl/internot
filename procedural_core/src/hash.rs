@@ -57,7 +57,7 @@ pub fn hash_vec<W: BitWord>(id: W, key: &str, dims: usize) -> Vec<f64> {
 pub fn hash_gaussian<W: BitWord>(id: W, key: &str) -> f64 {
     let u1 = unit_interval_from_u64(hash_gauss_sub(id, key, 1)).max(f64::MIN_POSITIVE);
     let u2 = unit_interval_from_u64(hash_gauss_sub(id, key, 2));
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    (-2.0 * crate::dmath::ln(u1)).sqrt() * crate::dmath::cos(2.0 * std::f64::consts::PI * u2)
 }
 
 /// Streamed sub-hash for `hash_gaussian`. The separator chain

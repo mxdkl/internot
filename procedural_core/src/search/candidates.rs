@@ -407,7 +407,7 @@ pub(crate) fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b)
-        .map(|(x, y)| (x - y).powi(2))
+        .map(|(x, y)| (x - y) * (x - y))
         .sum::<f64>()
         .sqrt()
 }

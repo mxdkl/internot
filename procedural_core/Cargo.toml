@@ -11,6 +11,9 @@ ordered-float = { workspace = true }
 serde = { workspace = true }
 xxhash-rust = { workspace = true }
 quine-mccluskey = "1.0"
+# Pinned exactly: world facts must be bit-identical across machines and
+# versions. See docs/superpowers/research/2026-09-29-deterministic-numerics.md.
+libm = { version = "=0.2.16", default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -36,5 +39,9 @@ harness = false
 
 [[bench]]
 name = "scale"
+harness = false
+
+[[bench]]
+name = "local_access"
 harness = false
 

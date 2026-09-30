@@ -253,6 +253,7 @@ mod tests {
         assert_eq!(layout.extract(id, "big"), 0xFFFFFFFF);
     }
 
+    #[cfg(debug_assertions)] // the check is a debug_assert!, compiled out in release
     #[test]
     #[should_panic(expected = "overflows field")]
     fn compose_panics_in_debug_when_value_exceeds_field_width() {

@@ -12,8 +12,9 @@
 //! - [`venue`] — [`VenueSpace`]: cohort enumeration over a registered Space.
 //! - [`strength`] — [`TieStrengthProfile`] + [`tie_strength`] over time.
 //! - [`intensity`] — [`CommIntensity`] + [`comm_intensity`].
-//! - [`events`] — deterministic inhomogeneous-Poisson event enumeration.
-//! - [`matching`] — Irving stable-roommates pairing.
+//! - [`events`] — deterministic, window-independent event enumeration.
+//! - [`matching`] — Irving stable-roommates pairing. **Deprecated:** exact
+//!   stable matching is provably non-local; use [`crate::pairing::Coupling`].
 //!
 //! See the spec in
 //! `docs/superpowers/specs/2026-05-14-social-graph-substrate.md` and
@@ -36,8 +37,9 @@ pub mod tie;
 pub mod util;
 pub mod venue;
 
-pub use events::{enumerate_events, CommEvent};
+pub use events::{enumerate_events, enumerate_events_keyed, CommEvent};
 pub use intensity::{comm_intensity, CommIntensity, PersonalityProjection};
+#[allow(deprecated)]
 pub use matching::stable_roommates_match;
 pub use strength::{tie_strength, TieStrengthProfile};
 pub use tie::{Tie, TIE_KIND_UNSPECIFIED};

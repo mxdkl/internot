@@ -85,7 +85,7 @@ pub fn oscillate<W: BitWord>(
     let t_seconds = t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 * 1e-9;
     let period_seconds = period.num_seconds().max(1) as f64;
     let theta = 2.0 * std::f64::consts::PI * t_seconds / period_seconds + phase;
-    amplitude * theta.sin()
+    amplitude * crate::dmath::sin(theta)
 }
 
 /// Shared stability-radius formula — Taylor-quadratic with 0.9 safety factor.
@@ -154,8 +154,8 @@ pub fn oscillate_stability_radius<W: BitWord>(
     let period_seconds = period.num_seconds().max(1) as f64;
     let omega = 2.0 * std::f64::consts::PI / period_seconds;
     let theta = omega * t_seconds + phase;
-    let abs_df = amplitude.abs() * omega * theta.cos().abs();
-    let abs_d2f = amplitude.abs() * omega * omega * theta.sin().abs();
+    let abs_df = amplitude.abs() * omega * crate::dmath::cos(theta).abs();
+    let abs_d2f = amplitude.abs() * omega * omega * crate::dmath::sin(theta).abs();
     let delta_seconds = stability_radius_quadratic(abs_df, abs_d2f, epsilon);
     duration_from_seconds_f64(delta_seconds)
 }

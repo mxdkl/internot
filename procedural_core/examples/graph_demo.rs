@@ -1,3 +1,4 @@
+#![allow(deprecated)] // exercises graph::stable_roommates_match until it is removed
 //! `graph_demo` — exercise every Phase 0 primitive on a tiny synthetic
 //! household. Self-contained; no `internot` dependency.
 //!

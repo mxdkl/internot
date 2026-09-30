@@ -5,13 +5,21 @@
 
 pub mod bits;
 pub(crate) mod coerce;
+pub mod count;
+pub mod dmath;
 pub mod edge;
 pub mod graph;
 pub mod hash;
+pub mod key;
+pub mod pairing;
+pub mod partition;
+pub mod perm;
+pub mod sample;
 pub mod sampler;
 pub mod search;
 pub mod slot;
 pub mod space;
+pub mod stream;
 pub mod time;
 pub mod trajectory;
 pub mod word;

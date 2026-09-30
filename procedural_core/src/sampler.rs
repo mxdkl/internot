@@ -12,7 +12,7 @@ pub fn pareto<W: BitWord>(id: W, key: &str, alpha: f64, scale: f64) -> f64 {
     assert!(alpha > 0.0, "pareto alpha must be positive");
     assert!(scale > 0.0, "pareto scale must be positive");
     let u = hash_float(id, key);
-    scale * (1.0 - u).powf(-1.0 / alpha)
+    scale * crate::dmath::pow(1.0 - u, -1.0 / alpha)
 }
 
 /// Lognormal sample: `exp(mu + sigma * Z)` where `Z ~ N(0, 1)`.
@@ -20,7 +20,7 @@ pub fn pareto<W: BitWord>(id: W, key: &str, alpha: f64, scale: f64) -> f64 {
 /// Used for income, asset values, response times. Always positive.
 pub fn lognormal<W: BitWord>(id: W, key: &str, mu: f64, sigma: f64) -> f64 {
     let z = hash_gaussian(id, key);
-    (mu + sigma * z).exp()
+    crate::dmath::exp(mu + sigma * z)
 }
 
 /// Exponential sample with given rate. Inverse CDF: `-ln(1 - u) / rate`.
@@ -29,7 +29,7 @@ pub fn lognormal<W: BitWord>(id: W, key: &str, mu: f64, sigma: f64) -> f64 {
 pub fn exponential<W: BitWord>(id: W, key: &str, rate: f64) -> f64 {
     assert!(rate > 0.0, "exponential rate must be positive");
     let u = hash_float(id, key);
-    -(1.0 - u).ln() / rate
+    -crate::dmath::ln(1.0 - u) / rate
 }
 
 /// Weighted categorical choice. Returns an index in `[0, weights.len())`,

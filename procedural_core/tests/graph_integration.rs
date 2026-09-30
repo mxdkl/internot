@@ -1,3 +1,4 @@
+#![allow(deprecated)] // exercises graph::stable_roommates_match until it is removed
 //! Cross-cutting integration tests for `procedural_core::graph`.
 //! Wires the modules together on a tiny synthetic cohort.
 
@@ -60,13 +61,9 @@ fn matching_is_deterministic_across_runs() {
 }
 
 #[test]
-#[ignore = "v1 limitation: per-call event index resets at t_start; full slice-recombinability requires re-anchoring index at a global origin. Tracked as v2 follow-up."]
 fn event_enumeration_slice_recombinability() {
-    // Spec property: enumerate([t1, t2]) ∪ enumerate([t2, t3]) ==
-    // enumerate([t1, t3]). In v1 this does NOT hold because each
-    // call seeds its event-index sequence from t_start. A future
-    // refactor will anchor the index at a global origin so slicing
-    // preserves continuity. Until then, this test stays #[ignore].
+    // enumerate([t1, t2)) ++ enumerate([t2, t3)) == enumerate([t1, t3)).
+    // Holds because every draw is keyed on the absolute day, not the window.
     let t0 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
     let t_mid = t0 + Duration::days(50);
     let t_end = t0 + Duration::days(100);
@@ -79,6 +76,6 @@ fn event_enumeration_slice_recombinability() {
     assert_eq!(
         full.iter().map(|e| e.at).collect::<Vec<_>>(),
         combined.iter().map(|e| e.at).collect::<Vec<_>>(),
-        "slice-recombinability — would catch v2 fix landing"
+        "slice-recombinability"
     );
 }

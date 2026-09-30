@@ -92,7 +92,7 @@ pub fn comm_intensity(
     let avg_chronotype = 0.5 * (self_p.chronotype + peer_p.chronotype);
     let peak_hour = DIURNAL_PEAK_BASE + DIURNAL_PEAK_SHIFT * avg_chronotype;
     let hour = t.hour() as f64;
-    let diurnal = (0.5 + 0.5 * ((hour - peak_hour) * std::f64::consts::PI / 12.0).cos()).clamp(0.0, 1.0);
+    let diurnal = (0.5 + 0.5 * crate::dmath::cos((hour - peak_hour) * std::f64::consts::PI / 12.0)).clamp(0.0, 1.0);
     // Weekly: weekdays slightly higher than weekends for mail/calendar;
     // chat slightly the other way.
     let weekday = t.weekday().num_days_from_monday(); // 0 (Mon) .. 6 (Sun)

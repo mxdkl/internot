@@ -3,6 +3,8 @@
 //! Each function takes two vectors (or other domain-specific inputs) and returns
 //! a scalar in `[0, 1]` representing similarity or connection strength.
 
+use crate::dmath;
+
 /// Geometric edge function: similarity from Euclidean distance.
 ///
 /// If `soft == false`, returns 1.0 when distance <= radius, 0.0 otherwise (hard threshold).
@@ -14,12 +16,12 @@
 /// Panics if `a` and `b` have different lengths.
 pub fn geometric(a: &[f64], b: &[f64], radius: f64, soft: bool) -> f64 {
     assert_eq!(a.len(), b.len(), "vectors must have equal length");
-    let dist_sq: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
+    let dist_sq: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
     let dist = dist_sq.sqrt();
     if soft {
         // Sigmoid: 1 / (1 + exp(k * (d - r))), with k chosen so the transition is sharp but smooth.
         let k = 6.0 / radius.max(f64::MIN_POSITIVE);
-        1.0 / (1.0 + (k * (dist - radius)).exp())
+        1.0 / (1.0 + dmath::exp(k * (dist - radius)))
     } else if dist <= radius {
         1.0
     } else {
@@ -63,16 +65,16 @@ pub fn hyperbolic(a: (f64, f64), b: (f64, f64), r_disk: f64, temperature: f64) -
     let (r1, theta1) = a;
     let (r2, theta2) = b;
     // Convert Poincaré-disk radial coordinates to hyperbolic radii.
-    let h1 = 2.0 * r1.clamp(0.0, 1.0 - f64::EPSILON).atanh();
-    let h2 = 2.0 * r2.clamp(0.0, 1.0 - f64::EPSILON).atanh();
+    let h1 = 2.0 * dmath::atanh(r1.clamp(0.0, 1.0 - f64::EPSILON));
+    let h2 = 2.0 * dmath::atanh(r2.clamp(0.0, 1.0 - f64::EPSILON));
     // Hyperbolic law of cosines. Guard against numerical issues when the two points coincide.
-    let d_theta = (theta1 - theta2).cos();
-    let cosh_d = h1.cosh() * h2.cosh() - h1.sinh() * h2.sinh() * d_theta;
+    let d_theta = dmath::cos(theta1 - theta2);
+    let cosh_d = dmath::cosh(h1) * dmath::cosh(h2) - dmath::sinh(h1) * dmath::sinh(h2) * d_theta;
     let cosh_d = cosh_d.max(1.0); // ensure input to acosh is valid
-    let d = cosh_d.acosh();
+    let d = dmath::acosh(cosh_d);
     // Sigmoid connection probability, sharper for smaller temperature.
     let t = temperature.max(1e-6);
-    1.0 / (1.0 + ((d - r_disk) / (2.0 * t)).exp())
+    1.0 / (1.0 + dmath::exp((d - r_disk) / (2.0 * t)))
 }
 
 /// Stochastic block model edge probability.

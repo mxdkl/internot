@@ -1,0 +1,680 @@
+{
+  "suite": "kinship",
+  "run": {
+    "machine": {
+      "cpu_model": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "logical_cores": 16,
+      "governor": "performance",
+      "slug": "amd-ryzen-9-5900hx-with-radeon-graphics-16t"
+    },
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "build_profile": "release",
+    "git_commit": "a17391ef1b2f-dirty",
+    "timestamp": "2026-09-30T19:21:48Z",
+    "quick": false,
+    "hw_counters_available": true,
+    "hw_counters_note": null,
+    "alloc_counting": true
+  },
+  "benchmarks": [
+    {
+      "name": "kinship/birth",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 169,
+      "calls": 16900000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 8.443073739999987,
+        "p50_ns": 8.247,
+        "p90_ns": 9.255,
+        "p99_ns": 10.079,
+        "p999_ns": 13.231,
+        "max_ns": 210.431,
+        "throughput_per_sec": 118440277.88865452,
+        "round_p99_ns": [
+          9.783,
+          10.143,
+          10.079,
+          10.079,
+          10.319,
+          10.319,
+          10.199,
+          9.847,
+          9.847,
+          9.847
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 210.331,
+          "input": "3075646"
+        },
+        {
+          "ns": 84.715,
+          "input": "5152449"
+        },
+        {
+          "ns": 75.467,
+          "input": "6381000"
+        },
+        {
+          "ns": 39.36,
+          "input": "8155980"
+        },
+        {
+          "ns": 38.005,
+          "input": "6171367"
+        },
+        {
+          "ns": 36.343,
+          "input": "4330154"
+        },
+        {
+          "ns": 35.568,
+          "input": "7710491"
+        },
+        {
+          "ns": 33.556,
+          "input": "9700296"
+        },
+        {
+          "ns": 32.958,
+          "input": "6595145"
+        },
+        {
+          "ns": 32.544,
+          "input": "3067102"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 37.495736094674555,
+        "instructions": 145.62669881656805,
+        "ipc": 3.8838202415567755,
+        "cache_references": 0.019505325443786983,
+        "cache_misses": 0.0037236686390532546,
+        "branch_misses": 0.00745680473372781,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/death",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 222.00405247999984,
+        "p50_ns": 201.087,
+        "p90_ns": 291.071,
+        "p99_ns": 601.087,
+        "p999_ns": 902.143,
+        "max_ns": 4902.911,
+        "throughput_per_sec": 4504422.2789135305,
+        "round_p99_ns": [
+          601.087,
+          601.087,
+          631.295,
+          601.087,
+          581.119,
+          601.087,
+          631.295,
+          612.351,
+          661.503,
+          591.359
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 4899.0,
+          "input": "9776950"
+        },
+        {
+          "ns": 4789.0,
+          "input": "10275141"
+        },
+        {
+          "ns": 4208.0,
+          "input": "9453472"
+        },
+        {
+          "ns": 3787.0,
+          "input": "5691100"
+        },
+        {
+          "ns": 3677.0,
+          "input": "594635"
+        },
+        {
+          "ns": 3567.0,
+          "input": "2303210"
+        },
+        {
+          "ns": 2284.0,
+          "input": "2488169"
+        },
+        {
+          "ns": 2174.0,
+          "input": "10187965"
+        },
+        {
+          "ns": 2124.0,
+          "input": "8662117"
+        },
+        {
+          "ns": 1924.0,
+          "input": "10123645"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 2129.775,
+        "instructions": 726.7737,
+        "ipc": 0.3412443567982533,
+        "cache_references": 29.2888,
+        "cache_misses": 14.1021,
+        "branch_misses": 1.4511,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/mother",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 463.1106293599996,
+        "p50_ns": 421.119,
+        "p90_ns": 701.439,
+        "p99_ns": 1172.479,
+        "p999_ns": 1904.639,
+        "max_ns": 8228.863,
+        "throughput_per_sec": 2159311.2673357553,
+        "round_p99_ns": [
+          1142.783,
+          1072.127,
+          1373.183,
+          1242.111,
+          1172.479,
+          1163.263,
+          1153.023,
+          1142.783,
+          1473.535,
+          1332.223
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 8226.0,
+          "input": "6075312"
+        },
+        {
+          "ns": 7925.0,
+          "input": "7299772"
+        },
+        {
+          "ns": 6753.0,
+          "input": "8760424"
+        },
+        {
+          "ns": 6632.0,
+          "input": "5182084"
+        },
+        {
+          "ns": 6082.0,
+          "input": "1707441"
+        },
+        {
+          "ns": 5741.0,
+          "input": "10100835"
+        },
+        {
+          "ns": 5420.0,
+          "input": "8880074"
+        },
+        {
+          "ns": 5410.0,
+          "input": "7535525"
+        },
+        {
+          "ns": 5190.0,
+          "input": "10662950"
+        },
+        {
+          "ns": 4899.0,
+          "input": "1110616"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 3175.2778,
+        "instructions": 1886.6105,
+        "ipc": 0.5941560451813066,
+        "cache_references": 83.6545,
+        "cache_misses": 36.5629,
+        "branch_misses": 7.9324,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/father",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 1419.7707482399985,
+        "p50_ns": 1443.839,
+        "p90_ns": 2234.367,
+        "p99_ns": 3065.855,
+        "p999_ns": 5029.887,
+        "max_ns": 18038.783,
+        "throughput_per_sec": 704339.0640634326,
+        "round_p99_ns": [
+          3006.463,
+          3057.663,
+          3327.999,
+          3258.367,
+          3377.151,
+          3137.535,
+          3057.663,
+          2996.223,
+          2977.791,
+          3065.855
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 18034.0,
+          "input": "8218148"
+        },
+        {
+          "ns": 10199.0,
+          "input": "7588328"
+        },
+        {
+          "ns": 9087.0,
+          "input": "10136226"
+        },
+        {
+          "ns": 9017.0,
+          "input": "570447"
+        },
+        {
+          "ns": 8807.0,
+          "input": "682433"
+        },
+        {
+          "ns": 8776.0,
+          "input": "7521348"
+        },
+        {
+          "ns": 8666.0,
+          "input": "9917875"
+        },
+        {
+          "ns": 8556.0,
+          "input": "7507170"
+        },
+        {
+          "ns": 8195.0,
+          "input": "10082008"
+        },
+        {
+          "ns": 8135.0,
+          "input": "3500487"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 7449.7029,
+        "instructions": 6035.2404,
+        "ipc": 0.8101316899496757,
+        "cache_references": 193.7434,
+        "cache_misses": 80.1836,
+        "branch_misses": 13.7169,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/union",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 1330.8251193599988,
+        "p50_ns": 1432.575,
+        "p90_ns": 2285.567,
+        "p99_ns": 3137.535,
+        "p999_ns": 4653.055,
+        "max_ns": 11583.487,
+        "throughput_per_sec": 751413.5294357125,
+        "round_p99_ns": [
+          3317.759,
+          3137.535,
+          3076.095,
+          2957.311,
+          2945.023,
+          2945.023,
+          3055.615,
+          3147.775,
+          4188.159,
+          3536.895
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 11581.0,
+          "input": "616857"
+        },
+        {
+          "ns": 10029.0,
+          "input": "9558743"
+        },
+        {
+          "ns": 9978.0,
+          "input": "5071179"
+        },
+        {
+          "ns": 9858.0,
+          "input": "2483762"
+        },
+        {
+          "ns": 9437.0,
+          "input": "9677399"
+        },
+        {
+          "ns": 8766.0,
+          "input": "6760677"
+        },
+        {
+          "ns": 8656.0,
+          "input": "9041294"
+        },
+        {
+          "ns": 8586.0,
+          "input": "8925124"
+        },
+        {
+          "ns": 8526.0,
+          "input": "1357708"
+        },
+        {
+          "ns": 8465.0,
+          "input": "580229"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 7862.2141,
+        "instructions": 4681.9607,
+        "ipc": 0.5955015521645487,
+        "cache_references": 114.2839,
+        "cache_misses": 52.9566,
+        "branch_misses": 7.5867,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/children",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 1144.0651401600007,
+        "p50_ns": 721.407,
+        "p90_ns": 2596.863,
+        "p99_ns": 3948.543,
+        "p999_ns": 6475.775,
+        "max_ns": 19480.575,
+        "throughput_per_sec": 874076.1036212913,
+        "round_p99_ns": [
+          3598.335,
+          3737.599,
+          3588.095,
+          3598.335,
+          4370.431,
+          4521.983,
+          3948.543,
+          4771.839,
+          4079.615,
+          3887.103
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 19476.0,
+          "input": "9580592"
+        },
+        {
+          "ns": 18955.0,
+          "input": "10063056"
+        },
+        {
+          "ns": 16390.0,
+          "input": "2137925"
+        },
+        {
+          "ns": 16170.0,
+          "input": "624321"
+        },
+        {
+          "ns": 15849.0,
+          "input": "567331"
+        },
+        {
+          "ns": 12464.0,
+          "input": "3606905"
+        },
+        {
+          "ns": 11702.0,
+          "input": "7073968"
+        },
+        {
+          "ns": 11531.0,
+          "input": "8433358"
+        },
+        {
+          "ns": 11352.0,
+          "input": "1261887"
+        },
+        {
+          "ns": 10310.0,
+          "input": "1462722"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 7336.7474,
+        "instructions": 4871.7185,
+        "ipc": 0.664016114279742,
+        "cache_references": 119.027,
+        "cache_misses": 52.2495,
+        "branch_misses": 16.3127,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/siblings",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 966.8543606399994,
+        "p50_ns": 932.351,
+        "p90_ns": 1603.583,
+        "p99_ns": 2775.039,
+        "p999_ns": 4599.807,
+        "max_ns": 39452.671,
+        "throughput_per_sec": 1034281.936048838,
+        "round_p99_ns": [
+          3158.015,
+          2957.311,
+          2945.023,
+          2785.279,
+          2736.127,
+          2766.847,
+          2775.039,
+          2695.167,
+          2775.039,
+          2725.887
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 39424.0,
+          "input": "7058600"
+        },
+        {
+          "ns": 7364.0,
+          "input": "170866"
+        },
+        {
+          "ns": 7213.0,
+          "input": "6013966"
+        },
+        {
+          "ns": 7173.0,
+          "input": "1079549"
+        },
+        {
+          "ns": 7043.0,
+          "input": "8541619"
+        },
+        {
+          "ns": 6872.0,
+          "input": "10348197"
+        },
+        {
+          "ns": 6723.0,
+          "input": "8243917"
+        },
+        {
+          "ns": 6712.0,
+          "input": "7086553"
+        },
+        {
+          "ns": 6542.0,
+          "input": "5291625"
+        },
+        {
+          "ns": 6532.0,
+          "input": "3836224"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 5242.8439,
+        "instructions": 5803.1636,
+        "ipc": 1.106873237252019,
+        "cache_references": 139.5567,
+        "cache_misses": 52.6783,
+        "branch_misses": 30.5244,
+        "note": null
+      }
+    },
+    {
+      "name": "kinship/world_build",
+      "mode": "warm",
+      "attempts": 1,
+      "batch": 1,
+      "calls": 5,
+      "distinct_inputs": 1,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 5,
+        "rounds": 1,
+        "mean_ns": 1036429295.616,
+        "p50_ns": 1037234601.983,
+        "p90_ns": 1041529569.279,
+        "p99_ns": 1041529569.279,
+        "p999_ns": 1041529569.279,
+        "max_ns": 1041529569.279,
+        "throughput_per_sec": 0.9648511521527878,
+        "round_p99_ns": [
+          1041529569.279
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 1041264697.0,
+          "input": "42"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 10781132,
+        "mean_per_call": 10781132.0,
+        "mean_bytes_per_call": 1530219036.0
+      },
+      "counters": {
+        "cycles": 4655020888.0,
+        "instructions": 12997060531.0,
+        "ipc": 2.792052032355993,
+        "cache_references": 97858420.0,
+        "cache_misses": 19802493.0,
+        "branch_misses": 20425431.0,
+        "note": null
+      }
+    }
+  ]
+}

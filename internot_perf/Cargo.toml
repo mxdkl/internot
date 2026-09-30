@@ -1,0 +1,22 @@
+[package]
+name = "internot_perf"
+description = "Performance harness and budget gate for Internot: latency distributions, hardware counters, flamegraphs, allocation counting."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+procedural_core = { path = "../procedural_core" }
+internot_society = { path = "../internot_society" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hdrhistogram = { version = "7.5", default-features = false }
+perf-event2 = "0.7"
+pprof = { version = "0.15", default-features = false, features = ["flamegraph"] }
+toml = "1"
+
+[[bin]]
+name = "perf-gate"
+path = "src/bin/perf-gate.rs"

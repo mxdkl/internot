@@ -1,0 +1,225 @@
+# Performance budgets: every benchmark perf-gate measures must have one.
+# Spec: docs/superpowers/specs/2026-09-29-society-as-a-function.md §16.2.
+#
+# A budget is never raised silently: raising one needs a design change or an
+# exception the founder explicitly approved, noted in a comment next to it.
+#
+# [budget."<suite>/<bench>"]
+# mode = "warm" | "cold"   required; must match how the benchmark runs
+# p99_ns = <number>        required; maximum p99 latency per call
+# p50_ns = <number>        optional; maximum median
+# max_allocs = <integer>   optional; maximum heap allocations in any one call
+
+[gate]
+# Fail when p99 exceeds the committed baseline's p99 by more than this fraction.
+max_regression = 0.10
+
+# --- core_hash -------------------------------------------------------------
+# PLACEHOLDERS. This example suite proves the plumbing; these primitives have
+# no §16.2 budget yet. Set at ~4x the p99 measured on the reference machine
+# (Ryzen 9 5900HX, powersave governor, 2026-09-29): hash_int 23-25 ns,
+# hash_float 25-27 ns, lognormal 88-97 ns. Zero allocations measured.
+
+[budget."core_hash/hash_int"]
+mode = "warm"
+p99_ns = 100
+max_allocs = 0
+
+[budget."core_hash/hash_float"]
+mode = "warm"
+p99_ns = 100
+max_allocs = 0
+
+[budget."core_hash/lognormal"]
+mode = "warm"
+p99_ns = 400
+max_allocs = 0
+
+# --- primitives (Phase 0, spec §4) ----------------------------------------
+# Set 2026-09-30 at about 2x the p99 measured on the reference machine
+# (Ryzen 9 5900HX, powersave governor): tight enough that a real regression
+# fails, loose enough for this governor's noise. The committed baseline's
+# 10% rule catches smaller drift. Hot paths must not allocate (§16.2).
+
+[budget."primitives/key_with3_unit"]
+mode = "warm"
+p99_ns = 5
+max_allocs = 0
+
+[budget."primitives/poisson"]
+mode = "warm"
+p99_ns = 200
+max_allocs = 0
+
+[budget."primitives/binomial"]
+mode = "warm"
+p99_ns = 350
+max_allocs = 0
+
+[budget."primitives/std_normal"]
+mode = "warm"
+p99_ns = 50
+max_allocs = 0
+
+[budget."primitives/lognormal"]
+mode = "warm"
+p99_ns = 80
+max_allocs = 0
+
+[budget."primitives/feistel_fwd"]
+mode = "warm"
+p99_ns = 40
+max_allocs = 0
+
+[budget."primitives/feistel_inv"]
+mode = "warm"
+p99_ns = 40
+max_allocs = 0
+
+# CompactPerm (added 2026-09-30): the same network in 32 bytes; same budget
+# as FeistelPerm, since round keys come from one seed XOR constants.
+[budget."primitives/compact_fwd"]
+mode = "warm"
+p99_ns = 40
+max_allocs = 0
+
+[budget."primitives/compact_inv"]
+mode = "warm"
+p99_ns = 40
+max_allocs = 0
+
+[budget."primitives/small_perm_build_64"]
+mode = "warm"
+p99_ns = 2000
+max_allocs = 0
+
+[budget."primitives/pairing_partner"]
+mode = "warm"
+p99_ns = 100
+max_allocs = 0
+
+[budget."primitives/coupling_partner"]
+mode = "warm"
+p99_ns = 150
+max_allocs = 0
+
+[budget."primitives/size_classes_group_of"]
+mode = "warm"
+p99_ns = 15
+max_allocs = 0
+
+[budget."primitives/split_tree_leaf_of"]
+mode = "warm"
+p99_ns = 1200
+max_allocs = 0
+
+[budget."primitives/count_tree_count_before_24"]
+mode = "warm"
+p99_ns = 3000
+max_allocs = 0
+
+[budget."primitives/count_tree_select_24"]
+mode = "warm"
+p99_ns = 3000
+max_allocs = 0
+
+[budget."primitives/quota_locate_4lvl"]
+mode = "warm"
+p99_ns = 100
+max_allocs = 0
+
+[budget."primitives/poisson_buckets_30d"]
+mode = "warm"
+p99_ns = 12000
+max_allocs = 0
+
+[budget."primitives/poisson_tree_count_before"]
+mode = "warm"
+p99_ns = 2500
+max_allocs = 0
+
+[budget."primitives/poisson_tree_last_before"]
+mode = "warm"
+p99_ns = 8000
+max_allocs = 0
+
+[budget."primitives/hazard_time_100y_annual"]
+mode = "warm"
+p99_ns = 600
+max_allocs = 0
+
+# --- kinship (R1 prototype, spec §6 and §16.2) -----------------------------
+# The R1 world (internot_society) keeps no memo caches: every query is a
+# pure lookup over structure built with the ledger, so "warm" here is also
+# the spec's "cold" case and the cold targets apply. Inputs: uniform ids
+# over the 1840-2100 prototype world (11.1M ever born, 152 MB) plus the most
+# prolific 1900 mothers and their partners.
+# Lookups are timed one call per sample (a batch repeats one input and runs
+# from cache), with the CPU settled to 65 °C first (perf/README.md).
+# Measured 2026-09-30 (performance governor), after the locality work and
+# the founder's death decision (fathers alive at conception): p99 death
+# 0.45-0.87 µs (bimodal across rounds), mother 1.1-1.2 µs, father 3.1 µs,
+# union 3.0-3.3 µs, children 3.6-3.95 µs, siblings 2.8-3.35 µs.
+# Earlier notes below record how each budget was set.
+
+[budget."kinship/birth"]
+mode = "warm"
+p99_ns = 25
+max_allocs = 0
+
+[budget."kinship/death"]
+mode = "warm"
+p99_ns = 1000
+max_allocs = 0
+
+# 2 µs approved by the founder on 2026-09-30, tighter than the §16.2 one-hop
+# target of 5 µs. The earlier 700 ns came from batched runs that timed
+# repeated inputs from cache. Single-call p99 (performance governor, thermal
+# settle) is 1.3-1.4 µs: about 15 dependent DRAM loads at ~95 ns.
+[budget."kinship/mother"]
+mode = "warm"
+p99_ns = 2000
+max_allocs = 0
+
+# Re-applied 2026-09-30 after a design change: R1b-2 immigrants doubled
+# the world (11.3M ever born, 61 MB of structure) and added entry cohorts.
+# The same rule (about 2x measured p99, capped at the §16.2 one-hop target
+# of 5 µs) gives the cap: father measured 3.4 µs, children 3.9 µs.
+[budget."kinship/father"]
+mode = "warm"
+p99_ns = 5000
+max_allocs = 0
+
+# Raises to union, father, children and world_build approved by the founder
+# on 2026-09-30.
+# Re-applied 2026-09-30 after two more design changes: arrival cells for
+# immigrant couples and same-sex union cells tripled the union cells (35k ->
+# 98k, mostly tiny), and the world's structure grew to ~85 MB. Measured p99
+# alternates 2.9 / 4.5 µs between runs under the powersave governor; the
+# rule (about 2x measured, capped at the §16.2 one-hop target) gives the
+# 5 µs cap. Next lever: tiny cells without a stored permutation (see
+# AGENTS.md, Phase 1).
+[budget."kinship/union"]
+mode = "warm"
+p99_ns = 5000
+max_allocs = 0
+
+[budget."kinship/children"]
+mode = "warm"
+p99_ns = 5000
+max_allocs = 0
+
+[budget."kinship/siblings"]
+mode = "warm"
+p99_ns = 4000
+max_allocs = 0
+
+# World::build(Params::prototype()) end to end: ledger (two regions, local
+# and national markets, immigrants with families) plus lookup structure.
+# Measured 0.50 s before immigrants; re-derived 2026-09-30 after the R1b-2
+# design change (arrival cohorts, arrival cells and plans): 0.90 s, budget
+# ~2.2x. The spec's full-scale target is < 30 s and < 100 MB (§16.2); this
+# prototype budget guards the per-region cost.
+[budget."kinship/world_build"]
+mode = "warm"
+p99_ns = 2_000_000_000

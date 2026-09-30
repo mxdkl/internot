@@ -12,6 +12,11 @@ Cargo.lock
 # reproduce live in docs/profiling/*.md.
 docs/profiling/raw/
 
+# perf-gate outputs, regenerated on every run. Budgets (perf/budgets.toml)
+# and per-machine baselines (perf/baselines/) ARE committed.
+perf/results/latest/
+perf/flamegraphs/
+
 # Raw datasets — too big to commit (10GB+ each). The deduplicated
 # distillates that ship with each service ARE committed (e.g.
 # internot/data/first_names.json, internot/data/last_names.json),

@@ -300,7 +300,7 @@ fn career_events_for_uncached(person_id: U512) -> Vec<CareerEvent> {
 
     loop {
         let event_seed = seed.wrapping_add((seq as u64) << 16);
-        let interval_years = lognormal(event_seed, "career_interval_v1", 3.0_f64.ln(), 0.7);
+        let interval_years = lognormal(event_seed, "career_interval_v1", procedural_core::dmath::ln(3.0), 0.7);
         let interval_days = (interval_years * 365.0).clamp(180.0, 15.0 * 365.0) as i64;
         cursor_days += interval_days;
 

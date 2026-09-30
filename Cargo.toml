@@ -5,6 +5,8 @@ members = [
     "internot",
     "internot_mcp",
     "internot_renderer",
+    "internot_perf",
+    "internot_society",
 ]
 resolver = "2"
 
