@@ -4,7 +4,6 @@
 
 use std::time::Instant;
 
-use internot_society::params::GESTATION_DAYS;
 use internot_society::world::{year_start, DAY};
 use internot_society::{Params, Sex, World};
 
@@ -37,14 +36,22 @@ fn main() {
         ledger.class_moves,
         100.0 * ledger.class_moves as f64 / opposite.max(1) as f64
     );
-    let names: Vec<&str> = ledger.params.regions.iter().map(|r| r.name).collect();
+    let names: Vec<&str> = ledger
+        .params
+        .regions
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
     for &year in &[1850, 1900, 1950, 1975, 2000, 2025, 2050, 2090] {
-        let sizes: Vec<String> = ledger
-            .blocks_of_year(year)
-            .map(|b| {
-                let b = &ledger.blocks[b as usize];
-                format!("{} {}", names[b.region as usize], b.size)
-            })
+        let mut by_region = vec![0u64; names.len()];
+        for b in ledger.blocks_of_year(year) {
+            let b = &ledger.blocks[b as usize];
+            by_region[b.region as usize] += b.size;
+        }
+        let sizes: Vec<String> = names
+            .iter()
+            .zip(&by_region)
+            .map(|(n, s)| format!("{n} {s}"))
             .collect();
         println!("births {year}: {}", sizes.join(", "));
     }
@@ -161,7 +168,7 @@ fn main() {
         for id in (base..end).step_by(step) {
             let Some(m) = w.mother(id) else { continue };
             let b = w.birth(id);
-            let conception = b - GESTATION_DAYS * DAY;
+            let conception = b - w.ledger().params.fertility.gestation_days * DAY;
             n += 1;
             match w.father(id) {
                 Some(f) => {
@@ -198,8 +205,14 @@ fn main() {
         let mut ages2: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
         let (mut second_n, mut second_broken) = (0u64, 0u64);
         let (mut gap_first, mut gap_first_10, mut gap_re, mut gap_re_10) = (0u64, 0u64, 0u64, 0u64);
+        // Unions per person ever partnered, born 1930-1970 (R1d: no cap).
+        let mut counts = [0u64; internot_society::world::MAX_UNIONS + 1];
         for id in (0..w.population() as u32).step_by(7) {
-            let [first, second] = w.unions(id);
+            let us = w.unions(id);
+            let (first, second) = (us[0], us[1]);
+            if (1930..1970).contains(&w.birth_year(id)) {
+                counts[us.iter().flatten().count()] += 1;
+            }
             let sex = w.sex(id) as usize;
             let birth_year = w.birth_year(id);
             if let Some(f) = first {
@@ -263,6 +276,16 @@ fn main() {
         println!(
             "  second unions begun 1960-89 broken within 10 y: {:.0}% (NSFG ~39)",
             pct(second_broken, second_n)
+        );
+        let ever: u64 = counts[1..].iter().sum();
+        let shares: Vec<String> = counts[1..]
+            .iter()
+            .map(|&c| format!("{:.1}", pct(c, ever)))
+            .collect();
+        let most = counts.iter().rposition(|&c| c > 0).unwrap_or(0);
+        println!(
+            "  unions per ever-partnered person born 1930-69, 1/2/3/...: {}% (most: {most}; SIPP 2009: married twice 12%, three+ times 3% of adults)",
+            shares.join("/")
         );
         // New opposite-sex unions 2005-2014 by partners' previous marriage
         // (Pew 2013: ~20% both previously married, ~20% one).

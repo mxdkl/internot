@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use internot_society::params::GESTATION_DAYS;
 use internot_society::world::{year_of, year_start, DAY};
 use internot_society::{CellKind, Params, PersonId, Sex, World};
 
@@ -27,21 +26,22 @@ fn age_at(w: &World, id: PersonId, t: i64) -> f64 {
 #[test]
 fn unions_are_mutual_and_agree_on_every_date() {
     let w = world();
-    let (mut partnered, mut second) = (0, 0);
+    let (mut partnered, mut second, mut third) = (0, 0, 0);
     for x in everyone(w) {
         let us = w.unions(x);
         let cells = w.union_cells(x);
         for (k, (u, cell)) in us.iter().zip(cells).enumerate() {
             let Some(u) = u else { continue };
             let (_, kind) = cell.expect("a union has a cell");
-            if k == 0 {
-                partnered += 1;
-            } else {
-                second += 1;
+            match k {
+                0 => partnered += 1,
+                1 => second += 1,
+                _ => third += 1,
             }
-            // The partner holds the same union, in their first or second
-            // seat (a divorced partner in their second, R1c). A divorced
-            // couple can remarry each other, so match the start too.
+            // The partner holds the same union, in whichever seat it is for
+            // them (a re-partnering partner in a later one, R1c and R1d). A
+            // divorced couple can remarry each other, so match the start
+            // too.
             let vs = w.unions(u.partner);
             let j = vs
                 .iter()
@@ -60,24 +60,34 @@ fn unions_are_mutual_and_agree_on_every_date() {
                 "{x}: sexes vs union kind"
             );
             assert_eq!(
-                k == 1,
+                k >= 1,
                 kind.second(),
                 "{x}: seat {k} holds a {kind:?} union"
             );
         }
-        // Availability (R1c): a second union follows the first's
-        // separation, in a later year, and starts while alive.
-        if let (Some(a), Some(b)) = (us[0], us[1]) {
-            let sep = a.separation.expect("a second union follows a separation");
-            assert!(
-                year_of(sep) < year_of(b.start),
-                "{x}: second union before the first separates"
-            );
-            assert!(b.start < w.death(x), "{x} dies before the second union");
+        // Availability (R1c, R1d): each later union follows the previous
+        // one's separation, in a later year, and starts while alive; the
+        // seats fill in order.
+        for k in 1..us.len() {
+            match (us[k - 1], us[k]) {
+                (Some(a), Some(b)) => {
+                    let sep = a.separation.expect("a later union follows a separation");
+                    assert!(
+                        year_of(sep) < year_of(b.start),
+                        "{x}: union {k} before union {} separates",
+                        k - 1
+                    );
+                    assert!(b.start < w.death(x), "{x} dies before union {k}");
+                }
+                (None, Some(_)) => panic!("{x}: union {k} without union {}", k - 1),
+                _ => {}
+            }
         }
     }
     assert!(partnered > 1000, "only {partnered} partnered people");
     assert!(second > 50, "only {second} second unions");
+    assert!(third > 0, "no third unions");
+    eprintln!("unions: {partnered} first, {second} second, {third} third or later");
 }
 
 #[test]
@@ -165,7 +175,7 @@ fn life_bounds_hold() {
             assert!((12.0..=51.0).contains(&age), "mother of {x} aged {age:.1}");
         }
         if let Some(f) = w.father(x) {
-            let conception = b - GESTATION_DAYS * DAY;
+            let conception = b - w.ledger().params.fertility.gestation_days * DAY;
             assert!(
                 w.birth(f) < conception && conception < w.death(f),
                 "father of {x} not alive at conception"
@@ -326,7 +336,7 @@ fn people_per_block_match_the_ledger() {
     let ledger = w.ledger();
     let block = |x: PersonId| {
         ledger
-            .block_of(w.birth_year(x), w.region(x))
+            .block_of(w.birth_year(x), w.lineage_group(x))
             .expect("every person is in a block")
     };
     let mut per_block: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -404,16 +414,18 @@ fn people_per_block_match_the_ledger() {
 }
 
 #[test]
-fn children_inherit_the_mothers_region_and_unions_cross_regions() {
+fn children_inherit_the_mothers_group_and_unions_cross_groups() {
     let w = world();
     let (mut cross, mut unions) = (0u64, 0u64);
     let mut directions = [0u64; 2];
+    // Cross-heritage unions, by the woman's heritage.
+    let mut mixed = vec![0u64; w.ledger().params.heritage_count()];
     for x in everyone(w) {
         if let Some(m) = w.mother(x) {
             assert_eq!(
-                w.region(x),
-                w.region(m),
-                "{x} is not in its mother's region"
+                (w.lineage_group(x), w.region(x), w.heritage(x)),
+                (w.lineage_group(m), w.region(m), w.heritage(m)),
+                "{x} is not in its mother's group"
             );
         }
         if w.sex(x) != Sex::Female {
@@ -425,13 +437,23 @@ fn children_inherit_the_mothers_region_and_unions_cross_regions() {
                 cross += 1;
                 directions[w.region(x) as usize] += 1;
             }
+            if w.heritage(x) != w.heritage(u.partner) {
+                mixed[w.heritage(x).index()] += 1;
+            }
         }
     }
+    // The tiny world floors every heritage at 8% and boosts the open
+    // market, so every group's women have cross-heritage unions.
+    assert!(
+        mixed.iter().all(|&m| m > 20),
+        "cross-heritage unions: {mixed:?}"
+    );
     let share = cross as f64 / unions as f64;
     // ρ runs 0.25–0.35 over the tiny world's years and half of national
-    // unions cross regions: about 12–18% expected.
+    // unions cross regions (12–18%); the open market (boosted four-fold in
+    // the tiny world) mixes regions as well, so 15–35% in all.
     assert!(
-        (0.06..=0.25).contains(&share),
+        (0.06..=0.40).contains(&share),
         "cross-region share {share:.3}"
     );
     assert!(

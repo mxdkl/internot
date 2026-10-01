@@ -19,10 +19,11 @@
 //! R1b-2). Every cohort has its own pools; a block's unions each year are
 //! split over its cohorts exactly.
 //!
-//! Blocks are `(birth year, lineage region)`. Each year every block's
-//! desired unions split between its region's local market and one national
-//! market (R1 plan, R1b-1); the markets' integer matrices are merged into
-//! one union cell per block, sex and year.
+//! Blocks are `(birth year, lineage group)`, a group being a region and a
+//! heritage (N1). Each year every block's desired unions split between an
+//! open market across all groups, its heritage's national market and its
+//! group's local market (R1 plan, R1b-1; N1 plan §3); the markets' integer
+//! matrices are merged into one union cell per block, sex and year.
 //!
 //! Spec §5.2; R1 plan decisions D-R1.1–D-R1.5.
 
@@ -34,24 +35,19 @@ use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 use crate::params::{
-    age_gap_weight, arrival_age_weight, couple_arrival_share, death_prob, dissolution_class_pmf,
-    first_union_hazard, immigrant_male_share, immigration_rate, national_market_share,
-    remarriage_base, remarriage_duration, remarriage_gap_weight, same_sex_gap_weight,
-    same_sex_share, status_affinity, Params, Sex, ARRIVAL_GAP_MIN, MAX_AGE, MAX_ARRIVAL_AGE,
-    MAX_CLASS, MAX_REMARRIAGE_AGE, MIN_ARRIVAL_AGE, MIN_COUPLE_ARRIVAL_AGE,
+    Heritage, MortalityFactor, Params, Repartnering, Sex, Unions, MAX_AGE, MAX_ARRIVAL_AGE,
+    MAX_CLASS, MAX_REMARRIAGE_AGE,
 };
 use crate::plan::{
     apportion, arrival_births, arrival_plans, leaf_births, nonunion_plans, union_age_density,
     PlanLeaf, PlanTables,
 };
 
-/// Youngest age at which a union starts (so everyone is at least 15 on the
-/// union date).
-pub const MIN_UNION_AGE: i32 = 16;
-/// Oldest age at which a woman starts a first union.
-pub const MAX_UNION_AGE_F: i32 = 65;
-/// Oldest age at which a man starts a first union.
-pub const MAX_UNION_AGE_M: i32 = 70;
+pub use crate::params::MIN_UNION_AGE;
+/// Smallest expected number of unions for a block to join a market: below
+/// it a seeker group adds nothing but matrix size. Numerical, not a rule
+/// about people (the first-union hazard has no upper age).
+const MIN_WANT: f64 = 1e-6;
 
 /// A block's union cell for one year, kind and dissolution class: members
 /// who start their (first) union that year and whose couples separate in
@@ -101,13 +97,13 @@ pub enum CellKind {
     /// did not arrive with her.
     Arrival = 3,
     /// Opposite-sex unions formed in-world that year in which this cell's
-    /// members are in their first union and their partners, divorced, in
-    /// their second (R1c).
+    /// members are in their first union and their partners re-partner
+    /// after a divorce (R1c; any later union, R1d).
     FirstWithSecond = 4,
-    /// The mirror: this cell's members are divorced and in their second
-    /// union, their partners in their first.
+    /// The mirror: this cell's members re-partner after a divorce (their
+    /// second union or a later one), their partners in their first.
     SecondWithFirst = 5,
-    /// Both partners divorced and in their second union.
+    /// Both partners re-partner after a divorce.
     SecondWithSecond = 6,
 }
 
@@ -134,7 +130,8 @@ impl CellKind {
         }
     }
 
-    /// True if this cell's members are in their second union.
+    /// True if this cell's members re-partner after a divorce: their second
+    /// union or a later one. Their members come from divorced sources.
     pub fn second(self) -> bool {
         matches!(self, CellKind::SecondWithFirst | CellKind::SecondWithSecond)
     }
@@ -147,15 +144,11 @@ impl CellKind {
         )
     }
 
-    /// True if the couple feeds the divorced pools when it separates: this
-    /// cell's members are in an opposite-sex first union. (Second unions
-    /// may dissolve, but there is no third; same-sex couples don't
-    /// re-partner in R1c.)
-    pub fn first_opposite(self) -> bool {
-        matches!(
-            self,
-            CellKind::InWorld | CellKind::Arrival | CellKind::FirstWithSecond
-        )
+    /// True if the couple feeds the divorced pools when it separates: any
+    /// opposite-sex union, whatever its order (R1d: no cap on the number of
+    /// unions). Same-sex couples don't re-partner yet.
+    pub fn feeds_divorced(self) -> bool {
+        !self.same_sex()
     }
 
     /// Number of kinds.
@@ -194,13 +187,17 @@ pub struct MotherShare {
     pub nonunion_births: u64,
 }
 
-/// One birth cohort: a lineage region's births in one year.
+/// One birth cohort: a lineage group's births in one year.
 #[derive(Clone, Debug)]
 pub struct Block {
     /// Birth year.
     pub year: i32,
+    /// Lineage group: `region * heritages + heritage`.
+    pub group: u16,
     /// Lineage region (index into [`Params::regions`]).
     pub region: u16,
+    /// Heritage group (N1).
+    pub heritage: Heritage,
     /// Founders were alive at `y0` and have no in-world parents.
     pub founder: bool,
     /// Members, over all entry cohorts.
@@ -251,9 +248,9 @@ pub struct Ledger {
     pub params: Params,
     /// Birth year of block 0.
     pub first_year: i32,
-    /// Lineage regions; block `(year, r)` has index
-    /// `(year - first_year) * regions + r`.
-    pub regions: usize,
+    /// Lineage groups (regions × heritages); block `(year, g)` has index
+    /// `(year - first_year) * groups + g`.
+    pub groups: usize,
     pub blocks: Vec<Block>,
     /// `base[b]` is block `b`'s first id; `base[len]` is the id count.
     pub base: Vec<u64>,
@@ -320,6 +317,7 @@ impl Births {
 struct Plans<'a> {
     root: Key,
     tables: &'a PlanTables,
+    params: &'a Params,
 }
 
 /// Where a class-cell's members come from: entry cohorts (first unions) or
@@ -406,14 +404,16 @@ pub(crate) fn cutoff(class: u8) -> Option<i32> {
 }
 
 /// Period survival `l(age)` at `year` for founders' starting sizes.
-fn period_survival(sex: Sex, age: i32, year: i32) -> f64 {
-    (0..age.max(0)).fold(1.0, |l, a| l * (1.0 - death_prob(sex, a as u32, year)))
+fn period_survival(p: &Params, f: MortalityFactor, sex: Sex, age: i32, year: i32) -> f64 {
+    (0..age.max(0)).fold(1.0, |l, a| {
+        l * (1.0 - p.mortality.death_prob_scaled(sex, a as u32, year, f))
+    })
 }
 
 /// Probability of never having partnered by `age` under `year`'s hazards.
-fn never_partnered_share(sex: Sex, age: i32, year: i32) -> f64 {
+fn never_partnered_share(p: &Params, sex: Sex, age: i32, year: i32) -> f64 {
     (0..age.max(0)).fold(1.0, |s, a| {
-        s * (1.0 - first_union_hazard(sex, a as u32, year))
+        s * (1.0 - p.unions.first_union_hazard(sex, a as u32, year))
     })
 }
 
@@ -625,6 +625,9 @@ struct Pool {
     cohorts: Vec<CohortPool>,
     div: [DivPools; 2],
     taken: [[u64; 2]; CellKind::COUNT],
+    /// This year's partnering rate of the never-partnered, by sex:
+    /// `[natives, arrival cohorts]` (R1d).
+    rate: [[f64; 2]; 2],
 }
 
 /// Below this many expected survivors a divorced source is retired from
@@ -647,6 +650,7 @@ impl Pool {
             cohorts: vec![c],
             div: [DivPools::default(), DivPools::default()],
             taken: [[0; 2]; CellKind::COUNT],
+            rate: [[1.0; 2]; 2],
         }
     }
 
@@ -655,6 +659,36 @@ impl Pool {
             .iter()
             .map(|&k| self.taken[k as usize][s as usize])
             .sum()
+    }
+
+    /// This year's desired first in-world unions of the never-partnered:
+    /// each cohort's expected members times its rate.
+    fn want(&self, s: Sex) -> f64 {
+        let si = s as usize;
+        self.cohorts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c.never[si].max(0.0) * self.rate[si][(i > 0) as usize])
+            .sum()
+    }
+
+    /// The yearly partnering rate of the block's natives who are single at
+    /// `age`, never partnered (hazard `h`) and divorced together: what a
+    /// single arrival of that age is given (R1d). `h` alone when the block
+    /// has no single natives.
+    fn single_rate(&self, s: Sex, age: i32, t: i32, h: f64, rp: &Repartnering) -> f64 {
+        let never = self.cohorts[0].never[s as usize].max(0.0);
+        let d = &self.div[s as usize];
+        let divorced: f64 = d
+            .available(t)
+            .iter()
+            .map(|y| y.scaled.max(0.0))
+            .sum::<f64>()
+            * d.factor;
+        if never + divorced <= 0.0 {
+            return h;
+        }
+        (h * never + self.div_want(s, age, t, rp)) / (never + divorced)
     }
 
     /// Expected never-partnered members left this year.
@@ -678,15 +712,15 @@ impl Pool {
     }
 
     /// Desired second unions this year of the divorced, aged `age`.
-    fn div_want(&self, s: Sex, age: i32, t: i32) -> f64 {
-        let base = remarriage_base(s, age, t);
+    fn div_want(&self, s: Sex, age: i32, t: i32, rp: &Repartnering) -> f64 {
+        let base = rp.base(s, age, t);
         if base == 0.0 {
             return 0.0;
         }
         let d = &self.div[s as usize];
         d.available(t)
             .iter()
-            .map(|y| remarriage_duration(t - y.year) * y.scaled.max(0.0))
+            .map(|y| rp.duration(t - y.year) * y.scaled.max(0.0))
             .sum::<f64>()
             * d.factor
             * base
@@ -724,7 +758,12 @@ impl Pool {
         if n == 0 {
             return Vec::new();
         }
-        let weights: Vec<f64> = self.cohorts.iter().map(|c| c.never[si].max(0.0)).collect();
+        let weights: Vec<f64> = self
+            .cohorts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c.never[si].max(0.0) * self.rate[si][(i > 0) as usize])
+            .collect();
         let caps: Vec<u64> = self
             .cohorts
             .iter()
@@ -748,7 +787,14 @@ impl Pool {
     /// survivors, capped by members not yet re-partnered. Each level is a
     /// keyed systematic sweep ([`sweep`]): exact, unbiased, linear and
     /// allocation-free. Returns `(source, count)` in source order.
-    fn settle_div(&mut self, kind: CellKind, s: Sex, t: i32, key: Key) -> Vec<(u32, u64)> {
+    fn settle_div(
+        &mut self,
+        kind: CellKind,
+        s: Sex,
+        t: i32,
+        key: Key,
+        rp: &Repartnering,
+    ) -> Vec<(u32, u64)> {
         let si = s as usize;
         let n = std::mem::take(&mut self.taken[kind as usize][si]);
         if n == 0 {
@@ -764,10 +810,7 @@ impl Pool {
                 ny,
                 |yi| {
                     let y = &years[yi];
-                    (
-                        remarriage_duration(t - y.year) * y.scaled.max(0.0),
-                        y.unused,
-                    )
+                    (rp.duration(t - y.year) * y.scaled.max(0.0), y.unused)
                 },
                 key.unit(),
                 |yi, k| by_year[yi] += k,
@@ -881,7 +924,7 @@ fn sweep(
 /// Register a first-union class-cell that separates as a divorced source
 /// of its block (R1c): the ledger's list, and the projection's pool.
 fn add_source(block: &mut Block, pool: &mut Pool, s: Sex, cell: &UnionCell) {
-    if cell.class == 0 || !cell.kind.first_opposite() {
+    if cell.class == 0 || !cell.kind.feeds_divorced() {
         return;
     }
     let src = DivSource {
@@ -946,41 +989,90 @@ impl Ledger {
         let plan_root = Key::from_seed(seed).with(TAG_PLANS);
         // Union years: arriving couples' unions began up to their age at
         // arrival before it; every other union starts in y0..=y1.
-        let plan_tables = PlanTables::new(params.y0 - MAX_ARRIVAL_AGE, params.y1);
+        let plan_tables = PlanTables::new(
+            params.y0 - MAX_ARRIVAL_AGE,
+            params.y1,
+            &params.fertility,
+            &params.heritage,
+        );
         let plans = Plans {
             root: plan_root,
             tables: &plan_tables,
+            params: &params,
         };
         let mut class_moves = 0u64;
         let arrival_density: Vec<Vec<f64>> = (params.y0..=params.y1)
-            .map(|t| union_age_density(t, MAX_ARRIVAL_AGE))
+            .map(|t| union_age_density(t, MAX_ARRIVAL_AGE, &params))
             .collect();
-        let regions = params.region_count();
-        assert!(regions >= 1, "a world needs at least one region");
+        assert!(
+            params.region_count() >= 1,
+            "a world needs at least one region"
+        );
+        let groups = params.group_count();
         let first_year = params.y0 - params.founder_max_age;
         let years = (params.y1 - first_year + 1) as usize;
         let male_share = params.male_share_at_birth;
-        let mut blocks: Vec<Block> = Vec::with_capacity(years * regions);
-        let mut pools: Vec<Pool> = Vec::with_capacity(years * regions);
-        let mut births = Births::new(first_year, years, years * regions);
+        let mut blocks: Vec<Block> = Vec::with_capacity(years * groups);
+        let mut pools: Vec<Pool> = Vec::with_capacity(years * groups);
+        let mut births = Births::new(first_year, years, years * groups);
         let weight_sum: f64 = params.regions.iter().map(|r| r.founder_weight).sum();
+        let heritages = params.heritage_count();
+        let founder_mix = params.floored(&params.heritage.founder_mix(params.y0));
+        // The founder mix is the composition of the living at y0, so each
+        // group's births are scaled by the base survivors over the group's:
+        // groups with higher mortality start from more births (exactly 1 for
+        // a group with the base mortality).
+        let survivors = |f: MortalityFactor| -> f64 {
+            (0..=params.founder_max_age)
+                .map(|age| {
+                    procedural_core::dmath::exp(-params.founder_growth * age as f64)
+                        * ((1.0 - male_share)
+                            * period_survival(&params, f, Sex::Female, age, params.y0)
+                            + male_share * period_survival(&params, f, Sex::Male, age, params.y0))
+                })
+                .sum()
+        };
+        let base_survivors = survivors(MortalityFactor {
+            infant: 1.0,
+            adult: 1.0,
+        });
+        let founder_scale: Vec<f64> = (0..heritages)
+            .map(|h| {
+                let f = params
+                    .heritage
+                    .mortality_factor(Heritage(h as u8), params.y0);
+                base_survivors / survivors(f)
+            })
+            .collect();
 
-        // Founders: survivors at y0 of a stable population, split by region.
+        // Founders: survivors at y0 of a stable population, split by region
+        // and heritage.
         for y in first_year..=params.y0 {
             let age = params.y0 - y;
-            for (r, region) in params.regions.iter().enumerate() {
+            for g in 0..groups {
+                let (region, heritage) = (g / heritages, g % heritages);
                 let born = params.founder_births
                     * procedural_core::dmath::exp(-params.founder_growth * age as f64)
-                    * region.founder_weight
-                    / weight_sum;
-                let f = (born * (1.0 - male_share) * period_survival(Sex::Female, age, params.y0))
-                    .round() as u64;
+                    * params.regions[region].founder_weight
+                    / weight_sum
+                    * founder_mix[heritage]
+                    * founder_scale[heritage];
+                let mf = params
+                    .heritage
+                    .mortality_factor(Heritage(heritage as u8), params.y0);
+                let f = (born
+                    * (1.0 - male_share)
+                    * period_survival(&params, mf, Sex::Female, age, params.y0))
+                .round() as u64;
                 let m =
-                    (born * male_share * period_survival(Sex::Male, age, params.y0)).round() as u64;
+                    (born * male_share * period_survival(&params, mf, Sex::Male, age, params.y0))
+                        .round() as u64;
                 let idx = blocks.len() as u32;
                 blocks.push(Block {
                     year: y,
-                    region: r as u16,
+                    group: g as u16,
+                    region: region as u16,
+                    heritage: Heritage(heritage as u8),
                     founder: true,
                     size: f + m,
                     females: f,
@@ -1000,40 +1092,39 @@ impl Ledger {
                     f,
                     m,
                     [
-                        f as f64 * never_partnered_share(Sex::Female, age, params.y0),
-                        m as f64 * never_partnered_share(Sex::Male, age, params.y0),
+                        f as f64 * never_partnered_share(&params, Sex::Female, age, params.y0),
+                        m as f64 * never_partnered_share(&params, Sex::Male, age, params.y0),
                     ],
                 )));
-                add_nonunion_births(&mut births, idx, f, y, params.y0 + 1, params.y1);
+                add_nonunion_births(
+                    &mut births,
+                    idx,
+                    f,
+                    y,
+                    params.y0 + 1,
+                    params.y1,
+                    (&params, Heritage(heritage as u8)),
+                );
             }
         }
 
         // Founder couples already partnered at y0.
         {
             let y0 = params.y0;
-            let wants = |b: usize, sex: Sex, max_age: i32| -> Option<f64> {
-                (MIN_UNION_AGE..=max_age + 30)
-                    .contains(&(y0 - blocks[b].year))
-                    .then(|| match sex {
-                        Sex::Female => blocks[b].females as f64 - pools[b].never(sex),
-                        Sex::Male => {
-                            (blocks[b].size - blocks[b].females) as f64 - pools[b].never(sex)
-                        }
-                    })
+            let wants = |b: usize, sex: Sex| -> Option<f64> {
+                (y0 - blocks[b].year >= MIN_UNION_AGE).then(|| match sex {
+                    Sex::Female => blocks[b].females as f64 - pools[b].never(sex),
+                    Sex::Male => (blocks[b].size - blocks[b].females) as f64 - pools[b].never(sex),
+                })
             };
-            let f: Vec<Option<f64>> = (0..blocks.len())
-                .map(|b| wants(b, Sex::Female, MAX_UNION_AGE_F))
-                .collect();
-            let m: Vec<Option<f64>> = (0..blocks.len())
-                .map(|b| wants(b, Sex::Male, MAX_UNION_AGE_M))
-                .collect();
+            let f: Vec<Option<f64>> = (0..blocks.len()).map(|b| wants(b, Sex::Female)).collect();
+            let m: Vec<Option<f64>> = (0..blocks.len()).map(|b| wants(b, Sex::Male)).collect();
             let none = vec![None; blocks.len()];
             clear_year(
                 y0,
-                params.same_sex_boost,
+                &params,
                 (&f, &m),
                 (&none, &none),
-                regions,
                 &mut blocks,
                 &mut pools,
                 &mut births,
@@ -1052,20 +1143,20 @@ impl Ledger {
             .sum();
         for t in params.y0 + 1..=params.y1 {
             // 1. The cohorts born this year: exactly the births recorded for
-            //    them, each in its mother's region.
-            let mut by_region: Vec<Vec<MotherShare>> = vec![Vec::new(); regions];
+            //    them, each in its mother's group.
+            let mut by_group: Vec<Vec<MotherShare>> = vec![Vec::new(); groups];
             for (mother, &(u, nu)) in births.year(t) {
                 if u + nu == 0 {
                     continue;
                 }
                 let mother = mother as u32;
-                by_region[blocks[mother as usize].region as usize].push(MotherShare {
+                by_group[blocks[mother as usize].group as usize].push(MotherShare {
                     mother,
                     union_births: u,
                     nonunion_births: nu,
                 });
             }
-            for (r, mut mothers) in by_region.into_iter().enumerate() {
+            for (g, mut mothers) in by_group.into_iter().enumerate() {
                 mothers.sort_by_key(|m| m.mother);
                 let size: u64 = mothers
                     .iter()
@@ -1075,7 +1166,9 @@ impl Ledger {
                 let idx = blocks.len() as u32;
                 blocks.push(Block {
                     year: t,
-                    region: r as u16,
+                    group: g as u16,
+                    region: (g / heritages) as u16,
+                    heritage: Heritage((g % heritages) as u8),
                     founder: false,
                     size,
                     females,
@@ -1096,33 +1189,49 @@ impl Ledger {
                     size - females,
                     [females as f64, (size - females) as f64],
                 )));
-                add_nonunion_births(&mut births, idx, females, t, t + 1, params.y1);
+                add_nonunion_births(
+                    &mut births,
+                    idx,
+                    females,
+                    t,
+                    t + 1,
+                    params.y1,
+                    (&params, Heritage((g % heritages) as u8)),
+                );
                 alive += size as f64;
             }
 
-            // 2. This year's union markets.
-            let want = |b: usize, sex: Sex, max_age: i32| -> Option<f64> {
+            // 2. This year's union markets. Natives who never partnered seek
+            //    first unions at the first-union hazard. Single immigrants
+            //    arrived as they were, with histories the world doesn't
+            //    know, so they partner at the rate of the natives of their
+            //    age who are single, never partnered and divorced together
+            //    (R1d): statistically like the people around them.
+            for (b, pool) in pools.iter_mut().enumerate() {
                 let age = t - blocks[b].year;
-                if !(MIN_UNION_AGE..=max_age).contains(&age) {
-                    return None;
+                for sex in [Sex::Female, Sex::Male] {
+                    pool.rate[sex as usize] = if age >= MIN_UNION_AGE {
+                        let h = params.unions.first_union_hazard(sex, age as u32, t);
+                        [h, pool.single_rate(sex, age, t, h, &params.repartnering)]
+                    } else {
+                        [0.0; 2]
+                    };
                 }
-                let w = first_union_hazard(sex, age as u32, t) * pools[b].never(sex).max(0.0);
-                (w > 0.0).then_some(w)
+            }
+            let want = |b: usize, sex: Sex| -> Option<f64> {
+                let w = pools[b].want(sex);
+                (w > MIN_WANT).then_some(w)
             };
-            let f: Vec<Option<f64>> = (0..blocks.len())
-                .map(|b| want(b, Sex::Female, MAX_UNION_AGE_F))
-                .collect();
-            let m: Vec<Option<f64>> = (0..blocks.len())
-                .map(|b| want(b, Sex::Male, MAX_UNION_AGE_M))
-                .collect();
+            let f: Vec<Option<f64>> = (0..blocks.len()).map(|b| want(b, Sex::Female)).collect();
+            let m: Vec<Option<f64>> = (0..blocks.len()).map(|b| want(b, Sex::Male)).collect();
             // The divorced's desired second unions (R1c).
             let div_want = |b: usize, sex: Sex| -> Option<f64> {
                 let age = t - blocks[b].year;
                 if !(MIN_UNION_AGE..=MAX_REMARRIAGE_AGE).contains(&age) {
                     return None;
                 }
-                let w = pools[b].div_want(sex, age, t);
-                (w > 0.0).then_some(w)
+                let w = pools[b].div_want(sex, age, t, &params.repartnering);
+                (w > MIN_WANT).then_some(w)
             };
             let df: Vec<Option<f64>> = (0..blocks.len())
                 .map(|b| div_want(b, Sex::Female))
@@ -1130,10 +1239,9 @@ impl Ledger {
             let dm: Vec<Option<f64>> = (0..blocks.len()).map(|b| div_want(b, Sex::Male)).collect();
             clear_year(
                 t,
-                params.same_sex_boost,
+                &params,
                 (&f, &m),
                 (&df, &dm),
-                regions,
                 &mut blocks,
                 &mut pools,
                 &mut births,
@@ -1154,7 +1262,7 @@ impl Ledger {
                 &mut pools,
                 &mut births,
                 first_year,
-                regions,
+                groups,
                 (key, plans),
                 &arrival_density[(t - params.y0) as usize],
             );
@@ -1175,9 +1283,14 @@ impl Ledger {
                 if age < 0 || age as u32 > MAX_AGE {
                     continue;
                 }
+                let f = params.heritage.mortality_factor(blocks[b].heritage, t);
                 let q = [
-                    death_prob(Sex::Female, age as u32, t),
-                    death_prob(Sex::Male, age as u32, t),
+                    params
+                        .mortality
+                        .death_prob_scaled(Sex::Female, age as u32, t, f),
+                    params
+                        .mortality
+                        .death_prob_scaled(Sex::Male, age as u32, t, f),
                 ];
                 for c in &mut pool.cohorts {
                     for ((never, living), q) in c.never.iter_mut().zip(&mut c.alive).zip(q) {
@@ -1208,7 +1321,7 @@ impl Ledger {
         Self {
             params,
             first_year,
-            regions,
+            groups,
             blocks,
             base,
             plan_root,
@@ -1223,25 +1336,26 @@ impl Ledger {
         *self.base.last().unwrap()
     }
 
-    /// Block index for a birth year and region.
-    pub fn block_of(&self, year: i32, region: u16) -> Option<u32> {
+    /// Block index for a birth year and lineage group.
+    pub fn block_of(&self, year: i32, group: u16) -> Option<u32> {
         let i = year - self.first_year;
-        let n_years = (self.blocks.len() / self.regions) as i32;
-        ((0..n_years).contains(&i) && (region as usize) < self.regions)
-            .then(|| (i as usize * self.regions + region as usize) as u32)
+        let n_years = (self.blocks.len() / self.groups) as i32;
+        ((0..n_years).contains(&i) && (group as usize) < self.groups)
+            .then(|| (i as usize * self.groups + group as usize) as u32)
     }
 
-    /// Block indices of every region's cohort born in `year`.
+    /// Block indices of every group's cohort born in `year`.
     pub fn blocks_of_year(&self, year: i32) -> std::ops::Range<u32> {
         match self.block_of(year, 0) {
-            Some(b) => b..b + self.regions as u32,
+            Some(b) => b..b + self.groups as u32,
             None => 0..0,
         }
     }
 }
 
-/// Immigrants arriving in year `t`: per region, `immigration_rate(t)` of
-/// the expected living `alive` (this year's births included), a share [`couple_arrival_share`] of them in
+/// Immigrants arriving in year `t`: per lineage group (region weight times
+/// the year's heritage mix of arrivals), the pack's immigration rate of
+/// the expected living `alive` (this year's births included), its couple share of them in
 /// couples. Couples get arrival union cells and arrival plans; the plans'
 /// births abroad are the children who arrive with them, each child's
 /// cohort recording its mothers (R1 plan, R1b-2 step B).
@@ -1254,38 +1368,46 @@ fn arrive(
     pools: &mut [Pool],
     births: &mut Births,
     first_year: i32,
-    regions: usize,
+    groups: usize,
     (key, plans): (Key, Plans),
     dens: &[f64],
 ) {
-    let arriving = (immigration_rate(t) * alive).round() as u64;
-    let region_w: Vec<f64> = params.regions.iter().map(|r| r.immigrant_weight).collect();
-    let ages: Vec<i32> = (MIN_ARRIVAL_AGE..=MAX_ARRIVAL_AGE).collect();
-    let age_w: Vec<f64> = ages.iter().map(|&a| arrival_age_weight(a)).collect();
-    let men_share = immigrant_male_share(t);
-    let block_of = |year: i32, r: usize| ((year - first_year) as usize) * regions + r;
+    let im = &params.immigration;
+    let arriving = (im.rate(t) * alive).round() as u64;
+    let heritages = params.heritage_count();
+    let mix = params.floored(&params.heritage.immigrant_mix(t));
+    let group_w: Vec<f64> = (0..groups)
+        .map(|g| params.regions[g / heritages].immigrant_weight * mix[g % heritages])
+        .collect();
+    let ages: Vec<i32> = (im.min_age..=MAX_ARRIVAL_AGE).collect();
+    let age_w: Vec<f64> = ages.iter().map(|&a| im.age_weight(a)).collect();
+    let block_of = |year: i32, g: usize| ((year - first_year) as usize) * groups + g;
     // Share ever partnered by each age under this year's schedule, per sex.
     let ever: [Vec<f64>; 2] = [Sex::Female, Sex::Male].map(|sex| {
         let mut never = 1.0;
         (0..=MAX_ARRIVAL_AGE)
             .map(|a| {
                 let e = 1.0 - never;
-                never *= 1.0 - first_union_hazard(sex, a as u32, t);
+                never *= 1.0 - params.unions.first_union_hazard(sex, a as u32, t);
                 e
             })
             .collect()
     });
     let partnered = |sex: Sex, age: i32| ever[sex as usize][age as usize];
-    for (r, &nr) in apportion(arriving, &region_w).iter().enumerate() {
+    for (r, &nr) in apportion(arriving, &group_w).iter().enumerate() {
+        let men_share = params
+            .heritage
+            .immigrant_male_share(Heritage((r % heritages) as u8), t)
+            .unwrap_or_else(|| im.male_share(t));
         // Couples: wives by age, then husbands by the age-gap kernel, never
-        // more than |ARRIVAL_GAP_MIN| years younger.
-        let couples = (couple_arrival_share(t) * nr as f64 / 2.0).round() as u64;
+        // more than `max_husband_younger` years younger.
+        let couples = (im.couple_share(t) * nr as f64 / 2.0).round() as u64;
         let singles = nr - 2 * couples;
         let wife_w: Vec<f64> = ages
             .iter()
             .zip(&age_w)
             .map(|(&a, &w)| {
-                if a >= MIN_COUPLE_ARRIVAL_AGE {
+                if a >= im.min_couple_age {
                     w * partnered(Sex::Female, a)
                 } else {
                     0.0
@@ -1301,8 +1423,8 @@ fn arrive(
                 .iter()
                 .zip(&age_w)
                 .map(|(&am, &w)| {
-                    if am - aw >= ARRIVAL_GAP_MIN {
-                        age_gap_weight(am - aw) * w * partnered(Sex::Male, am)
+                    if am - aw >= -im.max_husband_younger {
+                        params.unions.age_gap_weight(am - aw) * w * partnered(Sex::Male, am)
                     } else {
                         0.0
                     }
@@ -1349,7 +1471,15 @@ fn arrive(
             pool.used = [cf, cm];
             pools[b].cohorts.push(pool);
             let year = blocks[b].year;
-            add_nonunion_births(births, b as u32, f, year, t + 1, params.y1);
+            add_nonunion_births(
+                births,
+                b as u32,
+                f,
+                year,
+                t + 1,
+                params.y1,
+                (params, blocks[b].heritage),
+            );
         }
         // Arrival cells, and the plans' births: in-world later, or abroad
         // (children arriving now).
@@ -1362,7 +1492,7 @@ fn arrive(
         // Each slice's couples split over dissolution classes counted from
         // arrival. Arriving adults have no in-world kin, so kin repair never
         // moves them and their classes need no de-isolation.
-        let shares = SystematicShares::new(&dissolution_class_pmf(t, false));
+        let shares = SystematicShares::new(&params.dissolution.class_pmf(t, false));
         let mut by_f: BTreeMap<u32, Vec<(u8, u32, u64)>> = BTreeMap::new();
         let mut by_m: BTreeMap<u32, Vec<(u8, u32, u64)>> = BTreeMap::new();
         for (&(bf, bm), &n) in &cells {
@@ -1391,8 +1521,10 @@ fn arrive(
             );
             for cell in cells {
                 let pk = plan_key(plans.root, bf, t, CellKind::Arrival, cell.class);
-                for leaf in arrival_plans(cell.total, t, age, pk, dens, plans.tables) {
-                    let (in_world, abroad) = arrival_births(&leaf, age, cell.class);
+                let mca = params.immigration.min_couple_age;
+                let h = blocks[bf as usize].heritage;
+                for leaf in arrival_plans(cell.total, t, age, pk, dens, plans.tables, h, mca) {
+                    let (in_world, abroad) = arrival_births(&leaf, age, cell.class, params);
                     let count = leaf.plan.count;
                     for o in bits(in_world) {
                         let year = t + o;
@@ -1463,7 +1595,15 @@ fn arrive(
                 .cohorts
                 .push(CohortPool::new(f, size - f, [f as f64, (size - f) as f64]));
             let year = blocks[b].year;
-            add_nonunion_births(births, b as u32, f, year, t + 1, params.y1);
+            add_nonunion_births(
+                births,
+                b as u32,
+                f,
+                year,
+                t + 1,
+                params.y1,
+                (params, blocks[b].heritage),
+            );
         }
     }
 }
@@ -1487,8 +1627,10 @@ fn add_nonunion_births(
     block_year: i32,
     from: i32,
     to: i32,
+    (params, h): (&Params, Heritage),
 ) {
-    for leaf in nonunion_plans(females, block_year) {
+    let factor = params.heritage.fertility_factor(h, block_year + 25);
+    for leaf in nonunion_plans(females, block_year, &params.fertility, factor) {
         for k in 0..leaf.births as usize {
             let year = block_year + leaf.ages[k] as i32;
             if (from..=to).contains(&year) {
@@ -1543,17 +1685,17 @@ impl Market {
 
     /// Kernel over the birth-year gap `gap` (column's age minus row's) and
     /// the two statuses.
-    fn kernel(self, gap: i32, row: bool, col: bool) -> f64 {
+    fn kernel(self, gap: i32, row: bool, col: bool, u: &Unions) -> f64 {
         match self {
             Market::Opposite => {
                 let g = if row || col {
-                    remarriage_gap_weight(gap)
+                    u.remarriage_gap_weight(gap)
                 } else {
-                    age_gap_weight(gap)
+                    u.age_gap_weight(gap)
                 };
-                g * status_affinity(row, col)
+                g * u.status_affinity(row, col)
             }
-            Market::Same(_) => same_sex_gap_weight(gap),
+            Market::Same(_) => u.same_sex_gap_weight(gap),
         }
     }
 }
@@ -1561,27 +1703,35 @@ impl Market {
 /// A market's couples by row and column seeker.
 type Pairs = FxHashMap<(Who, Who), u64>;
 
+/// One market's key, kind, row seekers and column seekers.
+type Seekers = (u64, Market, Vec<(Who, f64)>, Vec<(Who, f64)>);
+
 /// Clear one year's markets and record the merged cells.
 ///
 /// `want_f[b]` / `want_m[b]` are block `b`'s desired first unions this year
 /// (`None`: not in the market), and `div_f` / `div_m` its divorced members'
-/// desired second unions (R1c). A share `same_sex_share(t)` of first-union
-/// wants goes to its sex's same-sex market; of the rest, and of all
-/// second-union wants, `national_market_share(t)` goes to the national
-/// opposite-sex market and the remainder to the block's regional one.
-/// Regional markets clear first, then the national one, then the same-sex
-/// ones, each against what the earlier ones left. The divorced and the
-/// never-partnered meet in the same opposite-sex markets; a couple's cell
-/// kinds follow from their statuses. Each market's integer matrix is summed
-/// per (row block, column block, kinds), split into dissolution classes and
-/// recorded as one cell per block, sex, kind and class.
+/// desired re-partnering (R1c). Each block's wants split (N1 plan §3):
+/// - a share `same_sex_share(t)` of first-union wants goes to its sex's
+///   same-sex markets: the open-market share of it to the sex's open one,
+///   the rest to the sex's heritage market;
+/// - of the rest, and of all re-partnering wants, the open-market share
+///   goes to the open opposite-sex market across every group; of the
+///   remainder, `national_market_share(t)` goes to the heritage's national
+///   market and the rest to the block's group's local one.
+///
+/// Every market's matrix is solved at once; caps then apply in order
+/// (local, national, open; then same-sex), each against what the earlier
+/// ones left. The divorced and the never-partnered meet in the same
+/// opposite-sex markets; a couple's cell kinds follow from their statuses.
+/// Each sex's markets' couples are summed per (row block, column block,
+/// kinds), split into dissolution classes and recorded as one cell per
+/// block, sex, kind and class.
 #[allow(clippy::too_many_arguments)]
 fn clear_year(
     t: i32,
-    same_sex_boost: f64,
+    params: &Params,
     (want_f, want_m): (&[Option<f64>], &[Option<f64>]),
     (div_f, div_m): (&[Option<f64>], &[Option<f64>]),
-    regions: usize,
     blocks: &mut [Block],
     pools: &mut [Pool],
     births: &mut Births,
@@ -1590,24 +1740,35 @@ fn clear_year(
     plans: Plans,
     class_moves: &mut u64,
 ) {
-    let sigma = (same_sex_share(t) * same_sex_boost).min(0.5);
-    let rho = if regions > 1 {
-        national_market_share(t)
+    let groups = params.group_count();
+    let heritages = params.heritage_count();
+    let sigma = (params.unions.same_sex_share(t) * params.same_sex_boost).min(0.5);
+    let rho = if params.region_count() > 1 {
+        params.unions.national_market_share(t)
     } else {
         0.0
     };
+    let omega = |b: usize, sex: Sex| {
+        (params
+            .heritage
+            .open_market_share(t, blocks[b].heritage, sex)
+            * params.open_market_boost)
+            .min(1.0)
+    };
+    // A market's seekers: every block passing `member`, each status's
+    // wants times `share(block, divorced)`.
     let parts = |never: &[Option<f64>],
                  div: &[Option<f64>],
-                 market: Option<u16>,
-                 (share_n, share_d): (f64, f64)|
+                 member: &dyn Fn(&Block) -> bool,
+                 share: &dyn Fn(usize, bool) -> f64|
      -> Vec<(Who, f64)> {
         let mut out = Vec::new();
         for (b, (&n, &d)) in never.iter().zip(div).enumerate() {
-            if !market.map_or(true, |r| blocks[b].region == r) {
+            if !member(&blocks[b]) {
                 continue;
             }
-            for (w, share, divorced) in [(n, share_n, false), (d, share_d, true)] {
-                if let Some(w) = w.map(|w| w * share).filter(|&w| w > 0.0) {
+            for (w, divorced) in [(n, false), (d, true)] {
+                if let Some(w) = w.map(|w| w * share(b, divorced)).filter(|&w| w > 0.0) {
                     let who = Who {
                         block: b as u32,
                         divorced,
@@ -1619,73 +1780,100 @@ fn clear_year(
         out
     };
     let none = vec![None; want_f.len()];
+    // The opposite-sex share of a status's wants (first unions lose the
+    // same-sex share; re-partnering is opposite-sex only).
+    let opposite = |divorced: bool| if divorced { 1.0 } else { 1.0 - sigma };
+    let local_share = |sex: Sex| {
+        move |b: usize, divorced: bool| opposite(divorced) * (1.0 - omega(b, sex)) * (1.0 - rho)
+    };
+    let national_share =
+        |sex: Sex| move |b: usize, divorced: bool| opposite(divorced) * (1.0 - omega(b, sex)) * rho;
+    let open_share = |sex: Sex| move |b: usize, divorced: bool| opposite(divorced) * omega(b, sex);
+    let everyone = |_: &Block| true;
+
     // Every market's participants, before any cell is recorded.
-    let local = ((1.0 - sigma) * (1.0 - rho), 1.0 - rho);
-    let national = ((1.0 - sigma) * rho, rho);
-    let regional: Vec<_> = (0..regions as u16)
-        .map(|r| {
-            (
-                parts(want_f, div_f, Some(r), local),
-                parts(want_m, div_m, Some(r), local),
-            )
+    let mut seekers: Vec<Seekers> = Vec::new();
+    for g in 0..groups {
+        let member = |bl: &Block| bl.group as usize == g;
+        seekers.push((
+            g as u64,
+            Market::Opposite,
+            parts(want_f, div_f, &member, &local_share(Sex::Female)),
+            parts(want_m, div_m, &member, &local_share(Sex::Male)),
+        ));
+    }
+    if rho > 0.0 {
+        for h in (0..heritages).map(|h| Heritage(h as u8)) {
+            let member = |bl: &Block| bl.heritage == h;
+            seekers.push((
+                (groups + h.index()) as u64,
+                Market::Opposite,
+                parts(want_f, div_f, &member, &national_share(Sex::Female)),
+                parts(want_m, div_m, &member, &national_share(Sex::Male)),
+            ));
+        }
+    }
+    seekers.push((
+        (groups + heritages) as u64,
+        Market::Opposite,
+        parts(want_f, div_f, &everyone, &open_share(Sex::Female)),
+        parts(want_m, div_m, &everyone, &open_share(Sex::Male)),
+    ));
+    let opposite_markets = seekers.len();
+    // Same-sex: each sex's seekers split into a left and a right half,
+    // paired like women and men; per heritage, then one open market.
+    for (sex, want) in [(Sex::Female, want_f), (Sex::Male, want_m)] {
+        let base = (groups + heritages + 1 + sex as usize * (heritages + 1)) as u64;
+        for h in (0..heritages).map(|h| Heritage(h as u8)) {
+            let member = |bl: &Block| bl.heritage == h;
+            let share = |b: usize, _: bool| sigma / 2.0 * (1.0 - omega(b, sex));
+            let half = parts(want, &none, &member, &share);
+            seekers.push((
+                base + h.index() as u64,
+                Market::Same(sex),
+                half.clone(),
+                half,
+            ));
+        }
+        let share = |b: usize, _: bool| sigma / 2.0 * omega(b, sex);
+        let half = parts(want, &none, &everyone, &share);
+        seekers.push((
+            base + heritages as u64,
+            Market::Same(sex),
+            half.clone(),
+            half,
+        ));
+    }
+    let specs: Vec<MarketSpec> = seekers
+        .iter()
+        .map(|(mk, market, rows, cols)| MarketSpec {
+            mk: *mk,
+            rows,
+            cols,
+            market: *market,
         })
         .collect();
-    let nationwide = (
-        parts(want_f, div_f, None, national),
-        parts(want_m, div_m, None, national),
-    );
-    let halves = [
-        (Sex::Female, parts(want_f, &none, None, (sigma / 2.0, 0.0))),
-        (Sex::Male, parts(want_m, &none, None, (sigma / 2.0, 0.0))),
-    ];
 
     // Every market's matrix depends only on its participants (fixed above)
     // and the blocks' birth years, so all of them are solved at once; the
     // caps then apply in order, since they depend on earlier takings.
-    let mut specs: Vec<MarketSpec> = regional
-        .iter()
-        .enumerate()
-        .map(|(r, (f, m))| MarketSpec {
-            mk: r as u64,
-            rows: f,
-            cols: m,
-            market: Market::Opposite,
-        })
-        .collect();
-    if rho > 0.0 {
-        specs.push(MarketSpec {
-            mk: regions as u64,
-            rows: &nationwide.0,
-            cols: &nationwide.1,
-            market: Market::Opposite,
-        });
-    }
-    let opposite_markets = specs.len();
-    for (sex, half) in &halves {
-        specs.push(MarketSpec {
-            mk: regions as u64 + 1 + *sex as u64,
-            rows: half,
-            cols: half,
-            market: Market::Same(*sex),
-        });
-    }
-    let solved: Vec<Vec<u64>> = {
+    let solved: Vec<Sparse> = {
         let blocks: &[Block] = blocks;
         specs
             .par_iter()
-            .map(|spec| solve_market(t, spec, blocks, key))
+            .map(|spec| solve_market(t, spec, blocks, key, &params.unions))
             .collect()
     };
     let mut solved = specs.iter().zip(solved);
 
-    let mut opposite = Pairs::default();
+    let mut opposite_pairs = Pairs::default();
     for (spec, x) in solved.by_ref().take(opposite_markets) {
-        apply_market(t, spec, x, pools, &mut opposite);
+        apply_market(t, spec, x, pools, &mut opposite_pairs);
     }
-    defer_isolated(&mut opposite, Market::Opposite, pools);
+    defer_isolated(&mut opposite_pairs, Market::Opposite, pools);
     record(
         t,
-        &opposite,
+        &opposite_pairs,
         Market::Opposite,
         blocks,
         pools,
@@ -1695,16 +1883,19 @@ fn clear_year(
         class_moves,
     );
 
-    // Same-sex markets: each sex's seekers split into a left and a right
-    // half, paired like women and men.
-    for (spec, x) in solved {
+    // Same-sex markets, merged per sex so each block pair has one cell per
+    // kind and class.
+    for sex in [Sex::Female, Sex::Male] {
         let mut pairs = Pairs::default();
-        apply_market(t, spec, x, pools, &mut pairs);
-        defer_isolated(&mut pairs, spec.market, pools);
+        for (spec, x) in solved.by_ref().take(heritages + 1) {
+            debug_assert!(spec.market == Market::Same(sex));
+            apply_market(t, spec, x, pools, &mut pairs);
+        }
+        defer_isolated(&mut pairs, Market::Same(sex), pools);
         record(
             t,
             &pairs,
-            spec.market,
+            Market::Same(sex),
             blocks,
             pools,
             births,
@@ -1944,7 +2135,7 @@ fn record(
         let mut split = match market {
             Market::Opposite => split_classes(
                 &slices,
-                &SystematicShares::new(&dissolution_class_pmf(t, kf.remarriage())),
+                &SystematicShares::new(&plans.params.dissolution.class_pmf(t, kf.remarriage())),
                 key.with3(TAG_CLASS, t as u64, kf as u64),
             ),
             Market::Same(_) => one_class(&slices),
@@ -2032,7 +2223,10 @@ impl Side<'_> {
             let skey =
                 key.with(TAG_SETTLE)
                     .with3(t as u64, b as u64, (kind as u64) << 1 | sex as u64);
-            (pool.settle_div(kind, sex, t, skey), Members::Sources)
+            (
+                pool.settle_div(kind, sex, t, skey, &plans.params.repartnering),
+                Members::Sources,
+            )
         } else {
             (pool.settle(kind, sex), Members::Cohorts)
         };
@@ -2054,12 +2248,15 @@ impl Side<'_> {
             if sex == Sex::Female && !kind.same_sex() {
                 let pk = plan_key(plans.root, b, t, kind, cell.class);
                 leaves.clear();
-                plans
-                    .tables
-                    .year(t)
-                    .plans_into(cell.total, kind.second(), pk, &mut leaves);
+                plans.tables.at(t, block.heritage).plans_into(
+                    cell.total,
+                    kind.second(),
+                    pk,
+                    &mut leaves,
+                );
                 for leaf in &leaves {
-                    let (offs, nb) = leaf_births(leaf, age, cutoff(cell.class));
+                    let (offs, nb) =
+                        leaf_births(leaf, age, cutoff(cell.class), &plans.params.fertility);
                     for &o in &offs[..nb] {
                         born[o as usize] += leaf.count;
                     }
@@ -2097,7 +2294,7 @@ struct MarketSpec<'a> {
 /// gap and statuses) and keyed rounding. Returns the row-major integer
 /// matrix before caps (empty if the market is). A pure function of the
 /// seekers and the blocks' birth years.
-fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key) -> Vec<u64> {
+fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key, u: &Unions) -> Sparse {
     let MarketSpec {
         mk,
         rows,
@@ -2106,14 +2303,14 @@ fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key) -> Vec<u6
     } = *spec;
     let (nr, nc) = (rows.len(), cols.len());
     if nr == 0 || nc == 0 {
-        return Vec::new();
+        return Sparse::default();
     }
     let (sf, sm): (f64, f64) = (
         rows.iter().map(|p| p.1).sum(),
         cols.iter().map(|p| p.1).sum(),
     );
     if sf <= 0.0 || sm <= 0.0 {
-        return Vec::new();
+        return Sparse::default();
     }
     let total = 2.0 * sf * sm / (sf + sm);
     let r: Vec<f64> = rows.iter().map(|p| p.1 * total / sf).collect();
@@ -2150,42 +2347,91 @@ fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key) -> Vec<u6
     for (a, &(yf, df)) in keys_f.iter().enumerate() {
         for (b, &(ym, dm)) in keys_m.iter().enumerate() {
             // age_col - age_row = year_row - year_col
-            g[a * gc + b] = market.kernel(yf - ym, df, dm);
+            g[a * gc + b] = market.kernel(yf - ym, df, dm, u);
         }
     }
     ipf(&mut g, gr, gc, &rs, &cs);
     let share = |v: f64, sum: f64| if sum > 0.0 { v / sum } else { 0.0 };
 
-    // Keyed rounding: floor plus a Bernoulli on the fraction.
+    // Keyed systematic rounding, row by row. Row i's expected couples with
+    // column j are `s_i · w_a(j)`, where `a` is the row's group, `s_i` its
+    // share of the group's margin and `w_a(j) = X[a][g_j] · c_j / C[g_j]`.
+    // So each row group has one cumulative weight over the columns, and a
+    // row places points `u, u + 1, ...` (`u` keyed by the row) along
+    // `s_i · W_a`: every cell gets the floor or ceiling of its expectation,
+    // exactly in expectation, and the row's total is within one of its
+    // expectation. Cost: O(groups · columns + couples · log columns)
+    // instead of a draw per cell.
     let key = key.with2(t as u64, mk);
-    // A zero cell has no fraction, so it needs no draw (`unit() < 0` is
-    // never true).
-    // Each row is a pure function of its seeker, so rows round in parallel.
-    let mut x = vec![0u64; nr * nc];
     let col_share: Vec<f64> = (0..nc).map(|j| share(c[j], cs[gj[j]])).collect();
-    x.par_chunks_mut(nc).enumerate().for_each(|(i, xrow)| {
-        let rw = rows[i].0;
-        let (grow, sr) = (&g[gi[i] * gc..(gi[i] + 1) * gc], share(r[i], rs[gi[i]]));
-        for (j, (&(cw, _), out)) in cols.iter().zip(xrow.iter_mut()).enumerate() {
-            let v = grow[gj[j]] * sr * col_share[j];
-            let fl = v.floor();
-            *out = if v > fl {
-                let up = key.with2(rw.code(), cw.code()).unit() < v - fl;
-                fl as u64 + up as u64
-            } else {
-                fl as u64
-            };
+    let (gj_ref, col_share_ref) = (&gj, &col_share);
+    let cum: Vec<f64> = (0..gr)
+        .into_par_iter()
+        .flat_map_iter(|a| {
+            let (gj, col_share) = (gj_ref, col_share_ref);
+            let grow = &g[a * gc..(a + 1) * gc];
+            let mut acc = 0.0;
+            (0..nc).map(move |j| {
+                acc += grow[gj[j]] * col_share[j];
+                acc
+            })
+        })
+        .collect();
+    // Each row is a pure function of its seeker, so rows round in parallel.
+    let rows_out: Vec<Vec<(u32, u64)>> = (0..nr)
+        .into_par_iter()
+        .map(|i| {
+            let w = &cum[gi[i] * nc..(gi[i] + 1) * nc];
+            let s = share(r[i], rs[gi[i]]);
+            let total = s * w[nc - 1];
+            let mut out: Vec<(u32, u64)> = Vec::new();
+            if total.is_nan() || total <= 0.0 {
+                return out;
+            }
+            let mut p = key.with(rows[i].0.code()).unit();
+            while p < total {
+                // The first column whose cumulative weight passes p.
+                let j = w.partition_point(|&x| x * s <= p).min(nc - 1) as u32;
+                match out.last_mut() {
+                    Some((last, n)) if *last == j => *n += 1,
+                    _ => out.push((j, 1)),
+                }
+                p += 1.0;
+            }
+            out
+        })
+        .collect();
+    let mut x = Sparse {
+        start: Vec::with_capacity(nr + 1),
+        col: Vec::new(),
+        n: Vec::new(),
+    };
+    for row in rows_out {
+        x.start.push(x.col.len() as u32);
+        for (j, k) in row {
+            x.col.push(j);
+            x.n.push(k);
         }
-    });
+    }
+    x.start.push(x.col.len() as u32);
     x
+}
+
+/// A market's integer matrix as sparse rows: row i's entries are
+/// `start[i]..start[i + 1]`, by increasing column.
+#[derive(Default)]
+struct Sparse {
+    start: Vec<u32>,
+    col: Vec<u32>,
+    n: Vec<u64>,
 }
 
 /// Apply a solved market's matrix `x`: capacity caps, then the takings in
 /// the pools by cell kind, and the couples added to `pairs`. Rows' takings
 /// count against the columns' caps when both sides share a pool (same-sex
 /// markets), so a pool is never over-drawn.
-fn apply_market(t: i32, spec: &MarketSpec, mut x: Vec<u64>, pools: &mut [Pool], pairs: &mut Pairs) {
-    if x.is_empty() {
+fn apply_market(t: i32, spec: &MarketSpec, mut x: Sparse, pools: &mut [Pool], pairs: &mut Pairs) {
+    if x.col.is_empty() {
         return;
     }
     let MarketSpec {
@@ -2193,16 +2439,39 @@ fn apply_market(t: i32, spec: &MarketSpec, mut x: Vec<u64>, pools: &mut [Pool], 
     } = *spec;
     let (nr, nc) = (rows.len(), cols.len());
     let (rsex, csex) = market.sexes();
+    let row_range = |i: usize| x.start[i] as usize..x.start[i + 1] as usize;
     // Caps: never more unions than expected available survivors, and never
     // more than the seeker's available members. Rows first; their takings
     // count against the columns' caps when both sides share a pool.
     let mut row_take: FxHashMap<Who, u64> = FxHashMap::default();
     for (i, &(rw, _)) in rows.iter().enumerate() {
-        let row = &mut x[i * nc..(i + 1) * nc];
+        let row = &mut x.n[row_range(i)];
         trim(row, pools[rw.block as usize].cap(rsex, rw.divorced, t));
         *row_take.entry(rw).or_default() += row.iter().sum::<u64>();
     }
+    // Entries by column, rows ascending (a counting sort).
+    let mut col_start = vec![0u32; nc + 1];
+    for &j in &x.col {
+        col_start[j as usize + 1] += 1;
+    }
+    for j in 0..nc {
+        col_start[j + 1] += col_start[j];
+    }
+    let mut by_col = vec![(0u32, 0u32); x.col.len()];
+    let mut fill = col_start.clone();
+    for i in 0..nr {
+        for e in row_range(i) {
+            let j = x.col[e] as usize;
+            by_col[fill[j] as usize] = (i as u32, e as u32);
+            fill[j] += 1;
+        }
+    }
+    let mut col: Vec<u64> = Vec::new();
     for (j, &(cw, _)) in cols.iter().enumerate() {
+        let entries = &by_col[col_start[j] as usize..col_start[j + 1] as usize];
+        if entries.is_empty() {
+            continue;
+        }
         let shared = match market {
             Market::Same(_) => row_take.get(&cw).copied().unwrap_or(0),
             Market::Opposite => 0,
@@ -2210,22 +2479,24 @@ fn apply_market(t: i32, spec: &MarketSpec, mut x: Vec<u64>, pools: &mut [Pool], 
         let cap = pools[cw.block as usize]
             .cap(csex, cw.divorced, t)
             .saturating_sub(shared);
-        let mut col: Vec<u64> = (0..nr).map(|i| x[i * nc + j]).collect();
+        col.clear();
+        col.extend(entries.iter().map(|&(_, e)| x.n[e as usize]));
         trim(&mut col, cap);
-        for (i, v) in col.into_iter().enumerate() {
-            let cut = x[i * nc + j] - v;
+        for (&(i, e), v) in entries.iter().zip(&col) {
+            let cut = x.n[e as usize] - v;
             if cut > 0 {
-                x[i * nc + j] = v;
-                *row_take.get_mut(&rows[i].0).unwrap() -= cut;
+                x.n[e as usize] = *v;
+                *row_take.get_mut(&rows[i as usize].0).unwrap() -= cut;
             }
         }
     }
 
     // Record the takings by cell kind and add the matrix to the pairs.
     for (i, &(rw, _)) in rows.iter().enumerate() {
-        for (j, &(cw, _)) in cols.iter().enumerate() {
-            let n = x[i * nc + j];
+        for e in row_range(i) {
+            let n = x.n[e];
             if n > 0 {
+                let cw = cols[x.col[e] as usize].0;
                 let (kf, km) = market.kinds(rw, cw);
                 pools[rw.block as usize].taken[kf as usize][rsex as usize] += n;
                 pools[cw.block as usize].taken[km as usize][csex as usize] += n;
@@ -2338,7 +2609,7 @@ mod tests {
                     let parts: u64 = d.parts.iter().map(|p| p.3).sum();
                     assert_eq!(parts, f, "a source's parts match its cells");
                     assert!(parts <= d.members);
-                    assert!(d.class > 0 && d.kind.first_opposite());
+                    assert!(d.class > 0 && d.kind.feeds_divorced());
                     for &(y2, k2, c2, _) in &d.parts {
                         assert!(y2 > d.divorce_year() && k2.second());
                         assert!(cells

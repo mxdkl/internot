@@ -1,0 +1,122 @@
+// Unions (marriage and cohabitation together): first-union timing, the
+// marriage markets' age-gap kernels, and the market shares.
+(
+    first_union: (
+        // No first union before this age; above it the hazard keeps
+        // declining with age, with no upper cutoff (statistics, not rules).
+        min_age: 16,
+        // Age at first union among those who ever partner is log-logistic
+        // in (age − origin), with this shape, centred on the median.
+        origin: 15.0,
+        shape: 6.0,
+        // Median age at first union for women, by year.
+        median_female: [
+            (1840, 23.0),
+            (1900, 22.5),
+            (1940, 21.5),
+            (1956, 20.3),
+            (1970, 20.8),
+            (1990, 23.0),
+            (2024, 25.5),
+            (2100, 26.5),
+        ],
+        // Men partner this many years later than women.
+        male_delay: 2.2,
+        // Share of a cohort that ever enters a union by 50, by year.
+        ever_partnered: [
+            (1840, 0.92),
+            (1970, 0.93),
+            (2000, 0.89),
+            (2024, 0.86),
+            (2100, 0.85),
+        ],
+    ),
+
+    // Share of each block's desired unions that goes to the national
+    // (cross-region) market rather than its region's local one, by year
+    // (R1 plan, R1b-1). Provisional: its meaning depends on how fine the
+    // lineage regions are, which waits on residence. Calibration target:
+    // share of couples whose partners were born in different regions (IPUMS
+    // birthplace of spouses). With two similar-sized regions about half of
+    // national unions cross regions.
+    national_market_share: [
+        (1840, 0.20),
+        (1900, 0.25),
+        (1950, 0.35),
+        (2020, 0.50),
+        (2100, 0.50),
+    ],
+
+    // Share of each sex's first-union demand that goes to same-sex unions,
+    // by year. Provisional: calibrated only to about 1.5% of coupled
+    // households being same-sex couples in 2019 (ACS); earlier partnerships
+    // were largely unrecorded, and the rise follows recorded prevalence.
+    same_sex_share: [
+        (1840, 0.004),
+        (1960, 0.005),
+        (1990, 0.012),
+        (2010, 0.025),
+        (2100, 0.030),
+    ],
+
+    // Age-gap kernel g(man's age − woman's age) from CPS 2023 (FG3) married
+    // couples: 35% within a year, husband 2+ older in 50%, wife 2+ older in
+    // 14%. Inclusive ranges of the gap in years; zero elsewhere. Same-sex
+    // couples use this kernel made symmetric.
+    age_gap: [
+        (-1, -1, 0.09),
+        (0, 0, 0.172),
+        (1, 1, 0.092),
+        (2, 3, 0.10),
+        (4, 5, 0.061),
+        (6, 9, 0.028),
+        (10, 14, 0.0092),
+        (15, 19, 0.0026),
+        (20, 30, 0.0008),
+        (-3, -2, 0.035),
+        (-5, -4, 0.0165),
+        (-9, -6, 0.00625),
+        (-19, -10, 0.0012),
+    ],
+
+    // Unions with a divorced partner use the kernel at gap × this factor
+    // (rounded): wider gaps. Provisional. Target (Pew 2014): 16% of newly
+    // remarried couples have a husband 10+ years older, against 4% of first
+    // marriages.
+    repartnering_gap_factor: 0.6,
+
+    // Relative affinity by whether each partner is divorced, multiplying the
+    // age-gap kernel. Provisional. Target (Pew 2014, ACS 2013): about 20% of
+    // new marriages have both spouses previously married and about 20% one.
+    status_affinity: (
+        neither: 1.0,
+        both: 3.5,
+        one: 1.0,
+    ),
+
+    // Which unions are marriages, and from when (N1). Unions are marriages
+    // and cohabitations together; this decides, per union, whether and when
+    // the couple marries, which is when surnames change.
+    // - `at_start`: share of unions that begin as a marriage, by union year.
+    //   Marriages preceded by cohabitation: 11% in 1965–74 and 44% in
+    //   1980–84 (Bumpass & Sweet 1989); 68% of first unions began as
+    //   cohabitation in 2006–10 (NSFG; research 2026-09-29 kinship note).
+    // - `later`: of unions that begin as cohabitation, the share that would
+    //   marry, after a delay with mean `delay_years` (exponential), if the
+    //   couple stays together that long: so the longer a cohabitation lasts,
+    //   the likelier it has married. NSFG 2006–10: 40% of first
+    //   cohabitations had married within 3 years, 32% were intact, 27%
+    //   dissolved. Calibrated so about 87% of people living with a partner
+    //   are married in 2023 (CPS AD-3: 50.1% with a spouse, 7.7% with an
+    //   unmarried partner).
+    // - Same-sex couples can marry from `same_sex_legal` (Massachusetts 2004;
+    //   nationwide 2015, Obergefell): until then their unions are
+    //   cohabitations, and couples still together marry later at the same
+    //   rate. ACS 2024: about 60% of same-sex couples are married.
+    marriage: (
+        at_start: [(1840, 0.97), (1965, 0.92), (1975, 0.80), (1982, 0.56), (1992, 0.45), (2008, 0.32), (2020, 0.28)],
+        later: [(1840, 0.95), (1980, 0.95), (2010, 0.92), (2100, 0.92)],
+        delay_years: 3.5,
+        same_sex_legal: [(2004, 0.0), (2015, 1.0)],
+    ),
+)

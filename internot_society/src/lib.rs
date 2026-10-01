@@ -9,12 +9,18 @@
 //! - [`plan`]: fertility and dissolution plans, apportioned exactly.
 //! - [`ledger`]: the integer counts both sides of every relation read.
 //! - [`world`]: people, unions, parents and children as keyed lookups.
+//! - [`household`]: who lives with whom at a time (L3), a view over the
+//!   world.
 
+pub mod household;
 pub mod ledger;
+pub mod names;
 pub mod params;
 pub mod plan;
 pub mod world;
 
+pub use household::{Household, Members};
 pub use ledger::CellKind;
-pub use params::{Params, Sex};
+pub use names::{Middle, Surname};
+pub use params::{Heritage, Params, Sex};
 pub use world::{PersonId, Union, World};

@@ -1,0 +1,15 @@
+[package]
+name = "internot_def"
+description = "World packs: RON world definitions with inheritance, merging, validation errors and a fingerprint, plus the value vocabulary (series, steps, per-sex values)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+# Pinned exactly: a pack's numbers must parse to the same bits everywhere.
+ron = "=0.12.2"
+serde_path_to_error = "0.1"
+xxhash-rust = { workspace = true }

@@ -1,0 +1,136 @@
+// Names (N1): first and middle names, surnames, and how surnames pass and
+// change. Data and sources: research/2026-10-01-heritage-and-names.md §4.
+(
+    // Distilled name tables (internot_society/data/distill_names.py): SSA
+    // baby names by year and sex (1880–2025), and Census 2020 first names and
+    // surnames by race and Hispanic origin. Public domain.
+    data: "data/names.bin",
+
+    // Each heritage group's column in the data.
+    columns: [
+        (group: "white", column: "white"),
+        (group: "black", column: "black"),
+        (group: "aian", column: "aian"),
+        (group: "asian", column: "asian"),
+        (group: "hispanic", column: "hispanic"),
+    ],
+
+    first_names: (
+        // People born in the world (and founders) are named from the year's
+        // SSA names, split across groups by P(group | name) from Census 2020,
+        // raked (IPF) to the world's own births by group that year. Names
+        // then have SSA's frequencies overall and their groups' leanings.
+        // Years outside the data use its first or last year.
+        //
+        // Immigrants were named abroad: a share `foreign` of each group's
+        // immigrants get a name from the data's foreign names (in Census
+        // 2020 but never given to 5+ US babies in a year: Svitlana, Tigist,
+        // Venkata, Fiordaliza); the rest are named like US births of their
+        // birth year. The share is the group's foreign-name mass in Census
+        // 2020 over the group's foreign-born share (ACS 2019–20: Asian 57%,
+        // Hispanic 32%, Black 10%, White 4%, AIAN about 5%), so the foreign
+        // names land on the foreign-born at their 2020 rate.
+        foreign: [
+            (group: "white", share: 0.075),
+            (group: "black", share: 0.05),
+            (group: "aian", share: 0.08),
+            (group: "asian", share: 0.125),
+            (group: "hispanic", share: 0.016),
+        ],
+        // A child whose parents' groups differ is named in one parent's
+        // group's tradition, each with this probability for the mother.
+        mixed_mother: 0.5,
+    ),
+
+    middle_names: (
+        // Share with a middle name, by birth cohort, per group and sex
+        // (NC voter file, research note §4d; before 1900, low confidence:
+        // about 3% in 1750–75 Virginia, near-universal among Princeton
+        // students by 1840). Groups without an entry use `default`.
+        default: (
+            female: [(1750, 0.05), (1800, 0.15), (1850, 0.5), (1880, 0.85), (1920, 0.945), (1950, 0.96), (1980, 0.97), (2000, 0.98)],
+            male: [(1750, 0.05), (1800, 0.15), (1850, 0.5), (1880, 0.85), (1920, 0.915), (1950, 0.96), (1980, 0.97), (2000, 0.985)],
+        ),
+        by_group: [
+            (group: "black", share: (
+                female: [(1850, 0.4), (1920, 0.86), (1950, 0.895), (1980, 0.945), (2000, 0.95)],
+                male: [(1850, 0.3), (1920, 0.65), (1950, 0.79), (1980, 0.91), (2000, 0.945)],
+            )),
+            (group: "hispanic", share: (
+                female: [(1950, 0.69), (1980, 0.72), (2000, 0.645)],
+                male: [(1950, 0.64), (1980, 0.725), (2000, 0.67)],
+            )),
+            (group: "asian", share: (
+                female: [(1950, 0.71), (1980, 0.61), (2000, 0.67)],
+                male: [(1950, 0.66), (1980, 0.61), (2000, 0.68)],
+            )),
+        ],
+        // Middle names come from the same first-name pool (another draw, not
+        // the first name). A share of men's are a family surname instead, the
+        // mother's birth surname here: 8–19% of men's middle names are
+        // surname-like, more in older cohorts (NC voter file).
+        family_surname: (
+            female: [(1850, 0.03)],
+            male: [(1850, 0.17), (1950, 0.12), (2000, 0.09)],
+        ),
+    ),
+
+    surnames: (
+        // Founders and immigrants draw a surname from their group's column.
+        // Census 2020 lists surnames with about 90+ holders; the rest (12%
+        // of people) are spread over the rarest listed names (fewer than
+        // `rare_below` holders), so a person with an unlisted surname looks
+        // like one with a rare one.
+        rare_below: 1000,
+
+        // A child's birth surname (Johnson & Scheuble 2002; Fragile Families
+        // 1998–2000): when the parents are married at the birth, the
+        // father's 97%, the mother's 2%, both hyphenated 1%; in a union not
+        // (yet) married, the father's 86%, the mother's 10%, both 4%. Children
+        // born outside a union take the mother's.
+        child: (
+            married: (father: 0.97, mother: 0.02, both: 0.01),
+            cohabiting: (father: 0.86, mother: 0.10, both: 0.04),
+        ),
+
+        // Spanish double surnames: a child of a Hispanic father gets the
+        // father's first surname then the mother's, with this probability by
+        // birth year (half of it if only one parent is Hispanic): 12–21% of
+        // Hispanics born in the 1950s–90s and 42% of those born 2000–08 have
+        // two Hispanic surnames (NC voter file); about half are hyphenated.
+        double: (
+            group: "hispanic",
+            share: [(1950, 0.12), (1990, 0.21), (2005, 0.42)],
+            hyphenated: 0.45,
+        ),
+
+        // At a wedding (unions.ron decides which unions marry, and when).
+        // Women: take the husband's surname, hyphenate, or keep their own, by
+        // wedding year (Johnson & Scheuble 1995: 1.5% nonconventional before
+        // 1980; Brightman 1994: 90 / 5 / 2 in the early 1990s; Hawaii 2006
+        // registrations: 83 / 5 / 12; Pew 2023: 79 / 5 / 14 for all married
+        // women, 20% keeping at 18–49). Brides 45 and older keep twice as
+        // often (Hawaii 2006: 18% against 9%).
+        wedding: (
+            woman_takes: [(1840, 0.985), (1965, 0.985), (1975, 0.94), (1990, 0.90), (2005, 0.86), (2015, 0.80), (2023, 0.75)],
+            woman_hyphenates: [(1840, 0.005), (1965, 0.005), (1975, 0.02), (1990, 0.05), (2023, 0.05)],
+            older_bride_age: 45,
+            older_bride_keeps: 2.0,
+            // Men taking the wife's surname (Pew 2023: 5% of married men;
+            // none in 107 Ontario divorce files): rare until recently.
+            man_takes: [(1840, 0.002), (1990, 0.005), (2010, 0.02), (2023, 0.04)],
+            // Same-sex couples: no US data. Provisional: one partner takes
+            // the other's surname, or both hyphenate.
+            same_sex_takes: 0.25,
+            same_sex_hyphenates: 0.10,
+            // Groups whose women keep their surname more often, as a factor
+            // on keeping (Pew 2023: Hispanic women 30% against White 10%).
+            keeps_more: [(group: "hispanic", factor: 2.5)],
+        ),
+
+        // After a separation (not a death), a partner who took the other's
+        // surname goes back to their birth surname with this probability.
+        // Unsourced: no US estimate exists (research note §4b).
+        separation_reverts: 0.5,
+    ),
+)

@@ -1,0 +1,64 @@
+// Fertility: births planned per union, their timing, and births outside a
+// union. Ages 15 to 45 are the fertile window the code is built for.
+(
+    // Parity distribution (0 to 8 births) among women in a union, by union
+    // year. Anchors trace US fertility eras: high (1840), transition (1900),
+    // Depression low (1935), baby boom (1957), bust (1976), modern (2024).
+    union_parity: [
+        (1840, [0.06, 0.05, 0.07, 0.09, 0.11, 0.12, 0.13, 0.12, 0.25]),
+        (1900, [0.08, 0.10, 0.14, 0.16, 0.15, 0.12, 0.10, 0.07, 0.08]),
+        (1935, [0.10, 0.18, 0.28, 0.20, 0.12, 0.06, 0.03, 0.02, 0.01]),
+        (1957, [0.05, 0.07, 0.18, 0.25, 0.20, 0.12, 0.07, 0.03, 0.03]),
+        (1976, [0.06, 0.17, 0.42, 0.22, 0.08, 0.03, 0.01, 0.005, 0.005]),
+        (2024, [0.07, 0.20, 0.41, 0.20, 0.08, 0.03, 0.005, 0.0025, 0.0025]),
+    ],
+
+    // Share of women in a re-partnering union who plan any birth in it; the
+    // others plan none. Those who do follow the union year's distribution
+    // moved one birth down (a re-partnering starts later). Provisional, and
+    // the calibration knob for completed fertility. Unsourced
+    // (research/2026-09-30-remarriage-targets.md §6); the stepfamily
+    // literature puts the share of remarried women who have a child with the
+    // new partner at about a third to a half.
+    second_union_fertile: 0.55,
+
+    // Years from union start to the first birth (1 to 4): a historical
+    // distribution, shifting to the modern one as `modern` goes from 0 to 1.
+    first_birth: (
+        historical: [0.60, 0.28, 0.08, 0.04],
+        modern: [0.35, 0.30, 0.20, 0.15],
+        shift: [(1950, 0.0), (2020, 1.0)],
+    ),
+
+    // Birth spacing patterns: years between births alternate between `gaps`
+    // (tight, medium, loose), chosen with these weights.
+    spacing: [
+        (gaps: (1, 2), weight: 0.30),
+        (gaps: (2, 3), weight: 0.45),
+        (gaps: (3, 5), weight: 0.25),
+    ],
+
+    // Days from conception to birth (38 weeks). A father need only be alive
+    // at conception: a child born within this long after his death is his.
+    gestation_days: 266,
+
+    nonunion: (
+        // Share of women with one non-union birth, by the year of their
+        // 25th birthday: from rare to about 12% today.
+        one: [
+            (1840, 0.025),
+            (1950, 0.03),
+            (1980, 0.08),
+            (2024, 0.11),
+            (2100, 0.11),
+        ],
+        // Women with two such births, as a share of those with one.
+        two_per_one: 0.25,
+        // Years between the two births, each equally likely.
+        second_gaps: [2, 3, 5],
+        // Age profile of a non-union birth: a normal curve with this peak and
+        // variance (years²), over the fertile window.
+        age_peak: 21,
+        age_variance: 36.0,
+    ),
+)

@@ -1,0 +1,50 @@
+// The United States, 1840 to 2100, at prototype scale.
+//
+// This file names the world and sets its timeline, scale and lineage
+// regions. Every other file in this folder is one section of the world's
+// statistics; `worlds/README.md` explains the format and how to make a new
+// world or a variant of this one.
+(
+    name: "United States",
+    description: "A US-shaped world from 1840 to 2100: two lineage regions, about 20,000 founder births a year.",
+    // A pack can extend another and change only what differs.
+    extends: None,
+
+    timeline: (
+        // First simulated year. Everyone alive then is a founder.
+        first_year: 1840,
+        // Last simulated year (inclusive).
+        last_year: 2100,
+        // Oldest founder at `first_year`.
+        founder_max_age: 90,
+    ),
+
+    founders: (
+        // Expected births in the year before `first_year`: the world's scale.
+        births: 20000.0,
+        // Growth rate of the stable population founders are drawn from.
+        growth: 0.025,
+    ),
+
+    // Share of births that are boys: 1.05 boys per girl.
+    male_share_at_birth: 0.5121951219512195,
+
+    // Lineage regions. A child belongs to its mother's region. Weights are
+    // relative shares of founders and of immigrants. Provisional placeholders
+    // until residence (Phase 2) gives regions real places.
+    regions: [
+        (id: "east", name: "east", founder_weight: 0.6, immigrant_weight: 0.7),
+        (id: "west", name: "west", founder_weight: 0.4, immigrant_weight: 0.3),
+    ],
+
+    // Multipliers for test worlds, which raise rare things so exhaustive
+    // checks cover them. Realistic worlds keep them at 1 (and the floor at 0).
+    test_boosts: (
+        // Multiplies the same-sex share of first unions (unions.ron).
+        same_sex: 1.0,
+        // Floor on every heritage group's share of founders and immigrants.
+        heritage_floor: 0.0,
+        // Multiplies every open-market (cross-heritage) share (heritage.ron).
+        open_market: 1.0,
+    ),
+)

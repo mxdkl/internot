@@ -7,6 +7,7 @@ members = [
     "internot_renderer",
     "internot_perf",
     "internot_society",
+    "internot_def",
 ]
 resolver = "2"
 

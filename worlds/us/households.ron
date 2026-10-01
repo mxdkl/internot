@@ -1,0 +1,113 @@
+// Households (L3): leaving home, living with kin, custody and roommates.
+// Provisional schedules, each calibrated in the household report against
+// research/2026-09-30-household-targets.md.
+(
+    // Leaving home other than by a union. The share of a birth cohort who
+    // haven't left on their own by age a is
+    //   S(a) = tail + (1 − tail) / (1 + exp((a − m) / s)),
+    // and nobody leaves this way before `min_age` (so no minor with a living
+    // parent lives alone). Unions end living at home separately.
+    // Anchors (birth cohort, m, s, tail) per sex, interpolated linearly.
+    // Fitted so the share at home among people not yet partnered matches
+    // Census AD-1: before about 1950 most young adults left only to marry
+    // (a heavy tail), then independent leaving peaked, and since about 1990
+    // more stay into their late twenties. Targets: AD-1 (at home at 18–24
+    // and 25–34 by sex, 1960–2025), Pew (35% of 18–34 at home in 1940),
+    // AD-3 (11.6% of adults a child of the householder, 2023).
+    independence: (
+        min_age: 18.0,
+        female: [
+            (1850, 22.0, 3.0, 0.50),
+            (1930, 21.0, 3.0, 0.50),
+            (1945, 21.0, 3.0, 0.42),
+            (1960, 21.0, 3.0, 0.30),
+            (1975, 22.0, 3.5, 0.25),
+            (1995, 20.5, 4.0, 0.38),
+            (2010, 20.5, 4.0, 0.40),
+        ],
+        male: [
+            (1850, 22.5, 3.0, 0.55),
+            (1930, 21.5, 3.0, 0.55),
+            (1945, 21.5, 3.0, 0.47),
+            (1960, 21.5, 3.0, 0.35),
+            (1975, 22.5, 3.5, 0.30),
+            (1995, 21.0, 4.0, 0.42),
+            (2010, 21.0, 4.0, 0.44),
+        ],
+    ),
+
+    // Probability that the father keeps the children of a union that ends in
+    // divorce: single fathers head 25% of one-parent families with children
+    // under 18 (Census FM-1). Drawn once per union, so siblings stay together.
+    custody_father: 0.25,
+
+    // Living with kin (L3 §13). A unit (a single adult, or a couple deciding
+    // together at the older partner's age) seeks kin with a propensity by
+    // age and era. Targets: Census AD-3 2023 (11.6% of adults a child of the
+    // householder, 12.3% with other relatives, 14.8% alone), AD-1 at home at
+    // 25–34, and Ruggles' elder co-residence.
+    kin: (
+        // An elder moving in with a child: level by the decider's birth
+        // cohort (single elders, couples), times a logistic in age centred
+        // on `midpoint` with width `width`. Nondecreasing in age and higher
+        // for a single elder, so one keyed uniform per person gives a stay
+        // that never reverts while a host remains. Targets: about 70% of
+        // people 65+ with an adult child in 1850 and under 15% by 1990–2000
+        // (Ruggles 2007), counting children who never left; 28% of people
+        // 65+ living alone (CPS 2023).
+        elder: (
+            single: [(1780, 0.85), (1850, 0.60), (1900, 0.20), (1930, 0.06), (1960, 0.06)],
+            couple: [(1780, 0.55), (1850, 0.30), (1900, 0.06), (1930, 0.02), (1960, 0.02)],
+            midpoint: 70.0,
+            width: 4.0,
+        ),
+        // Moving back with a parent: a bump over the late twenties for single
+        // adults aged `min_age` to below `max_age`: level · exp(−((age −
+        // peak) / width)²). Before that, the independence tail keeps people
+        // at home.
+        boomerang: (
+            level: [(1900, 0.04), (1960, 0.03), (1980, 0.04), (2000, 0.07), (2025, 0.10)],
+            min_age: 18.0,
+            max_age: 35.0,
+            peak: 27.0,
+            width: 4.0,
+        ),
+        // Single adults living with relatives (siblings, parents, adult
+        // children): level · clamp((age − from) / years, floor, 1). Low for
+        // young adults, then flat from 35.
+        other: (
+            level: [(1900, 0.30), (1960, 0.27), (2000, 0.22), (2025, 0.22)],
+            from: 18.0,
+            years: 17.0,
+            floor: 0.25,
+        ),
+        // A young couple living with a parent: level, falling linearly to
+        // zero between `from` and `from + years`; none at `max_age` and older.
+        // Larger before 1960.
+        young_couple: (
+            level: [(1900, 0.08), (1940, 0.08), (1960, 0.04), (1990, 0.02)],
+            from: 18.0,
+            years: 17.0,
+            max_age: 35.0,
+        ),
+    ),
+
+    // Roommates: single adults who have left home, have no child under 18
+    // and aren't seeking kin, aged `min_age` to below `max_age` at an epoch
+    // start, group in keyed frames over bands of `band_years` birth years,
+    // re-formed every `epoch_years`.
+    roommates: (
+        min_age: 18.0,
+        max_age: 65.0,
+        band_years: 3,
+        epoch_years: 2,
+        // Probability that an eligible adult seeks roommates in an epoch:
+        // era level times an age factor (first band whose bound the age is
+        // below). Targets: about 7% of 18–24 and 5% of 25–34 year olds in
+        // roommate households (2019; 71% of the 10% and 7% living with
+        // non-relatives only), and 6.7% of households "other nonfamily"
+        // (2025).
+        level: [(1950, 0.0), (1970, 0.4), (1990, 0.7), (2020, 0.85)],
+        by_age: (below: [(25.0, 1.0), (30.0, 0.8), (35.0, 0.5), (50.0, 0.25)], above: 0.12),
+    ),
+)

@@ -1,7 +1,8 @@
 //! People and kinship as pure functions of `(seed, id, t)`.
 //!
-//! An id is a rank in a birth block (block = birth year × lineage region;
-//! a child is born into its mother's region). A block's raw ids are its
+//! An id is a rank in a birth block (block = birth year × lineage group, a
+//! group being a region and a heritage; a child is born into its mother's
+//! group). A block's raw ids are its
 //! entry cohorts in order: natives, then immigrants by arrival year (R1b-2).
 //! Keyed permutations order them:
 //! - each cohort's **life line**: `[women | men]`, each sex as `[sub-cells
@@ -28,8 +29,8 @@ use rayon::prelude::*;
 
 use crate::ledger::{cutoff, plan_key, Block, CellKind, Ledger, MotherShare, MIN_UNION_AGE};
 use crate::params::{
-    death_prob, dissolution_pmf, Params, Sex, DISSOLUTION_BANDS, GESTATION_DAYS, MAX_AGE,
-    MAX_BIRTH_AGE, MAX_REMARRIAGE_AGE, MIN_BIRTH_AGE,
+    Heritage, Params, Sex, DISSOLUTION_BANDS, MAX_AGE, MAX_BIRTH_AGE, MAX_REMARRIAGE_AGE,
+    MIN_BIRTH_AGE,
 };
 use crate::plan::{
     arrival_births, arrival_plans, leaf_births, nonunion_plans, NonUnionLeaf, MAX_PARITY,
@@ -67,6 +68,11 @@ pub struct Union {
 /// Most children one person can have in R1: a full union plan plus two
 /// non-union births.
 pub const MAX_KIN: usize = 4 * MAX_PARITY;
+
+/// Most unions one person's lookups can return. A technical bound, not a
+/// rule (R1d): anyone can re-partner after any separation, and
+/// [`World::unions`] panics if a chain ever runs past this.
+pub const MAX_UNIONS: usize = 16;
 
 /// A short list of kin stored inline, so kin lookups never allocate. Reads
 /// as a slice of ids.
@@ -750,6 +756,8 @@ pub struct World {
     /// Coarse indexes of both, [`COARSE_LEN`] entries per row.
     lifetable_coarse: Vec<f64>,
     residual_coarse: Vec<f64>,
+    /// Name sampling tables, built lazily (N1).
+    name_tables: crate::names::NameTables,
 }
 
 impl World {
@@ -768,7 +776,9 @@ impl World {
             residuals: Vec::new(),
             lifetable_coarse: Vec::new(),
             residual_coarse: Vec::new(),
+            name_tables: crate::names::NameTables::default(),
         };
+        w.name_tables = crate::names::NameTables::new(&w.ledger.params.name_data);
         // Each block's structures are a pure function of the ledger, so
         // they are built on every core.
         let marks = Self::free_marks(&w.ledger);
@@ -795,6 +805,17 @@ impl World {
         w.lifetable_coarse = w.lifetables.chunks(TABLE).flat_map(coarse_index).collect();
         w.residual_coarse = w.residuals.chunks(TABLE).flat_map(coarse_index).collect();
         w
+    }
+
+    /// The world's root key (for views keyed on people, such as
+    /// households).
+    /// The world's name sampling tables (N1).
+    pub(crate) fn name_tables(&self) -> &crate::names::NameTables {
+        &self.name_tables
+    }
+
+    pub(crate) fn key(&self) -> Key {
+        self.key
     }
 
     /// The ledger this world reads.
@@ -829,7 +850,7 @@ impl World {
     }
 
     /// `(block, raw)` for an id.
-    fn decode(&self, id: PersonId) -> (u32, u64) {
+    pub(crate) fn decode(&self, id: PersonId) -> (u32, u64) {
         let id = id as u64;
         assert!(id < self.population(), "person id {id} out of range");
         let i = (id >> self.bucket_shift) as usize;
@@ -845,7 +866,7 @@ impl World {
         (b as u32, id - self.ledger.base[b])
     }
 
-    fn id_of(&self, block: u32, raw: u64) -> PersonId {
+    pub(crate) fn id_of(&self, block: u32, raw: u64) -> PersonId {
         (self.ledger.base[block as usize] + raw) as PersonId
     }
 
@@ -922,8 +943,11 @@ impl World {
                     let arrivals = if c.kind == CellKind::Arrival {
                         let off = ar.arrivals.len() as u32;
                         let dens = self.ledger.arrival_density(c.year);
-                        for leaf in arrival_plans(c.total, c.year, age, pk, dens, tables) {
-                            let (in_world, kids) = arrival_births(&leaf, age, c.class);
+                        let p = &self.ledger.params;
+                        let mca = p.immigration.min_couple_age;
+                        let h = block.heritage;
+                        for leaf in arrival_plans(c.total, c.year, age, pk, dens, tables, h, mca) {
+                            let (in_world, kids) = arrival_births(&leaf, age, c.class, p);
                             ar.leaves.push(Leaf::pack(at, in_world));
                             ar.arrivals.push((leaf.d, kids));
                             at += leaf.plan.count;
@@ -931,11 +955,19 @@ impl World {
                         off
                     } else {
                         let mut plans = Vec::new();
-                        tables
-                            .year(c.year)
-                            .plans_into(c.total, c.kind.second(), pk, &mut plans);
+                        tables.at(c.year, block.heritage).plans_into(
+                            c.total,
+                            c.kind.second(),
+                            pk,
+                            &mut plans,
+                        );
                         for leaf in &plans {
-                            let (offs, n) = leaf_births(leaf, age, cutoff(c.class));
+                            let (offs, n) = leaf_births(
+                                leaf,
+                                age,
+                                cutoff(c.class),
+                                &self.ledger.params.fertility,
+                            );
                             let mask = offs[..n].iter().fold(0u32, |m, &o| m | 1 << o);
                             ar.leaves.push(Leaf::pack(at, mask));
                             at += leaf.count;
@@ -1053,7 +1085,7 @@ impl World {
                         in_cell: start,
                         ci: ci as u16,
                         year: cell.yr,
-                        divorces: cell.class > 0 && cell.kind.first_opposite(),
+                        divorces: cell.class > 0 && cell.kind.feeds_divorced(),
                     });
                     lines[co as usize][si] = line + (end - start);
                 }
@@ -1143,7 +1175,9 @@ impl World {
         let mut cohort_starts = Vec::with_capacity(n_co + 1);
         let mut raw = 0u64;
         for (c, (co, subs)) in block.cohorts.iter().zip(subs).enumerate() {
-            let nonunion = nonunion_plans(co.females, block.year);
+            let p = &self.ledger.params;
+            let factor = p.heritage.fertility_factor(block.heritage, block.year + 25);
+            let nonunion = nonunion_plans(co.females, block.year, &p.fertility, factor);
             let mut nu_starts = Vec::with_capacity(nonunion.len() + 1);
             let mut acc = 0;
             for leaf in &nonunion {
@@ -1310,14 +1344,14 @@ impl World {
 
     /// Starts of the mother-age slots of a parent line whose mothers are
     /// `mothers` (in mother-block order). Every mother is in the child's
-    /// region and aged [`MIN_BIRTH_AGE`] to [`MAX_BIRTH_AGE`] at the birth.
+    /// lineage group and aged [`MIN_BIRTH_AGE`] to [`MAX_BIRTH_AGE`] at the birth.
     fn parent_starts(&self, block: &Block, mothers: &[MotherShare]) -> [u64; PARENT_SLOTS + 1] {
         let mut slot_births = [0u64; PARENT_SLOTS];
         for m in mothers {
             let mother = &self.ledger.blocks[m.mother as usize];
             assert_eq!(
-                mother.region, block.region,
-                "a child is in its mother's region"
+                mother.group, block.group,
+                "a child is in its mother's lineage group"
             );
             let age = block.year - mother.year;
             assert!(
@@ -1415,9 +1449,9 @@ impl World {
         Some((s, s.in_cell as u64 + (p.offset - s.start as u64)))
     }
 
-    /// The first-union seat of the member at place `pos` of source `src`'s
-    /// remarriage order.
-    fn first_seat_of_source(&self, block: u32, sex: Sex, src: usize, pos: u64) -> Seat {
+    /// The seat, in the source's own union cell, of the member at place
+    /// `pos` of source `src`'s remarriage order.
+    fn seat_of_source(&self, block: u32, sex: Sex, src: usize, pos: u64) -> Seat {
         let sl = self.layout(block).sources[sex as usize][src];
         let i = CompactPerm::from_parts(sl.members as u64, sl.perm).inv(pos);
         Seat {
@@ -1428,9 +1462,9 @@ impl World {
         }
     }
 
-    /// The second-union seat of a person at a first-union seat, if their
-    /// cell separates and they re-partner (R1c).
-    fn second_seat(&self, first: Seat) -> Option<Seat> {
+    /// The seat of a person's next union, after the union at `seat`
+    /// separates, if they re-partner (R1c, any order R1d).
+    fn next_seat(&self, first: Seat) -> Option<Seat> {
         let layout = self.layout(first.block);
         let src = layout.source_of[first.sex as usize][first.ci];
         if src == u32::MAX {
@@ -1462,11 +1496,13 @@ impl World {
         };
         let offset = line as u64 + (i - start as u64);
         if cell.kind.second() {
-            // A second-union cell's members come from divorced sources:
+            // A re-partnering cell's members come from divorced sources:
             // `cohort` is the source, `offset` a place in its remarriage
-            // order, which maps back to the member's first-union seat.
-            let first = self.first_seat_of_source(block, sex, cohort as usize, offset);
-            return self.person_in_cell(first.block, sex, first.ci, first.i);
+            // order, which maps back to the member's seat in the previous
+            // union (itself a re-partnering cell for a third union, and so
+            // on).
+            let prev = self.seat_of_source(block, sex, cohort as usize, offset);
+            return self.person_in_cell(prev.block, sex, prev.ci, prev.i);
         }
         self.id_of(block, self.raw_of(block, cohort, sex, offset))
     }
@@ -1537,9 +1573,20 @@ impl World {
     }
 
     /// Lineage region (index into [`Params::regions`]): the mother's
-    /// region, or the founder's.
+    /// region, or the founder's or immigrant's.
     pub fn region(&self, id: PersonId) -> u16 {
         self.block(self.decode(id).0).region
+    }
+
+    /// Heritage group (N1): the mother's, or the founder's or immigrant's.
+    pub fn heritage(&self, id: PersonId) -> Heritage {
+        self.block(self.decode(id).0).heritage
+    }
+
+    /// Lineage group (region × heritage): the mother's, or the founder's or
+    /// immigrant's. Block `(year, group)` holds the person.
+    pub fn lineage_group(&self, id: PersonId) -> u16 {
+        self.block(self.decode(id).0).group
     }
 
     /// True if born before the world starts and not an immigrant (no
@@ -1628,12 +1675,16 @@ impl World {
 
     /// The default (unrepaired) fathers a child can have: for a union birth
     /// the mother's default partner in that union; for a non-union birth
-    /// her default partner in either union (R1c; conservative: the kin
+    /// her default partner in any of her unions (R1c; conservative: the kin
     /// predicate treats any of them as the father).
-    fn default_fathers(&self, c: PersonId, pc: ParentPos) -> [Option<PersonId>; 2] {
+    fn default_fathers(&self, c: PersonId, pc: ParentPos) -> [Option<PersonId>; MAX_UNIONS] {
         let (m, _, seat) = self.mother_event_at(c, pc);
         match seat {
-            Some(s) => [self.partner_unrepaired(s), None],
+            Some(s) => {
+                let mut out = [None; MAX_UNIONS];
+                out[0] = self.partner_unrepaired(s);
+                out
+            }
             None => self
                 .seats(&self.life_pos(m))
                 .map(|s| s.and_then(|s| self.partner_unrepaired(s))),
@@ -1641,7 +1692,8 @@ impl World {
     }
 
     /// For a union birth, from its birth-table column: whether the father
-    /// is in his second union (R1c). `None` for other births.
+    /// re-partnered for that union (his second or a later one; R1c, R1d).
+    /// `None` for other births.
     fn father_in_second(&self, (mb, _, _): ParentPos, column: Option<usize>) -> Option<bool> {
         let layout = self.layout(mb);
         let plan = &layout.plans[column?];
@@ -1671,7 +1723,7 @@ impl World {
         let age = MAX_BIRTH_AGE - k as i32;
         let mb = self
             .ledger
-            .block_of(block.year - age, block.region)
+            .block_of(block.year - age, block.group)
             .expect("the mother's block");
         Some((mb, q - starts[k], arrival))
     }
@@ -1733,15 +1785,16 @@ impl World {
                 return true;
             }
         }
-        // Paternal half-siblings (R1c): the same father with two mothers,
-        // one in his first union and one in his second. Only union births
-        // whose fathers are at different union orders can share one.
+        // Paternal half-siblings (R1c, R1d): the same father with two
+        // mothers. A man has one first union, so two union births can share
+        // a father across mothers only if at least one comes from a union in
+        // which he re-partnered (his second, third, ...).
         if let (Some(pa), Some(pb)) = (pa, pb) {
             let (fa, fb) = (
                 self.father_in_second(pa, self.birth_cell(a, pa)),
                 self.father_in_second(pb, self.birth_cell(b, pb)),
             );
-            if matches!((fa, fb), (Some(x), Some(y)) if x != y) {
+            if matches!((fa, fb), (Some(x), Some(y)) if x || y) {
                 let (da, db) = (
                     self.default_fathers(a, pa)[0],
                     self.default_fathers(b, pb)[0],
@@ -2066,10 +2119,17 @@ impl World {
         })
     }
 
-    /// A person's union seats: first, then second (R1c).
-    fn seats(&self, p: &LifePos) -> [Option<Seat>; 2] {
-        let first = self.first_seat(p);
-        [first, first.and_then(|s| self.second_seat(s))]
+    /// A person's union seats, in order: each after the previous one
+    /// separates (R1c; any number, R1d).
+    fn seats(&self, p: &LifePos) -> [Option<Seat>; MAX_UNIONS] {
+        let mut out = [None; MAX_UNIONS];
+        let mut seat = self.first_seat(p);
+        for slot in out.iter_mut() {
+            *slot = seat;
+            seat = seat.and_then(|s| self.next_seat(s));
+        }
+        assert!(seat.is_none(), "more than {MAX_UNIONS} unions");
+        out
     }
 
     /// The union cell of a partnered person.
@@ -2095,7 +2155,7 @@ impl World {
             // keyed draws, as no ledger count depends on them.
             let year = cell.year();
             let start = year_start(year) + key.below(360) as i64 * DAY;
-            let pmf = dissolution_pmf(year);
+            let pmf = self.ledger.params.dissolution.pmf(year);
             let u = key.with(3).unit() * pmf.iter().sum::<f64>();
             let mut acc = 0.0;
             let band = pmf
@@ -2168,7 +2228,7 @@ impl World {
     /// Unions of `id`: the first, and the second if the first ended in
     /// divorce and they re-partnered (R1c). A second union starts after the
     /// first's separation year.
-    pub fn unions(&self, id: PersonId) -> [Option<Union>; 2] {
+    pub fn unions(&self, id: PersonId) -> [Option<Union>; MAX_UNIONS] {
         self.seats(&self.life_pos(id))
             .map(|s| s.and_then(|s| self.union_at(s, id)))
     }
@@ -2183,7 +2243,7 @@ impl World {
 
     /// The year and kind of each of a person's union cells: first, then
     /// second (R1c).
-    pub fn union_cells(&self, id: PersonId) -> [Option<(i32, CellKind)>; 2] {
+    pub fn union_cells(&self, id: PersonId) -> [Option<(i32, CellKind)>; MAX_UNIONS] {
         let p = self.life_pos(id);
         self.seats(&p).map(|s| {
             s.map(|s| {
@@ -2463,7 +2523,7 @@ impl World {
         }
     }
 
-    /// Father: the mother's partner at conception, [`GESTATION_DAYS`]
+    /// Father: the mother's partner at conception, the pack's `gestation_days`
     /// before the birth.
     ///
     /// For a union birth that is her partner if he was still alive then:
@@ -2473,7 +2533,7 @@ impl World {
     /// both parents.
     pub fn father(&self, id: PersonId) -> Option<PersonId> {
         let (m, kind, seat) = self.mother_event_at(id, self.parent_line_pos(id)?);
-        let conception = self.birth(id) - GESTATION_DAYS * DAY;
+        let conception = self.birth(id) - self.ledger.params.fertility.gestation_days * DAY;
         // A union birth's father is the mother's partner in that union
         // (her first or her second, R1c).
         let partner = || seat.and_then(|s| self.repaired_partner(s, m)).map(|x| x.0);
@@ -2497,7 +2557,7 @@ impl World {
         start: u64,
     ) -> Option<PersonId> {
         let mother = self.block(mb);
-        let cb = self.ledger.block_of(year, mother.region)?;
+        let cb = self.ledger.block_of(year, mother.group)?;
         let age = year - mother.year;
         let k = (MAX_BIRTH_AGE - age) as usize;
         if let EventKind::Arrival { cell, leaf } = kind {
@@ -2667,7 +2727,7 @@ impl World {
             let Some(c) = self.child_of_event(wp.block, year, kind, off, start) else {
                 continue;
             };
-            let conception = self.birth(c) - GESTATION_DAYS * DAY;
+            let conception = self.birth(c) - self.ledger.params.fertility.gestation_days * DAY;
             let his = match kind {
                 EventKind::Arrival { .. } => true,
                 EventKind::Union { .. } => conception < death,
@@ -2726,7 +2786,7 @@ impl World {
             Some(s) => {
                 let cell = Self::cell(self.layout(s.block), s.sex, s.ci);
                 let his = cell.kind.partner();
-                his.second() || (his.first_opposite() && cell.class > 0)
+                his.second() || (his.feeds_divorced() && cell.class > 0)
             }
             None => self.first_seat(&self.life_pos(m)).is_some(),
         };
@@ -2764,13 +2824,17 @@ impl World {
     }
 
     fn build_lifetable(&self, b: u32) -> [Vec<f64>; 2] {
-        let year = self.block(b).year;
+        let block = self.block(b);
+        let year = block.year;
+        let p = &self.ledger.params;
         let table = |sex| {
             let mut l = Vec::with_capacity(MAX_AGE as usize + 2);
             let mut s = 1.0;
             for a in 0..=MAX_AGE {
                 l.push(s);
-                s *= 1.0 - death_prob(sex, a, year + a as i32);
+                let t = year + a as i32;
+                let f = p.heritage.mortality_factor(block.heritage, t);
+                s *= 1.0 - p.mortality.death_prob_scaled(sex, a, t, f);
             }
             l.push(0.0);
             l

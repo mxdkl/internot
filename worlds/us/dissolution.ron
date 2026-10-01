@@ -1,0 +1,39 @@
+// How unions end: by separation or by a death.
+//
+// A union formed in year t separates with probability `separation_share(t)`;
+// otherwise it lasts until a partner dies. A separating union ends in one of
+// five duration bands (years after the union year): 1–3, 4–7, 8–12, 13–20,
+// 21–40. Within a band, each year is equally likely.
+(
+    // Unions include cohabitation, which breaks up more often than marriage:
+    // since about 1990 the share stays near half instead of following the
+    // marriage-only decline (R1d; calibrated on partner status by age, Census
+    // A1 plus UC3).
+    separation_share: [
+        (1840, 0.05),
+        (1900, 0.10),
+        (1950, 0.28),
+        (1970, 0.50),
+        (2000, 0.50),
+        (2100, 0.50),
+    ],
+
+    // Shares of separating unions in each band. Durations follow NSFG's
+    // early-peaking hazard: about a third within 4 years, median about 8,
+    // for marriages. Unions formed since about 1990 include more
+    // cohabitations, which end sooner (R1d): the bands shift from `early` to
+    // `late` as `shift` goes from 0 to 1.
+    bands: (
+        early: [0.18, 0.24, 0.24, 0.20, 0.14],
+        late: [0.30, 0.26, 0.20, 0.14, 0.10],
+        shift: [(1980, 0.0), (2000, 1.0)],
+    ),
+
+    // Re-partnering unions separate more: their separation share is
+    // multiplied by this, capped at `max_share`. NSFG 1995 has 39% of second
+    // marriages disrupted within 10 years against 33% of first marriages
+    // (research/2026-09-30-remarriage-targets.md §5); calibrated on the
+    // realism report.
+    repartnered_factor: 1.35,
+    max_share: 0.9,
+)

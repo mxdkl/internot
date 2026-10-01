@@ -18,6 +18,15 @@ A procedural-world substrate for AI-agent training and evaluation. The thesis: a
 - `procedural_overlay` — `Session<'w, W>` for mutation: in-memory overlay over a borrowed `World`, intercepts reads, absorbs writes.
 - `internot_renderer` — shared LLM-render infrastructure: `OpenAiClient` (blocking reqwest; `with_base_url` lets it target any OpenAI-compatible API such as DeepSeek), on-disk `Cache` keyed by `(namespace, prompt_version, model_version, hashed-id)`, `RenderError`. **Currently has no consumer** (its only consumer, mail's renderer, was removed). Per-service renderers compose this; the same OpenAiClient + Cache instance is shared across services via the Services struct (see below).
 
+**World packs (spec `specs/2026-10-01-world-packs.md`):**
+- `internot_def`: world packs, i.e. RON files in `worlds/<pack>/`. It provides:
+  - loading from directories or from packs embedded in the binary;
+  - `extends`, merging field by field and lists by `id`;
+  - errors that name the file and the line or field;
+  - a fingerprint;
+  - the value vocabulary (`Series`, `VecSeries`, `Steps`, `Bands`, `Ranges`, `BySex`).
+- **Every statistic lives in a pack** (`worlds/us/`), never in code. `worlds/README.md` is the guide.
+
 **New layers under construction (spec `specs/2026-09-29-society-as-a-function.md`):**
 - `internot_society` — the R1 kinship prototype: the demographic ledger (`ledger.rs`), schedules (`params.rs`), plan catalogs (`plan.rs`) and the lookups (`world.rs`). Population, unions (including same-sex and couples who arrived together), births, parents, children, siblings and deaths, for natives and immigrants, all as pure functions of `(seed, id, t)`. It depends on `procedural_core`, plus `rayon` for a parallel `World::build`. Status and guarantees are under "Phase 1" below.
 - `internot_perf` — the benchmark and profiling harness (`perf-gate` binary): suites `core_hash`, `primitives` and `kinship`, budgets in `perf/budgets.toml`, per-machine baselines in `perf/baselines/`, and flamegraphs. `perf/check.sh` runs all workspace tests and then the gate.
@@ -153,6 +162,12 @@ Adding the service automatically: registers spaces on the right world, exposes v
   - Benchmarks come before features.
 - **"Make it perfect or don't build it."** Design fully and prototype the risky parts before production code. A phase is done only when its property, realism and performance gates pass.
 - **Budget.** About $10 of DeepSeek API credit for everything (LLM rendering plus agent runs). Design for that.
+- **Statistics, not rules (2026-09-30).** "Don't make global rules for people; theoretically anything can happen, it's just statistics." Also: "do what you think is realistic."
+  - Model behaviour with rates by age, era and circumstance, never with caps, exclusions or labels forced on people. Examples:
+    - immigrants arrive as they are, and re-partner if they want;
+    - no "at most two unions";
+    - no "never returns home".
+  - A hard rule kept for technical reasons is debt: name it, measure its realism cost, and replace it when it matters.
 
 **Active goal.** Run the pilot in `docs/superpowers/specs/2026-09-29-coherence-eval-awareness-experiment.md`: does a coherent world lower how often a model says it thinks it's being tested? The pilot needs a small set of content services with cross-references between them.
 
@@ -364,7 +379,111 @@ Adding the service automatically: registers spaces on the right world, exposes v
       4. **Lookup budgets sized to workloads**: about 25 µs for one-hop lookups and 2 µs for death, in place of the 4–5 µs caps.
     - The kinship gate's lookup failures are known and accepted until then. Do not re-record baselines; that would hide them.
 
+**L3 households: BUILT, calibrated (2026-09-30)** (`plans/2026-09-30-l3-households.md`, including §13; targets in `research/2026-09-30-household-targets.md`).
+- **Module:** `internot_society::household`: `World::household(x, t)`, `World::members(h, t)`, `World::kin_host`.
+  - Household kinds: `Union`, `Solo` (with anyone who lives with them), `Roommates`.
+  - Rules:
+    1. dependents live with a parent or guardian (minors whose union ended go back);
+    2. a unit (single or couple) seeks kin with a propensity by age and era: moving back with a parent, other relatives, an elder with a child, a young couple with a parent. It joins the first **anchor** among its kin (anchors never seek kin), so it's one step and never cycles;
+    3. partners live together;
+    4. single adults live alone or with roommates (ages 18 to 64, no child under 18; keyed frames of 12 over birth-year bands).
+- **Tests** (`tests/households.rs`, exhaustive on the tiny world at 15 dates): exact reciprocity both ways; partners together; minors never alone except the measured residuals; no next-day reversion.
+  - The residuals: founder minors until 18 (1840 to 1857); kinless orphans, 0.15% of minors in 1900 and none by 2025.
+- **Calibrated:**
+  - at home at 18 to 24;
+  - adults with other relatives (12.0% against 12.3%);
+  - household size and couple share for 1980 and 2000 (2.75 against 2.76; 53.2% against 52.8%);
+  - 65+ with an adult child (18.5% in 2000).
+  - **Report:** `examples/household_report.rs` (about 80 s), including partner status by age.
+- **Still off (2025):**
+
+  | Measure | Model | Census |
+  |---|---|---|
+  | adults living alone | 22.5% | 14.8% |
+  | one-person households | 40.6% | 29.5% |
+  | 65+ living alone | 39% | 28% |
+
+  This is mostly the kinship partner deficit at older ages; see R1d debt.
+- **Speed:** `household` 17 µs p50 / 176 µs p99; `members` 167 µs / 731 µs. No gate yet.
+- **Out of scope:** dorms, boarders and servants.
+- **Founder decision (2026-10-01): accepted as is.** "We can drift from the census a little." Phase 1 (population, kinship, households) is done.
+  - Still open, as debt: widowed re-partnering, mortality by partnership, the young-union timing, and the deferred speed items (lookup budgets, memory, the 2.4 s world build).
+
+**R1d (statistics, not rules): steps 1 to 4 DONE (2026-09-30)** (`plans/2026-09-30-r1d-statistics-not-rules.md`).
+- Rules removed:
+  - the age cutoffs on first unions and re-partnering;
+  - "at most two unions" (now any number; `MAX_UNIONS` = 16 is a bound on lookups, and the most reached is 9);
+  - single immigrants partnering on the never-partnered first-union schedule (now at their single native peers' rate).
+- Recalibrated to living with a spouse or partner by age (Census A1 plus UC3):
+  - re-partnering;
+  - dissolution, with cohabitation included, so recent unions end sooner;
+  - fertility compensation.
+- The 1970 cohort has 2.02 children; 14.0M ever born.
+- **Open debt:** no widowed re-partnering (widowed singles at 75+: 39% against 33%); mortality ignores partnership; no same-sex re-partnering. World build is 2.4 s.
+
+**World packs: steps 1 to 4 DONE (2026-10-01)** (`specs/2026-10-01-world-packs.md`; research `research/2026-10-01-world-definitions.md`).
+- **Founder decision (2026-10-01):** "everything configurable through those rust json-like files". That covers races, names, birth rates, countries, places and, later, services, "easily extendible by anyone"; the specifics are delegated.
+- **The design:**
+  - Mechanisms are code; every number, list and name is data.
+  - Packs are RON files in `worlds/<pack>/`, and `us` and `us-tiny` are embedded in the binary.
+  - `extends` merges a child pack into its parent field by field. Lists of records with an `id` merge by id.
+  - Unknown fields are errors. Every number sits next to a comment naming its source.
+  - The merged pack is compiled once at build. A fingerprint identifies the pack.
+  - A new crate, `internot_def`, does the loading and merging and holds the value vocabulary (`Series`, `Steps`, `BySex`, ...).
+- **Migration is bit-identical,** checked by `examples/world_fingerprint.rs`. Baseline: tiny `b19c209ec97e8c4c` / `f3bd18ec8c5afb2e`, prototype `e47e257ad076f57d` / `bc764f24987f394f`.
+- **Done:**
+  - `internot_def` crate.
+  - Packs `worlds/us` (nine sections) and `worlds/us-tiny` (one file extending `us`).
+  - `worlds/README.md`, the guide for anyone.
+  - `internot_society::params` is typed sections plus `Params::{prototype, tiny, embedded, load, from_pack}`.
+  - `build.rs` embeds `worlds/`.
+  - Heritage groups are pack-defined: `Heritage` is an index, and there is no enum.
+- **Checks:**
+  - The fingerprint is unchanged (re-recorded baseline with heritage as an index: tiny `830e0ddfaf6b1702` / `f3bd18ec8c5afb2e`, prototype `fc1cc62ffcc638bb` / `bc764f24987f394f`).
+  - All 860 workspace tests pass.
+- **How to work from now on:**
+  - New statistics go in the pack, never in code.
+  - A new section is a typed struct in its consumer's crate, read with `pack.section(name)`, checked in `validate`, and documented in `worlds/README.md`.
+  - Structural bounds stay in code and are listed in the README.
+  - Check refactors that must not change the world with `examples/world_fingerprint.rs`.
+- **Next:** N1 resumes on the packs: group fertility and mortality rates, calibration, then names.
+
+**Names and heritage (N1): heritage DONE, names BUILT (2026-10-01)** (plan outcome for details).
+- **Names:** `internot_society::names`, with data and rules in `worlds/us/names.ron` and `data/names.bin`.
+  - First names come from SSA by year, split by group with Census 2020 and raked to the world's own births.
+  - Surnames are inherited, change at weddings by era, and can revert after a separation.
+  - Marriage is now a fact of each union (`World::marriage_date`). 86.5% of couples living together are married in 2023, against 86.7%.
+- **Speed:** `first_name` 5.5 / 24 µs and `surname` 51 / 286 µs (p50 / p99).
+- **Debt:** Asian names mix origins (needs origin countries); no women's middle-name pool; names frozen after 2025.
+- **Heritage is in the ledger and calibrated** (plan outcome):
+  - composition 1850–2020 within about 2–3 points of the Census;
+  - intermarriage by group and sex matches Pew for 1980 and 2015;
+  - group fertility and mortality are pack factors, with adult mortality solved to the e0 gaps.
+- **Debt:** children join the mother's group (Hispanic 16.7% against 19.6%); same union rates for every group; no generation effect in intermarriage.
+- **Build:** 4.9 s.
+- **Why heritage first.** First names and surnames depend strongly on race and Hispanic origin (Census 2020 name files). For a family's names to make sense, partners must mostly share a heritage, at real intermarriage rates by era (Pew: 3% of newlyweds in 1967, 17% in 2015).
+  - A heritage-blind ledger can't give that. Any labelling of a heritage-blind union graph either mixes families at random within a few generations or lets one label take over.
+  - So heritage must shape the markets, not only the names.
+- **Founder decision (2026-10-01): heritage goes in the ledger.**
+  - Lineage groups become region × heritage.
+  - Five groups follow the Census 2020 name files: non-Hispanic White, Black, Asian and Pacific Islander, AIAN, and Hispanic of any race.
+  - "Two or more races" is not a group; it comes from mixed parents.
+  - The founder asked whether heritage affects the couple or only the children. The answer is both: it shapes who partners with whom, and children inherit it.
+- **Cost measured before design (10 groups against 2, uniform mixing, the worst case):**
+  - world build 10.4 s against 2.7 s;
+  - peak RSS during the build 2.6 GB against 1.6 GB.
+  - The time is the cross-group market's dense rounding, which grows with groups² (the known regions² debt).
+  - Sparse rounding (per row group: cumulative shares and systematic placement, O(couples · log) instead of O(rows · cols)) is part of the plan.
+- **v1 scope (debt from the start):**
+  - every group has the same fertility, mortality and union rates; real groups differ, so composition will drift;
+  - children join their mother's group in the ledger (as with regions, D-R1.1), and their names draw on both parents.
+
 **Blocked on founder decisions** (each written up, with options and a recommendation):
+0. ~~Kinship current-status calibration~~ **Decided 2026-09-30: do what is realistic, statistics not rules** (see Direction). Immigrants arrive as they are and partner at rates for people like them. Being worked on (R1d, below). The original question: Too many people are divorced and single at 45+ (Census A1), and older single immigrants count as never partnered. Recommendation:
+   - (a) recalibrate R1c's re-partnering hazard to current-status targets (A1 divorced by age, plus cohabitation). It was calibrated to remarriage only, while unions include cohabitation.
+   - (b) give older single arrivals a previous union abroad (divorced or widowed), so they enter the re-partnering markets.
+
+   Then reassess widowed re-partnering and third unions (now capped at two unions).
 1. ~~Residence and households~~ **Decided 2026-09-30: option B now, C prototyped as its upgrade** (`research/2026-09-30-residence-enumeration-problem.md`).
    - Kinship is exact by lineage region.
    - Residence is dynamic: exact per person and per address, with moves drawn from candidate tiers (same city, same lineage region, national).

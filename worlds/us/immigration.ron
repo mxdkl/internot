@@ -1,0 +1,79 @@
+// Immigration: how many arrive each year, at what ages, alone or as couples.
+// The heritage mix of arrivals is in heritage.ron.
+(
+    // Net adult immigrants per year as a share of the living population,
+    // times `scale`; the children of arriving couples come on top (about 15%
+    // of all arrivals, as in the historical flows). Anchors shaped on US
+    // history (DHS Yearbook, Table 1, net of the heavy return migration
+    // before 1914, scaled by 0.85 for adults): the famine-era surge of the
+    // 1840s–50s, mass migration to 1914, the 1924 quotas, near zero in the
+    // Depression and war, the 1965 reopening, and the 1990–2007 high. Steps
+    // are adjacent anchors. Tuned so the foreign-born share of the living
+    // tracks the Census (see tests/realism.rs).
+    rate: (
+        scale: 0.85,
+        anchors: [
+            (1840, 0.0110),
+            (1855, 0.0100),
+            (1860, 0.0065),
+            (1880, 0.0065),
+            (1914, 0.0058),
+            (1915, 0.0020),
+            (1929, 0.0018),
+            (1930, 0.0003),
+            (1945, 0.0003),
+            (1946, 0.0012),
+            (1965, 0.0012),
+            (1966, 0.0025),
+            (1990, 0.0033),
+            (2007, 0.0042),
+            (2008, 0.0032),
+            (2100, 0.0030),
+        ],
+    ),
+
+    // Youngest age of an immigrant arriving on their own; the oldest is 80
+    // (the code's bound).
+    min_age: 18,
+
+    // Relative weight of arriving at each age: the labour component of the
+    // Rogers–Castro model migration schedule (Rogers & Castro 1981), peak
+    // near 23, with the standard μ = 20, α = 0.1, λ = 0.4:
+    // exp(−α(age − μ) − exp(−λ(age − μ))).
+    age_profile: (mu: 20, alpha: 0.1, lambda: 0.4),
+
+    // Share of adult immigrants who arrive as a couple, by arrival year.
+    // Provisional, tuned so children of arriving couples are about 15% of
+    // arrivals: such couples bring two to three children each, and many
+    // married immigrants came ahead alone (chain migration). Lowest in the
+    // male-heavy mass migration before 1914, higher after the 1920s quotas
+    // and the 1965 family-reunification law.
+    couple_share: [
+        (1840, 0.14),
+        (1900, 0.10),
+        (1930, 0.18),
+        (1970, 0.20),
+        (2100, 0.18),
+    ],
+
+    // Youngest woman arriving in a couple: with husbands at most
+    // `max_husband_younger` years younger, both partners were at least 16
+    // when the union started.
+    min_couple_age: 19,
+    max_husband_younger: 3,
+
+    // Oldest age at which a child arrives with the parents; older children
+    // of arriving couples stay abroad.
+    max_child_age: 17,
+
+    // Share of immigrants who are men, by arrival year: male-heavy mass
+    // migration before 1914, female majorities from the 1930s to the 1980s.
+    male_share: [
+        (1840, 0.58),
+        (1910, 0.62),
+        (1930, 0.45),
+        (1980, 0.47),
+        (2000, 0.50),
+        (2100, 0.50),
+    ],
+)
