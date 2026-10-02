@@ -14,37 +14,12 @@
 //! partition of all a block's women (0, 1 or 2 births at planned ages).
 
 use procedural_core::key::Key;
-use procedural_core::partition::{apportion_systematic, SystematicShares};
+use procedural_core::life::first_event_pmf;
+use procedural_core::partition::{
+    apportion_largest_remainder, apportion_systematic, SystematicShares,
+};
 
 use crate::params::{Fertility, Heritage, Heritages, Params, Sex, MAX_BIRTH_AGE, MIN_BIRTH_AGE};
-
-/// Split `n` into integer parts proportional to `weights` (largest
-/// remainder; ties go to the lower index). The parts always sum to `n`
-/// when any weight is positive.
-pub fn apportion(n: u64, weights: &[f64]) -> Vec<u64> {
-    let total: f64 = weights.iter().filter(|w| **w > 0.0).sum();
-    let mut out = vec![0u64; weights.len()];
-    if n == 0 || total <= 0.0 {
-        return out;
-    }
-    let mut assigned = 0u64;
-    let mut rema: Vec<(f64, usize)> = Vec::with_capacity(weights.len());
-    for (i, &w) in weights.iter().enumerate() {
-        if w <= 0.0 {
-            continue;
-        }
-        let exact = n as f64 * w / total;
-        let base = exact.floor() as u64;
-        out[i] = base;
-        assigned += base;
-        rema.push((exact - base as f64, i));
-    }
-    rema.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    for &(_, i) in rema.iter().take((n - assigned) as usize) {
-        out[i] += 1;
-    }
-    out
-}
 
 /// [`apportion_systematic`] into a new vector.
 fn split(n: u64, weights: &[f64], key: Key) -> Vec<u64> {
@@ -296,19 +271,12 @@ pub fn arrival_plans(
 /// before arrival, [`arrival_plans`]). Computed once per arrival year: it
 /// costs a hazard evaluation per age.
 pub fn union_age_density(year: i32, max_age: i32, p: &Params) -> Vec<f64> {
-    let mut never = 1.0;
-    (0..=max_age)
-        .map(|a| {
-            let h = p.unions.first_union_hazard(Sex::Female, a as u32, year);
-            let d = if a >= p.immigration.min_couple_age {
-                never * h
-            } else {
-                0.0
-            };
-            never *= 1.0 - h;
-            d
-        })
-        .collect()
+    let mut d = first_event_pmf(max_age, |a| {
+        p.unions.first_union_hazard(Sex::Female, a as u32, year)
+    });
+    let young = (p.immigration.min_couple_age.max(0) as usize).min(d.len());
+    d[..young].fill(0.0);
+    d
 }
 
 /// One leaf of a block's non-union birth partition.
@@ -333,7 +301,8 @@ pub fn nonunion_plans(
     factor: f64,
 ) -> Vec<NonUnionLeaf> {
     let mut leaves = Vec::new();
-    let counts = apportion(females, &fert.nonunion_count_pmf(block_year + 25, factor));
+    let counts =
+        apportion_largest_remainder(females, &fert.nonunion_count_pmf(block_year + 25, factor));
     if counts[0] > 0 {
         leaves.push(NonUnionLeaf {
             ages: [0, 0],
@@ -345,7 +314,10 @@ pub fn nonunion_plans(
     let weights: Vec<f64> = ages.iter().map(|&a| fert.nonunion_age_weight(a)).collect();
     let gaps = &fert.nonunion.second_gaps;
     let gap_weights = vec![1.0; gaps.len()];
-    for (i, &n) in apportion(counts[1], &weights).iter().enumerate() {
+    for (i, &n) in apportion_largest_remainder(counts[1], &weights)
+        .iter()
+        .enumerate()
+    {
         if n > 0 {
             leaves.push(NonUnionLeaf {
                 ages: [ages[i] as u8, 0],
@@ -354,11 +326,17 @@ pub fn nonunion_plans(
             });
         }
     }
-    for (i, &n) in apportion(counts[2], &weights).iter().enumerate() {
+    for (i, &n) in apportion_largest_remainder(counts[2], &weights)
+        .iter()
+        .enumerate()
+    {
         if n == 0 {
             continue;
         }
-        for (g, &ng) in apportion(n, &gap_weights).iter().enumerate() {
+        for (g, &ng) in apportion_largest_remainder(n, &gap_weights)
+            .iter()
+            .enumerate()
+        {
             let second = ages[i] + gaps[g] as i32;
             if ng > 0 && second < MAX_BIRTH_AGE {
                 leaves.push(NonUnionLeaf {
@@ -384,17 +362,6 @@ mod tests {
 
     fn us() -> Params {
         Params::prototype()
-    }
-
-    #[test]
-    fn apportion_is_exact_and_proportional() {
-        assert_eq!(apportion(10, &[1.0, 1.0, 1.0]), vec![4, 3, 3]);
-        assert_eq!(apportion(0, &[1.0, 2.0]), vec![0, 0]);
-        assert_eq!(apportion(7, &[0.0, 1.0]), vec![0, 7]);
-        for n in [1u64, 13, 999, 123_457] {
-            let v = apportion(n, &[0.2, 0.5, 0.3, 0.0, 1e-9]);
-            assert_eq!(v.iter().sum::<u64>(), n);
-        }
     }
 
     /// The plan partition as first written, with a full split at every

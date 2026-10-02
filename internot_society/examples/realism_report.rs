@@ -15,7 +15,7 @@ fn main() {
     let t_ledger = t0.elapsed();
     drop(ledger_only);
     let t1 = Instant::now();
-    let w = World::build(Params::prototype(), 42);
+    let w = World::build_keeping_ledger(Params::prototype(), 42);
     println!(
         "ledger build: {t_ledger:?}; world build (ledger + layouts, events, tables): {:?}; population ever born: {}",
         t1.elapsed(),

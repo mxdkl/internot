@@ -1,0 +1,6 @@
+// Markets by area, as in us-areas: partners meet where they live, with a
+// small national share.
+(
+    national_market_share: [(1840, 0.06), (1950, 0.08), (2020, 0.10)],
+    local_open_markets: true,
+)

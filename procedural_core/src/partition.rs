@@ -16,6 +16,15 @@
 //!   integer splits with exact totals (one margin, or two), for counts that
 //!   both sides of a relation must agree on. [`SystematicShares`] precomputes
 //!   the shares for many splits over the same weights.
+//! - [`round_systematic_cumulative`] and [`SparseCounts`]: keyed systematic
+//!   rounding of a real-valued row (given by cumulative weights) to sparse
+//!   integer counts, for wide matrices whose entries are mostly zero.
+//! - [`sweep_capped`], [`apportion_largest_remainder`],
+//!   [`apportion_largest_remainder_capped`] and [`trim_largest_first`]:
+//!   integer splits under caps.
+//! - [`pair_group`], [`even_parts`], [`segment_offset`] and
+//!   [`locate_in_segments`]: small groupings and offsets over consecutive
+//!   ranges.
 //!
 //! See `docs/superpowers/research/2026-09-29-local-access-and-bijections.md` §4.
 
@@ -421,6 +430,361 @@ impl SplitTree {
     }
 }
 
+/// The group of position `q` when `[0, n)` is cut into pairs
+/// `(2k, 2k + 1)`, with the last three positions of an odd `n` as one
+/// triple, or the lone position when `n ≤ 1`: `(first position, size)`.
+/// Every group has two or three members unless `n ≤ 1`.
+#[inline]
+pub fn pair_group(q: u64, n: u64) -> (u64, u64) {
+    if n <= 1 {
+        (q, 1)
+    } else if n % 2 == 1 && q >= n - 3 {
+        (n - 3, 3)
+    } else {
+        (q & !1, 2)
+    }
+}
+
+/// `n` split into the fewest parts of at most `max`, as even as possible,
+/// larger parts first: `k = ⌈n / max⌉` parts of `⌊n / k⌋` or one more.
+/// Empty if `n` is 0 or the parts would be smaller than `min`.
+pub fn even_parts(n: u64, min: u64, max: u64) -> impl Iterator<Item = u64> {
+    assert!(max >= 1 && min <= max, "a valid part size range");
+    let k = n.div_ceil(max);
+    let (q, r) = (n.checked_div(k).unwrap_or(0), n.checked_rem(k).unwrap_or(0));
+    let k = if q < min.max(1) { 0 } else { k };
+    (0..k).map(move |i| q + (i < r) as u64)
+}
+
+/// The offset of segment `id` among consecutive segments `(id, size)`: the
+/// sum of the sizes before it, or `None` if absent.
+#[inline]
+pub fn segment_offset<K: PartialEq>(
+    segments: impl IntoIterator<Item = (K, u64)>,
+    id: K,
+) -> Option<u64> {
+    let mut acc = 0;
+    for (k, size) in segments {
+        if k == id {
+            return Some(acc);
+        }
+        acc += size;
+    }
+    None
+}
+
+/// The segment among consecutive segments `(id, size)` holding index `i`,
+/// and the offset within it; `None` past the end.
+#[inline]
+pub fn locate_in_segments<K>(
+    segments: impl IntoIterator<Item = (K, u64)>,
+    mut i: u64,
+) -> Option<(K, u64)> {
+    for (k, size) in segments {
+        if i < size {
+            return Some((k, i));
+        }
+        i -= size;
+    }
+    None
+}
+
+/// Keyed unbiased rounding of one nonnegative real: `⌊x + u⌋` for one keyed
+/// `u ∈ [0, 1)`, so the result is `⌊x⌋` or `⌈x⌉` and its mean over `u` is
+/// exactly `x` (systematic sampling with one point). With the same `u`,
+/// rounding `x − k` for an integer `k ≤ x` gives exactly `round(x) − k`, so a
+/// capacity drawn down by integer takings stays one rounding. Non-positive
+/// or NaN `x` gives 0.
+#[inline]
+pub fn round_unbiased(x: f64, u: f64) -> u64 {
+    if x.is_nan() || x <= 0.0 {
+        return 0;
+    }
+    (x + u).floor() as u64
+}
+
+/// Keyed systematic rounding of a real-valued row given by its cumulative
+/// weights: the row's entries are `scale · (cum[j] − cum[j−1])`, and points
+/// `u, u + 1, u + 2, …` (one keyed `u ∈ [0, 1)`) below `scale · cum[last]`
+/// each land in the first entry whose scaled cumulative weight passes them.
+/// `f(j, count)` receives the nonzero counts in column order.
+///
+/// Every entry gets the floor or the ceiling of its expectation, its mean
+/// over `u` is exactly its expectation, and the row's total is within one of
+/// its expectation (Madow's systematic sampling). Cost `O(points · log len)`,
+/// independent of the zero entries, so a sparse row of a wide matrix is
+/// cheap. `cum` must be nondecreasing; a non-positive or NaN total gives
+/// nothing.
+#[inline]
+pub fn round_systematic_cumulative(cum: &[f64], scale: f64, u: f64, mut f: impl FnMut(usize, u64)) {
+    let Some(&last) = cum.last() else {
+        return;
+    };
+    let total = scale * last;
+    if total.is_nan() || total <= 0.0 {
+        return;
+    }
+    let len = cum.len();
+    let (mut p, mut run) = (u, None::<(usize, u64)>);
+    while p < total {
+        let j = cum.partition_point(|&x| x * scale <= p).min(len - 1);
+        run = match run {
+            Some((last, n)) if last == j => Some((last, n + 1)),
+            Some((last, n)) => {
+                f(last, n);
+                Some((j, 1))
+            }
+            None => Some((j, 1)),
+        };
+        p += 1.0;
+    }
+    if let Some((j, n)) = run {
+        f(j, n);
+    }
+}
+
+/// Integer counts as sparse rows (compressed sparse rows): row `i`'s entries
+/// are `start[i]..start[i + 1]`, each a column and a count, columns
+/// increasing within a row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SparseCounts {
+    pub start: Vec<u32>,
+    pub col: Vec<u32>,
+    pub n: Vec<u64>,
+}
+
+impl SparseCounts {
+    /// Build from rows of `(column, count)` runs in column order.
+    pub fn from_rows(rows: impl IntoIterator<Item = Vec<(u32, u64)>>) -> Self {
+        let rows = rows.into_iter();
+        let mut x = SparseCounts {
+            start: Vec::with_capacity(rows.size_hint().0 + 1),
+            col: Vec::new(),
+            n: Vec::new(),
+        };
+        for row in rows {
+            x.start.push(x.col.len() as u32);
+            for (j, k) in row {
+                x.col.push(j);
+                x.n.push(k);
+            }
+        }
+        x.start.push(x.col.len() as u32);
+        x
+    }
+
+    /// Number of rows (zero for the empty default).
+    pub fn rows(&self) -> usize {
+        self.start.len().saturating_sub(1)
+    }
+
+    /// Whether there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.col.is_empty()
+    }
+
+    /// Row `i`'s entry range.
+    #[inline]
+    pub fn row(&self, i: usize) -> Range<usize> {
+        self.start[i] as usize..self.start[i + 1] as usize
+    }
+
+    /// The entries by column (a counting sort): column `j`'s entries are
+    /// `by_col[col_start[j]..col_start[j + 1]]`, each `(row, entry index)`,
+    /// rows ascending. Returns `(col_start, by_col)`.
+    pub fn column_index(&self, cols: usize) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let mut col_start = vec![0u32; cols + 1];
+        for &j in &self.col {
+            col_start[j as usize + 1] += 1;
+        }
+        for j in 0..cols {
+            col_start[j + 1] += col_start[j];
+        }
+        let mut by_col = vec![(0u32, 0u32); self.col.len()];
+        let mut fill = col_start.clone();
+        for i in 0..self.rows() {
+            for e in self.row(i) {
+                let j = self.col[e] as usize;
+                by_col[fill[j] as usize] = (i as u32, e as u32);
+                fill[j] += 1;
+            }
+        }
+        (col_start, by_col)
+    }
+}
+
+/// Keyed systematic split of `n` over `len` items by weight, with caps.
+///
+/// Item `k` is `item(k) = (weight, cap)`. `n` points spaced `W / n` apart
+/// from offset `u · W / n` (`u ∈ [0, 1)`, keyed) fall into the items'
+/// weight intervals. An item over its cap passes the excess to the next; a
+/// second pass gives what remains to items with room, in order.
+/// `give(k, count)` receives the counts (an item can get two calls, one per
+/// pass). With no positive weight, the caps are the weights. Exact, unbiased
+/// where no cap binds, linear, and allocation-light.
+///
+/// Panics if `n` exceeds the caps' sum.
+pub fn sweep_capped(
+    n: u64,
+    len: usize,
+    item: impl Fn(usize) -> (f64, u64),
+    u: f64,
+    mut give: impl FnMut(usize, u64),
+) {
+    let total: f64 = (0..len).map(|k| item(k).0).sum();
+    let by_cap = total <= 0.0;
+    let weight = |k: usize| {
+        let (w, c) = item(k);
+        if by_cap {
+            c as f64
+        } else {
+            w
+        }
+    };
+    let total = if by_cap {
+        (0..len).map(|k| item(k).1 as f64).sum()
+    } else {
+        total
+    };
+    let step = total / n as f64;
+    let (mut next, mut cum, mut placed, mut carry) = (u * step, 0.0, 0u64, 0u64);
+    let mut given = Vec::with_capacity(len);
+    let mut room_left = false;
+    for k in 0..len {
+        cum += weight(k);
+        let mut c = carry;
+        while placed < n && next < cum {
+            c += 1;
+            placed += 1;
+            next += step;
+        }
+        let cap = item(k).1;
+        let g = c.min(cap);
+        carry = c - g;
+        if g > 0 {
+            give(k, g);
+        }
+        room_left |= g < cap;
+        given.push(g);
+    }
+    // Points lost to rounding at the end, and excess carried past the last
+    // item: to items with room, in order.
+    let mut rest = carry + (n - placed);
+    if rest > 0 && room_left {
+        for (k, &g0) in given.iter().enumerate() {
+            if rest == 0 {
+                break;
+            }
+            let room = item(k).1 - g0;
+            let g = room.min(rest);
+            if g > 0 {
+                give(k, g);
+                rest -= g;
+            }
+        }
+    }
+    assert_eq!(rest, 0, "sweep_capped: more points than room");
+}
+
+/// Split `n` into integer parts proportional to `weights` by largest
+/// remainder (Hamilton's method; ties go to the lower index). The parts sum
+/// to `n` when any weight is positive; non-positive weights get nothing.
+///
+/// Deterministic but biased on small splits (a one-member split always goes
+/// to the modal part); prefer [`apportion_systematic`] where parts can be
+/// small.
+pub fn apportion_largest_remainder(n: u64, weights: &[f64]) -> Vec<u64> {
+    let total: f64 = weights.iter().filter(|w| **w > 0.0).sum();
+    let mut out = vec![0u64; weights.len()];
+    if n == 0 || total <= 0.0 {
+        return out;
+    }
+    let mut assigned = 0u64;
+    let mut rema: Vec<(f64, usize)> = Vec::with_capacity(weights.len());
+    for (i, &w) in weights.iter().enumerate() {
+        if w <= 0.0 {
+            continue;
+        }
+        let exact = n as f64 * w / total;
+        let base = exact.floor() as u64;
+        out[i] = base;
+        assigned += base;
+        rema.push((exact - base as f64, i));
+    }
+    rema.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    for &(_, i) in rema.iter().take((n - assigned) as usize) {
+        out[i] += 1;
+    }
+    out
+}
+
+/// [`apportion_largest_remainder`] without exceeding `caps`: parts that
+/// would exceed their cap are fixed at it and the rest is re-apportioned
+/// among the others; when their weights run out, by spare capacity.
+///
+/// Panics if `n` exceeds the caps' sum.
+pub fn apportion_largest_remainder_capped(n: u64, weights: &[f64], caps: &[u64]) -> Vec<u64> {
+    assert_eq!(weights.len(), caps.len(), "one cap per weight");
+    assert!(
+        n <= caps.iter().sum::<u64>(),
+        "apportion_largest_remainder_capped: more than the caps hold"
+    );
+    let mut out = vec![0u64; weights.len()];
+    let mut open: Vec<bool> = caps.iter().map(|&c| c > 0).collect();
+    let mut left = n;
+    while left > 0 {
+        let idx: Vec<usize> = (0..weights.len()).filter(|&i| open[i]).collect();
+        let mut w: Vec<f64> = idx.iter().map(|&i| weights[i].max(0.0)).collect();
+        if w.iter().all(|&x| x <= 0.0) {
+            w = idx.iter().map(|&i| (caps[i] - out[i]) as f64).collect();
+        }
+        let add = apportion_largest_remainder(left, &w);
+        let over: Vec<usize> = idx
+            .iter()
+            .zip(&add)
+            .filter(|&(&i, &a)| a > caps[i] - out[i])
+            .map(|(&i, _)| i)
+            .collect();
+        if over.is_empty() {
+            for (&i, &a) in idx.iter().zip(&add) {
+                out[i] += a;
+            }
+            left = 0;
+        } else {
+            // Fill the overflowing parts to their caps and re-apportion the
+            // rest; each round closes at least one part.
+            for i in over {
+                left -= caps[i] - out[i];
+                out[i] = caps[i];
+                open[i] = false;
+            }
+        }
+    }
+    out
+}
+
+/// Reduce `cells` until they sum to at most `cap`, taking from the largest
+/// cell first (ties: lowest index). Leaves `cells` unchanged if they already
+/// fit.
+pub fn trim_largest_first(cells: &mut [u64], cap: u64) {
+    let mut sum: u64 = cells.iter().sum();
+    if sum <= cap {
+        return;
+    }
+    // Cutting the largest cell either empties it or ends the trim, so the
+    // cells are taken once each in (size descending, index) order.
+    let mut order: Vec<usize> = (0..cells.len()).filter(|&i| cells[i] > 0).collect();
+    order.sort_unstable_by(|&a, &b| cells[b].cmp(&cells[a]).then(a.cmp(&b)));
+    for i in order {
+        if sum <= cap {
+            break;
+        }
+        let cut = (sum - cap).min(cells[i]);
+        cells[i] -= cut;
+        sum -= cut;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +1006,319 @@ mod tests {
             let r = t.leaf_of(i);
             assert!(r.contains(&i));
         }
+    }
+
+    /// Dense reference for [`round_systematic_cumulative`]: count the points
+    /// `u + m` below each entry's scaled upper bound.
+    fn round_dense(cum: &[f64], scale: f64, u: f64) -> Vec<u64> {
+        let total = scale * cum[cum.len() - 1];
+        let mut out = vec![0u64; cum.len()];
+        let mut p = u;
+        while p < total {
+            let j = (0..cum.len())
+                .find(|&j| cum[j] * scale > p)
+                .unwrap_or(cum.len() - 1);
+            out[j] += 1;
+            p += 1.0;
+        }
+        out
+    }
+
+    fn cumulative(w: &[f64]) -> Vec<f64> {
+        let mut acc = 0.0;
+        w.iter()
+            .map(|&x| {
+                acc += x;
+                acc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn systematic_rounding_is_floor_or_ceiling_and_sparse() {
+        let w = [0.0, 2.7, 0.0, 0.0, 0.35, 1.0, 0.0, 4.25, 0.05, 0.0];
+        let cum = cumulative(&w);
+        for scale in [0.0, 0.1, 1.0, 1.7, 13.0] {
+            for seed in 0..200 {
+                let u = Key::from_seed(seed).unit();
+                let mut got = vec![0u64; w.len()];
+                let mut last = None;
+                round_systematic_cumulative(&cum, scale, u, |j, c| {
+                    assert!(c > 0 && last < Some(j), "nonzero, in order");
+                    last = Some(j);
+                    got[j] += c;
+                });
+                assert_eq!(got, round_dense(&cum, scale, u));
+                for (&x, &c) in w.iter().zip(&got) {
+                    let e = scale * x;
+                    assert!(c == e.floor() as u64 || c == e.ceil() as u64, "{c} vs {e}");
+                }
+                let total: u64 = got.iter().sum();
+                let e = scale * cum[cum.len() - 1];
+                assert!((total as f64 - e).abs() < 1.0 + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn systematic_rounding_is_unbiased() {
+        let w = [0.3, 0.05, 1.2, 0.45];
+        let cum = cumulative(&w);
+        let scale = 0.8;
+        let trials = 40_000u64;
+        let mut sums = [0u64; 4];
+        for seed in 0..trials {
+            round_systematic_cumulative(&cum, scale, Key::from_seed(seed).unit(), |j, c| {
+                sums[j] += c
+            });
+        }
+        for (s, x) in sums.iter().zip(w) {
+            let mean = *s as f64 / trials as f64;
+            assert!((mean - scale * x).abs() < 0.01, "{mean} vs {}", scale * x);
+        }
+    }
+
+    #[test]
+    fn systematic_rounding_handles_empty_and_degenerate_rows() {
+        let mut calls = 0;
+        round_systematic_cumulative(&[], 1.0, 0.5, |_, _| calls += 1);
+        round_systematic_cumulative(&[0.0, 0.0], 5.0, 0.0, |_, _| calls += 1);
+        round_systematic_cumulative(&[1.0, f64::NAN], 5.0, 0.0, |_, _| calls += 1);
+        round_systematic_cumulative(&[1.0, 2.0], -1.0, 0.0, |_, _| calls += 1);
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn unbiased_rounding_is_exact_on_average_and_consistent() {
+        // The mean over a uniform grid of `u` is `x` to the grid's
+        // resolution; every result is the floor or the ceiling.
+        let grid = 1 << 12;
+        for &x in &[0.0, 0.3, 1.0, 2.75, 7.125, 1e6 + 0.5] {
+            let mut sum = 0u64;
+            for k in 0..grid {
+                let u = (k as f64 + 0.5) / grid as f64;
+                let r = round_unbiased(x, u);
+                assert!(r == x.floor() as u64 || r == x.ceil() as u64, "{x} {u}");
+                sum += r;
+            }
+            assert!(
+                (sum as f64 / grid as f64 - x).abs() <= 1.0 / grid as f64,
+                "{x}"
+            );
+        }
+        // Drawing a capacity down by integer takings keeps one rounding.
+        for seed in 0..200u64 {
+            let u = Key::from_seed(seed).unit();
+            let x = 5.0 + seed as f64 / 37.0;
+            for k in 0..5u64 {
+                assert_eq!(round_unbiased(x - k as f64, u), round_unbiased(x, u) - k);
+            }
+        }
+        assert_eq!(round_unbiased(-1.0, 0.9), 0);
+        assert_eq!(round_unbiased(f64::NAN, 0.9), 0);
+        assert_eq!(round_unbiased(0.0, 0.999), 0);
+    }
+
+    #[test]
+    fn unbiased_rounding_golden() {
+        let got: Vec<u64> = (0..6u64)
+            .map(|s| round_unbiased(2.0 + s as f64 * 0.17, Key::from_seed(s).unit()))
+            .collect();
+        assert_eq!(got, GOLDEN_UNBIASED);
+    }
+
+    const GOLDEN_UNBIASED: [u64; 6] = [2, 2, 3, 3, 2, 3];
+
+    #[test]
+    fn systematic_rounding_golden() {
+        let cum = cumulative(&[0.5, 0.0, 2.25, 1.0, 0.125, 3.0]);
+        let mut got = Vec::new();
+        round_systematic_cumulative(&cum, 1.5, Key::from_seed(5).unit(), |j, c| got.push((j, c)));
+        assert_eq!(got, GOLDEN_ROUNDING);
+    }
+
+    const GOLDEN_ROUNDING: [(usize, u64); 3] = [(2, 4), (3, 1), (5, 5)];
+
+    #[test]
+    fn sparse_counts_index_by_column() {
+        let x = SparseCounts::from_rows(vec![
+            vec![(0, 2), (3, 1)],
+            vec![],
+            vec![(1, 5), (3, 4)],
+            vec![(0, 7)],
+        ]);
+        assert_eq!(x.rows(), 4);
+        assert_eq!(x.row(1), 2..2);
+        assert_eq!(x.row(2), 2..4);
+        let (start, by_col) = x.column_index(4);
+        assert_eq!(start, vec![0, 2, 3, 3, 5]);
+        assert_eq!(by_col, vec![(0, 0), (3, 4), (2, 2), (0, 1), (2, 3)]);
+        assert!(SparseCounts::default().is_empty());
+        assert_eq!(SparseCounts::default().rows(), 0);
+    }
+
+    #[test]
+    fn sweep_is_exact_capped_and_proportional() {
+        let weights = [0.5, 0.0, 2.0, 1.0, 0.25];
+        let caps = [3u64, 4, 2, 5, 9];
+        for n in 0..=caps.iter().sum::<u64>() {
+            for seed in 0..40 {
+                let mut got = [0u64; 5];
+                sweep_capped(
+                    n,
+                    5,
+                    |k| (weights[k], caps[k]),
+                    Key::from_seed(seed).unit(),
+                    |k, c| got[k] += c,
+                );
+                assert_eq!(got.iter().sum::<u64>(), n);
+                assert!(got.iter().zip(&caps).all(|(g, c)| g <= c));
+            }
+        }
+        // Small takings follow the weights on average.
+        let mut sums = [0u64; 5];
+        let trials = 20_000;
+        for seed in 0..trials {
+            sweep_capped(
+                1,
+                5,
+                |k| (weights[k], caps[k]),
+                Key::from_seed(seed).unit(),
+                |k, c| sums[k] += c,
+            );
+        }
+        let total: f64 = weights.iter().sum();
+        for (s, w) in sums.iter().zip(weights) {
+            assert!((*s as f64 / trials as f64 - w / total).abs() < 0.01);
+        }
+        // No positive weight: the caps are the weights.
+        let mut got = [0u64; 3];
+        sweep_capped(6, 3, |k| (0.0, [1, 2, 3][k]), 0.5, |k, c| got[k] += c);
+        assert_eq!(got, [1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "more points than room")]
+    fn sweep_needs_room() {
+        sweep_capped(4, 2, |_| (1.0, 1), 0.5, |_, _| {});
+    }
+
+    #[test]
+    fn sweep_golden() {
+        let weights = [0.4, 1.5, 0.0, 0.75, 2.0];
+        let caps = [2u64, 3, 1, 9, 4];
+        let mut got = [0u64; 5];
+        sweep_capped(
+            9,
+            5,
+            |k| (weights[k], caps[k]),
+            Key::from_seed(21).unit(),
+            |k, c| got[k] += c,
+        );
+        assert_eq!(got, GOLDEN_SWEEP);
+    }
+
+    const GOLDEN_SWEEP: [u64; 5] = [1, 2, 0, 2, 4];
+
+    #[test]
+    fn largest_remainder_is_exact_and_proportional() {
+        let apportion = apportion_largest_remainder;
+        assert_eq!(apportion(10, &[1.0, 1.0, 1.0]), vec![4, 3, 3]);
+        assert_eq!(apportion(0, &[1.0, 2.0]), vec![0, 0]);
+        assert_eq!(apportion(7, &[0.0, 1.0]), vec![0, 7]);
+        assert_eq!(apportion(7, &[0.0, -1.0]), vec![0, 0]);
+        for n in [1u64, 13, 999, 123_457] {
+            let w = [0.2, 0.5, 0.3, 0.0, 1e-9];
+            let v = apportion(n, &w);
+            assert_eq!(v.iter().sum::<u64>(), n);
+            for (&x, &p) in v.iter().zip(&w) {
+                assert!((x as f64 - n as f64 * p / 1.000000001).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn capped_largest_remainder_is_exact_and_capped() {
+        let capped = apportion_largest_remainder_capped;
+        assert_eq!(capped(10, &[1.0, 1.0], &[2, 20]), vec![2, 8]);
+        assert_eq!(capped(5, &[0.0, 0.0], &[3, 3]), vec![3, 2]);
+        assert_eq!(capped(0, &[1.0], &[0]), vec![0]);
+        let caps = [5u64, 0, 7, 100, 1];
+        for n in 0..=113 {
+            let v = capped(n, &[3.0, 9.0, 0.5, 0.1, 2.0], &caps);
+            assert_eq!(v.iter().sum::<u64>(), n);
+            assert!(v.iter().zip(&caps).all(|(a, c)| a <= c));
+        }
+    }
+
+    #[test]
+    fn trim_takes_from_the_largest_first() {
+        let mut v = vec![5, 9, 1, 9];
+        trim_largest_first(&mut v, 10);
+        assert_eq!(v.iter().sum::<u64>(), 10);
+        assert_eq!(v, vec![5, 0, 1, 4]);
+        let mut v = vec![1, 2];
+        trim_largest_first(&mut v, 10);
+        assert_eq!(v, vec![1, 2]);
+        let mut v = vec![3, 3];
+        trim_largest_first(&mut v, 0);
+        assert_eq!(v, vec![0, 0]);
+    }
+
+    #[test]
+    fn pair_groups_tile_the_range() {
+        for n in 0u64..40 {
+            let mut q = 0;
+            while q < n {
+                let (first, size) = pair_group(q, n);
+                assert_eq!(first, q, "n {n}");
+                assert!(n <= 1 || (2..=3).contains(&size));
+                for m in first..first + size {
+                    assert_eq!(pair_group(m, n), (first, size));
+                }
+                q += size;
+            }
+            assert_eq!(q, n);
+        }
+    }
+
+    #[test]
+    fn even_parts_are_fewest_and_even() {
+        // Groups of two or three, as the roommate frames use.
+        let table: [&[u64]; 13] = [
+            &[],
+            &[],
+            &[2],
+            &[3],
+            &[2, 2],
+            &[3, 2],
+            &[3, 3],
+            &[3, 2, 2],
+            &[3, 3, 2],
+            &[3, 3, 3],
+            &[3, 3, 2, 2],
+            &[3, 3, 3, 2],
+            &[3, 3, 3, 3],
+        ];
+        for (n, want) in table.iter().enumerate() {
+            assert_eq!(even_parts(n as u64, 2, 3).collect::<Vec<_>>(), *want, "{n}");
+        }
+        for n in 0u64..200 {
+            let parts: Vec<u64> = even_parts(n, 1, 7).collect();
+            assert_eq!(parts.iter().sum::<u64>(), n);
+            assert_eq!(parts.len() as u64, n.div_ceil(7));
+            assert!(parts.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1));
+        }
+    }
+
+    #[test]
+    fn segments_offset_and_locate() {
+        let segs = [(7u32, 3u64), (2, 0), (9, 5), (4, 1)];
+        assert_eq!(segment_offset(segs, 9), Some(3));
+        assert_eq!(segment_offset(segs, 5), None);
+        assert_eq!(locate_in_segments(segs, 0), Some((7, 0)));
+        assert_eq!(locate_in_segments(segs, 3), Some((9, 0)));
+        assert_eq!(locate_in_segments(segs, 8), Some((4, 0)));
+        assert_eq!(locate_in_segments(segs, 9), None);
     }
 }

@@ -18,30 +18,28 @@ top of a new population model.
 What exists today:
 
 - `internot_society` is the population model. It covers births, deaths,
-  marriage, divorce and remarriage, and immigration, and gives everyone parents,
-  children and siblings, from 1840 to 2100. Nothing is simulated ahead of time
-  or stored per person. Each fact is worked out from the seed and the person's
-  id when you ask for it.
-- The `people` service in `internot` is older and has known problems (see
-  `AGENTS.md`). The population model will replace it.
-
-Households are next.
+  marriage, divorce and remarriage, immigration, names, households and where
+  people live (down to census tracts), from 1840 to 2100. Everyone has parents,
+  children and siblings. Nothing is simulated ahead of time or stored per
+  person. Each fact is worked out from the seed and the person's id when you
+  ask for it.
+- The `directory` service serves it over MCP: `read_person` and
+  `read_household` give anyone's names, family, unions, household and address
+  at any date.
+- World definitions (rates, names, places) live in data files under `worlds/`,
+  one folder per world. `us` is the default; `us-areas` tracks where people
+  live in the population model itself and is much larger to build.
 
 ## Layout
 
 | Crate | What it does |
 |---|---|
-| `procedural_core` | Building blocks: keyed hashes, permutations, samplers, bit layouts and search |
-| `procedural_overlay` | Keeps an agent's changes for one session on top of the read-only world |
-| `internot_society` | The population and family model |
+| `procedural_core` | Building blocks: keyed hashes, permutations, samplers, fitting, bit layouts and search |
+| `internot_def` | Loads and merges the world definitions in `worlds/` |
+| `internot_society` | The population, family, household and residence model |
 | `internot` | The services and their tools |
 | `internot_mcp` | The MCP server, which exposes every tool in `internot` |
-| `internot_renderer` | Turns structured facts into text with an LLM (unused right now) |
 | `internot_perf` | Benchmarks and the performance gate |
-
-`mcp_harness/` is a Python harness that runs agent scenarios against the MCP
-server. Most of its scenarios call tools that were removed, so read them as
-examples for now.
 
 ## Building and running
 
@@ -52,11 +50,15 @@ cargo build --release
 cargo test --workspace
 ```
 
-Start the MCP server (it talks over stdio):
+Start the MCP server (it talks over stdio). It builds the world first, which
+takes about 7 seconds for `us`:
 
 ```sh
 cargo run --release -p internot_mcp --bin internot-mcp
 ```
+
+`INTERNOT_PACK` picks the world (`us`, `us-areas`, `us-tiny`, ...) and
+`INTERNOT_SEED` the seed (default 42).
 
 Build a sample world and compare it with US demographic data:
 
@@ -64,8 +66,8 @@ Build a sample world and compare it with US demographic data:
 cargo run --release -p internot_society --example realism_report
 ```
 
-That world has two regions and about 12 million people born over its history.
-It builds in about a second and a half on a 16-thread laptop.
+That world has about 17 million people born over its history and builds in
+about 6 seconds on a 16-thread laptop.
 
 Run the tests and then the performance gate:
 

@@ -1,10 +1,8 @@
 [workspace]
 members = [
     "procedural_core",
-    "procedural_overlay",
     "internot",
     "internot_mcp",
-    "internot_renderer",
     "internot_perf",
     "internot_society",
     "internot_def",

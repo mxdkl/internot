@@ -423,7 +423,7 @@ impl<W: BitWord> Space<W> {
 
     /// `TypeId` of an attribute's registered value type, or `None` if unknown.
     ///
-    /// Lets external crates (notably `procedural_overlay`) validate write
+    /// Lets external crates (such as a mutation overlay) validate write
     /// types against the declared schema before storing them. Works for
     /// every attribute kind — static, temporal, indexable, composite, and
     /// cross-space — since all variants share the same `value_type_id`
@@ -1138,8 +1138,8 @@ mod tests {
 
     #[test]
     fn attribute_type_id_reports_registered_type_for_every_kind() {
-        // Cover all six EvalFn variants. A sister crate (procedural_overlay)
-        // uses these accessors to validate write types against the declared
+        // Cover all six EvalFn variants. A mutation overlay would use these
+        // accessors to validate write types against the declared
         // attribute schema, so every registration path must surface its type.
         use crate::world::World;
         use std::any::TypeId;

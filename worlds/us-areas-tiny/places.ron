@@ -1,0 +1,5 @@
+// Each area is its own lineage region (the world region named after it);
+// data/places.bin holds only the test world's four areas.
+(
+    by_area: true,
+)

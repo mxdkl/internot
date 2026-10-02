@@ -27,8 +27,14 @@
 //!
 //! Spec §5.2; R1 plan decisions D-R1.1–D-R1.5.
 
+use procedural_core::bits::ones;
+use procedural_core::fit::{GroupedIpf, IpfStop};
 use procedural_core::key::{label, Key};
-use procedural_core::partition::{contingency_systematic, SystematicShares};
+use procedural_core::life::{cumulative_incidence, first_event_pmf, stable_age_weight, survival};
+use procedural_core::partition::{
+    apportion_largest_remainder, apportion_largest_remainder_capped, contingency_systematic,
+    round_unbiased, sweep_capped, trim_largest_first, SparseCounts, SystematicShares,
+};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -39,8 +45,8 @@ use crate::params::{
     MAX_CLASS, MAX_REMARRIAGE_AGE,
 };
 use crate::plan::{
-    apportion, arrival_births, arrival_plans, leaf_births, nonunion_plans, union_age_density,
-    PlanLeaf, PlanTables,
+    arrival_births, arrival_plans, leaf_births, nonunion_plans, union_age_density, PlanLeaf,
+    PlanTables,
 };
 
 pub use crate::params::MIN_UNION_AGE;
@@ -71,6 +77,9 @@ pub struct UnionCell {
     /// Which union cell of the year this is; cells are ordered by `(year,
     /// kind, class)`.
     pub kind: CellKind,
+    /// The area the couple lives in when the union starts: the market's
+    /// (area mode; 0 otherwise).
+    pub area: u16,
     /// Dissolution class (R1c): `0`, the union lasts until a partner dies;
     /// `k`, the couple separates `k` calendar years after the union year
     /// (after the arrival year, for couples who arrive together). Each
@@ -166,6 +175,11 @@ impl CellKind {
 pub struct Cohort {
     /// Arrival year; `None` for natives.
     pub arrival: Option<i32>,
+    /// Natives' migration class (area mode, spec `2026-10-01-ledger-areas.md`):
+    /// `(destination area, move year)`. Its members live in the block's area
+    /// until the move year and in the destination from then (if still in
+    /// their first single spell). `None`: the stayers, and arrivals.
+    pub class: Option<(u16, i32)>,
     /// Members.
     pub size: u64,
     /// Women among them.
@@ -228,14 +242,26 @@ pub struct DivSource {
     pub year: i32,
     pub kind: CellKind,
     pub class: u8,
+    /// The class-cell's area (area mode; 0 otherwise). Its members stay
+    /// in it while divorced and seek partners there.
+    pub area: u16,
     /// Members.
     pub members: u64,
     /// Remarriage parts: `(second-union cell year, kind, class, count)`,
     /// in the order they were recorded; the rest never re-partner.
     pub parts: Vec<(i32, CellKind, u8, u64)>,
+    /// Area mode: each part's second-union cell area, which is the
+    /// union's area and can differ from `area` (a national or open
+    /// market). Empty otherwise.
+    pub part_areas: Vec<u16>,
 }
 
 impl DivSource {
+    /// The area of part `k`'s second-union cell.
+    pub fn part_area(&self, k: usize) -> u16 {
+        self.part_areas.get(k).copied().unwrap_or(self.area)
+    }
+
     /// The calendar year the members separate.
     pub fn divorce_year(&self) -> i32 {
         self.year + self.class as i32
@@ -265,6 +291,8 @@ pub struct Ledger {
     pub arrival_density: Vec<Vec<f64>>,
     /// Plan shares for every union year, shared with the world.
     pub plan_tables: PlanTables,
+    /// Area mode: couple moves, shared with the world (stage 3).
+    pub couple_moves: Option<CoupleMoves>,
 }
 
 impl Ledger {
@@ -280,13 +308,278 @@ const TAG_ARRIVAL_CLASS: u64 = label("ledger/arrival-class");
 const TAG_PLANS: u64 = label("ledger/plans");
 const TAG_CONTINGENCY: u64 = label("ledger/contingency");
 const TAG_SETTLE: u64 = label("ledger/settle");
+const TAG_AREA: u64 = label("ledger/area");
+const TAG_MIGRATION: u64 = label("ledger/migration");
+const TAG_ARRIVAL_COUPLES: u64 = label("ledger/arrival-couples");
+const TAG_MOVES: u64 = label("ledger/couple-moves");
+
+/// Move bands of the natives' migration classes (area mode): ages
+/// `(from, to)` whose single long-move hazards the band sums, and the age at
+/// which its class moves.
+const MOVE_BANDS: [(i32, i32, i32); 3] = [(18, 22, 20), (23, 29, 26), (30, 49, 38)];
+
+/// Where single people move (area mode): for each origin region and decade,
+/// the shares of the other regions (areas), by attractiveness times the
+/// distance decay between area centres (`residence.ron` `gravity`).
+struct Migration {
+    regions: usize,
+    first_decade: i32,
+    decades: usize,
+    shares: Vec<f64>,
+}
+
+impl Migration {
+    fn new(params: &Params) -> Self {
+        let places = crate::residence::Places::from_params(params).expect("area mode needs places");
+        let regions = params.region_count();
+        let areas = places.count(crate::residence::AREA) as u32;
+        let first_decade = params.y0 - params.y0.rem_euclid(10);
+        let decades = ((params.y1 - first_decade) / 10 + 1) as usize;
+        let g = &params.residence.gravity;
+        let mut shares = vec![0.0; decades * regions * regions];
+        for d in 0..decades {
+            let year = first_decade + 10 * d as i32;
+            for a in 0..areas {
+                let origin = places.region(a) as usize;
+                let row = (d * regions + origin) * regions;
+                let mut total = 0.0;
+                for b in (0..areas).filter(|&b| b != a) {
+                    let miles = procedural_core::geo::haversine_miles(
+                        places.centre(crate::residence::AREA, a),
+                        places.centre(crate::residence::AREA, b),
+                    );
+                    let k = procedural_core::curve::piecewise_power(
+                        miles,
+                        g.flat_miles,
+                        &g.segments,
+                        g.beyond,
+                    );
+                    let w = places.weight(crate::residence::AREA, b, year) * k;
+                    shares[row + places.region(b) as usize] += w;
+                    total += w;
+                }
+                if total > 0.0 {
+                    for x in &mut shares[row..row + regions] {
+                        *x /= total;
+                    }
+                }
+            }
+        }
+        Self {
+            regions,
+            first_decade,
+            decades,
+            shares,
+        }
+    }
+
+    /// Destination shares over regions of a move out of `origin` in `year`.
+    fn shares(&self, origin: u16, year: i32) -> &[f64] {
+        let d = ((year - self.first_decade) / 10).clamp(0, self.decades as i32 - 1) as usize;
+        let row = (d * self.regions + origin as usize) * self.regions;
+        &self.shares[row..row + self.regions]
+    }
+
+    /// The natives of a block born in `block_year` in region `own`, `f`
+    /// women and `m` men, split into migration classes `(destination, move
+    /// year, women, men)` (nonzero only), each class moving at its band's
+    /// age if still single: keyed systematic apportionment of the chance of
+    /// a first single long move in each band (the pack's `long` rates)
+    /// times the destination shares. Bands before `after` are skipped (the
+    /// founders' pasts). The rest stay.
+    #[allow(clippy::too_many_arguments)]
+    fn classes(
+        &self,
+        params: &Params,
+        block_year: i32,
+        own: u16,
+        f: u64,
+        m: u64,
+        after: i32,
+        key: Key,
+    ) -> Vec<(u16, i32, u64, u64)> {
+        let long = &params.residence.long;
+        let mut weights: Vec<f64> = vec![0.0];
+        let mut labels: Vec<(u16, i32)> = vec![(own, i32::MAX)];
+        let mut stay = 1.0;
+        for &(from, to, at) in &MOVE_BANDS {
+            let no_move: f64 = (from..=to)
+                .map(|a| 1.0 - (long.by_age.at(a) * long.era.at(block_year + a)).min(1.0))
+                .product();
+            let p = stay * (1.0 - no_move);
+            stay -= p;
+            let year = block_year + at;
+            if year <= after || year > params.y1 || p <= 0.0 {
+                continue;
+            }
+            for (dest, &sh) in self.shares(own, year).iter().enumerate() {
+                if sh > 0.0 {
+                    weights.push(p * sh);
+                    labels.push((dest as u16, year));
+                }
+            }
+        }
+        weights[0] = (1.0 - weights[1..].iter().sum::<f64>()).max(0.0);
+        let shares = SystematicShares::new(&weights);
+        let mut out: BTreeMap<(i32, u16), (u64, u64)> = BTreeMap::new();
+        for (sex, n) in [(0usize, f), (1, m)] {
+            shares.for_each_part(n, key.with(sex as u64), |i, c| {
+                if i > 0 {
+                    let e = out.entry((labels[i].1, labels[i].0)).or_default();
+                    if sex == 0 {
+                        e.0 += c;
+                    } else {
+                        e.1 += c;
+                    }
+                }
+            });
+        }
+        out.into_iter()
+            .map(|((year, dest), (f, m))| (dest, year, f, m))
+            .collect()
+    }
+}
+
+/// Couple moves between areas (area mode, stage 3; spec
+/// `2026-10-01-ledger-areas.md` §8): each women's plan leaf splits into the
+/// couples who stay in the union's area and those who move once, `k`
+/// calendar years after the union year (while the union lasts), to another
+/// area. The chance of a move in a year is the pack's long-move rate at the
+/// woman's age that year; destinations follow [`Migration`]'s shares around
+/// the origin. The ledger and the world split leaves alike, so both see the
+/// same births by area.
+#[derive(Clone)]
+pub struct CoupleMoves {
+    y0: i32,
+    y1: i32,
+    /// The long-move rate by `(year - y0, age)`.
+    rate: Vec<f64>,
+    ages: usize,
+    first_decade: i32,
+    decades: usize,
+    regions: usize,
+    /// Destination shares per `(decade, origin)`; `None` if there is
+    /// nowhere else to go.
+    dests: Vec<Option<SystematicShares>>,
+}
+
+impl std::fmt::Debug for CoupleMoves {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CoupleMoves({} regions, {}–{})", self.regions, self.y0, self.y1)
+    }
+}
+
+/// A cell's move offsets: shares over `0` (stays) and `1..=kmax`.
+pub struct MoveOffsets(Option<SystematicShares>);
+
+impl CoupleMoves {
+    fn new(params: &Params, migration: &Migration) -> Self {
+        let (y0, y1) = (params.y0, params.y1);
+        let ages = MAX_AGE as usize + 1;
+        let long = &params.residence.long;
+        let mut rate = Vec::with_capacity((y1 - y0 + 1) as usize * ages);
+        for y in y0..=y1 {
+            for a in 0..ages as i32 {
+                rate.push((long.by_age.at(a) * long.era.at(y)).clamp(0.0, 1.0));
+            }
+        }
+        let dests = (0..migration.decades)
+            .flat_map(|d| {
+                let year = migration.first_decade + 10 * d as i32;
+                (0..migration.regions).map(move |o| (o, year))
+            })
+            .map(|(o, year)| {
+                let w = migration.shares(o as u16, year);
+                w.iter().any(|&x| x > 0.0).then(|| SystematicShares::new(w))
+            })
+            .collect();
+        Self {
+            y0,
+            y1,
+            rate,
+            ages,
+            first_decade: migration.first_decade,
+            decades: migration.decades,
+            regions: migration.regions,
+            dests,
+        }
+    }
+
+    /// The offsets of a cell's moves: unions begun in `union_year` by women
+    /// aged `age`, separating `cutoff` years after it (`None`: never). A move
+    /// falls in `1..=kmax`: after the union year, before the separation
+    /// year, by the world's last year and the last age.
+    pub fn offsets(&self, union_year: i32, age: i32, cutoff: Option<i32>) -> MoveOffsets {
+        let kmax = (self.y1 - union_year)
+            .min(MAX_AGE as i32 - age)
+            .min(cutoff.map_or(i32::MAX, |c| c - 1))
+            .min(u8::MAX as i32);
+        if kmax < 1 {
+            return MoveOffsets(None);
+        }
+        let pmf = first_event_pmf(kmax - 1, |j| {
+            let (y, a) = (union_year + 1 + j, (age + 1 + j).max(0) as usize);
+            self.rate[(y - self.y0) as usize * self.ages + a]
+        });
+        let moved: f64 = pmf.iter().sum();
+        if moved <= 0.0 {
+            return MoveOffsets(None);
+        }
+        let mut w = Vec::with_capacity(pmf.len() + 1);
+        w.push((1.0 - moved).max(0.0));
+        w.extend(pmf);
+        MoveOffsets(Some(SystematicShares::new(&w)))
+    }
+
+    /// Split `n` couples of a leaf over moves: `f(k, dest, count)`, with
+    /// `k = 0` (and `dest = origin`) for those who stay; in part order.
+    pub fn split(
+        &self,
+        offsets: &MoveOffsets,
+        n: u64,
+        union_year: i32,
+        origin: u16,
+        key: Key,
+        mut f: impl FnMut(u8, u16, u64),
+    ) {
+        let Some(shares) = &offsets.0 else {
+            f(0, origin, n);
+            return;
+        };
+        shares.for_each_part(n, key, |k, c| {
+            if k == 0 {
+                return f(0, origin, c);
+            }
+            let year = union_year + k as i32;
+            let d = ((year - self.first_decade) / 10).clamp(0, self.decades as i32 - 1) as usize;
+            match &self.dests[d * self.regions + origin as usize] {
+                Some(dests) => dests.for_each_part(c, key.with(k as u64), |dest, cd| {
+                    f(k as u8, dest as u16, cd)
+                }),
+                None => f(0, origin, c),
+            }
+        });
+    }
+}
+
+/// `k` keyed by `area` in area mode (`on`), unchanged otherwise, so worlds
+/// without areas keep their keys.
+pub fn area_key(k: Key, area: u16, on: bool) -> Key {
+    if on {
+        k.with2(TAG_AREA, area as u64)
+    } else {
+        k
+    }
+}
 
 /// Births by year and mother block: `(union, non-union)`, year-major over
-/// every block the ledger will have.
+/// every block the ledger will have; births in another area than the
+/// mother block's own (area mode) are kept apart, by area.
 struct Births {
     first_year: i32,
     blocks: usize,
     counts: Vec<(u64, u64)>,
+    other: BTreeMap<(i32, u32, u16), (u64, u64)>,
 }
 
 impl Births {
@@ -295,7 +588,26 @@ impl Births {
             first_year,
             blocks,
             counts: vec![(0, 0); years * blocks],
+            other: BTreeMap::new(),
         }
+    }
+
+    /// Births of `year` to mother block `mother` in `area`, where `own` is
+    /// the mother block's own area.
+    fn in_area(&mut self, year: i32, mother: u32, area: u16, own: u16) -> &mut (u64, u64) {
+        if area == own {
+            self.at(year, mother)
+        } else {
+            self.other.entry((year, mother, area)).or_default()
+        }
+    }
+
+    /// Year `year`'s births in other areas than the mothers' own:
+    /// `(mother, area, counts)`.
+    fn others(&self, year: i32) -> impl Iterator<Item = (u32, u16, &(u64, u64))> {
+        self.other
+            .range((year, 0, 0)..(year + 1, 0, 0))
+            .map(|(&(_, m, a), c)| (m, a, c))
     }
 
     fn at(&mut self, year: i32, mother: u32) -> &mut (u64, u64) {
@@ -318,6 +630,8 @@ struct Plans<'a> {
     root: Key,
     tables: &'a PlanTables,
     params: &'a Params,
+    /// Area mode: couple moves (stage 3).
+    moves: Option<&'a CoupleMoves>,
 }
 
 /// Where a class-cell's members come from: entry cohorts (first unions) or
@@ -336,6 +650,7 @@ enum Members {
 fn class_cells(
     year: i32,
     kind: CellKind,
+    area: u16,
     partners: &mut [(u8, u32, u64)],
     members: &[(u32, u64)],
     from: Members,
@@ -380,6 +695,7 @@ fn class_cells(
                 cohorts,
                 sources,
                 kind,
+                area,
                 class,
             }
         })
@@ -405,88 +721,12 @@ pub(crate) fn cutoff(class: u8) -> Option<i32> {
 
 /// Period survival `l(age)` at `year` for founders' starting sizes.
 fn period_survival(p: &Params, f: MortalityFactor, sex: Sex, age: i32, year: i32) -> f64 {
-    (0..age.max(0)).fold(1.0, |l, a| {
-        l * (1.0 - p.mortality.death_prob_scaled(sex, a as u32, year, f))
-    })
+    survival(age, |a| p.mortality.death_prob_scaled(sex, a, year, f))
 }
 
 /// Probability of never having partnered by `age` under `year`'s hazards.
 fn never_partnered_share(p: &Params, sex: Sex, age: i32, year: i32) -> f64 {
-    (0..age.max(0)).fold(1.0, |s, a| {
-        s * (1.0 - p.unions.first_union_hazard(sex, a as u32, year))
-    })
-}
-
-/// Iterative proportional fitting of `k` (rows × cols) to row and column
-/// margins. Zero margins give zero rows/columns. Stops once every row sum
-/// is within `1e-10` (relative) of its margin after a column pass, or after
-/// 60 passes; both are deterministic, so the result is too.
-fn ipf(k: &mut [f64], rows: usize, cols: usize, r: &[f64], c: &[f64]) {
-    // Row-major throughout: column sums accumulate row by row, in the same
-    // order as a column walk, and each pass fuses a scaling with the next
-    // sums, so the results are bit-identical to separate row and column
-    // passes.
-    let mut colsum = vec![0.0; cols];
-    let mut fac = vec![0.0; cols];
-    let mut sums = vec![0.0; rows];
-    scale_cols_and_sum_rows(k, cols, None, &mut sums);
-    for it in 0..=60 {
-        let converged = it > 0
-            && sums
-                .iter()
-                .zip(r)
-                .all(|(&s, &ri)| (s - ri).abs() <= 1e-10 * ri.max(1.0));
-        if converged || it == 60 {
-            break;
-        }
-        colsum.fill(0.0);
-        for (row, (&s, &ri)) in k.chunks_exact_mut(cols).zip(sums.iter().zip(r)) {
-            let f = if s > 0.0 { ri / s } else { 0.0 };
-            for (x, acc) in row.iter_mut().zip(colsum.iter_mut()) {
-                *x *= f;
-                *acc += *x;
-            }
-        }
-        for ((f, &s), &cj) in fac.iter_mut().zip(&colsum).zip(c) {
-            *f = if s > 0.0 { cj / s } else { 0.0 };
-        }
-        scale_cols_and_sum_rows(k, cols, Some(&fac), &mut sums);
-    }
-}
-
-/// Scale each column of a row-major `rows × cols` matrix by `fac` (if
-/// given), then write each row's sum to `out`, added left to right exactly
-/// as `iter().sum()` does. A float sum is a chain of dependent adds, so
-/// eight rows are summed side by side to overlap their chains; each row's
-/// own order, and so its result, is unchanged.
-fn scale_cols_and_sum_rows(k: &mut [f64], cols: usize, fac: Option<&[f64]>, out: &mut [f64]) {
-    const LANES: usize = 8;
-    let mut i = 0;
-    let mut chunks = out.chunks_exact_mut(LANES);
-    for chunk in &mut chunks {
-        let block = &mut k[i * cols..(i + LANES) * cols];
-        let mut acc = [0.0f64; LANES];
-        for j in 0..cols {
-            let f = fac.map(|f| f[j]);
-            for (l, a) in acc.iter_mut().enumerate() {
-                let x = &mut block[l * cols + j];
-                if let Some(f) = f {
-                    *x *= f;
-                }
-                *a += *x;
-            }
-        }
-        chunk.copy_from_slice(&acc);
-        i += LANES;
-    }
-    for o in chunks.into_remainder() {
-        let row = &mut k[i * cols..(i + 1) * cols];
-        if let Some(fac) = fac {
-            row.iter_mut().zip(fac).for_each(|(x, &f)| *x *= f);
-        }
-        *o = row.iter().sum();
-        i += 1;
-    }
+    survival(age, |a| p.unions.first_union_hazard(sex, a, year))
 }
 
 /// Mutable projection state for one entry cohort, by sex (index
@@ -498,6 +738,12 @@ struct CohortPool {
     alive: [f64; 2],
     size: [u64; 2],
     used: [u64; 2],
+    /// An arrival cohort (immigrants), not natives.
+    arrival: bool,
+    /// A migration class (area mode): in `dest` from year `moves`
+    /// (`i32::MAX`: never moves).
+    dest: u16,
+    moves: i32,
 }
 
 impl CohortPool {
@@ -507,6 +753,19 @@ impl CohortPool {
             alive: [f as f64, m as f64],
             size: [f, m],
             used: [0, 0],
+            arrival: false,
+            dest: 0,
+            moves: i32::MAX,
+        }
+    }
+
+    /// The area the cohort's never-partnered live in during year `t`, for
+    /// a block whose own area is `own`.
+    fn area(&self, own: u16, t: i32) -> u16 {
+        if t >= self.moves {
+            self.dest
+        } else {
+            own
         }
     }
 }
@@ -558,10 +817,10 @@ impl Default for DivPools {
 }
 
 impl DivPools {
-    /// Add a source of `members` who separate in `divorce_year`.
-    fn add(&mut self, divorce_year: i32, members: u64) {
+    /// Add source `source` (its index in the block's list) of `members` who
+    /// separate in `divorce_year`.
+    fn add(&mut self, divorce_year: i32, members: u64, source: u32) {
         let scaled = members as f64 / self.factor;
-        let source = self.count;
         self.count += 1;
         let k = self.years.partition_point(|y| y.year < divorce_year);
         if self.years.get(k).map_or(true, |y| y.year != divorce_year) {
@@ -623,11 +882,70 @@ impl DivPools {
 /// split over the cohorts or sources.
 struct Pool {
     cohorts: Vec<CohortPool>,
-    div: [DivPools; 2],
-    taken: [[u64; 2]; CellKind::COUNT],
+    /// The block's own area (its region in area mode; 0 otherwise, when
+    /// every pool and seeker is in area 0).
+    own: u16,
+    /// Divorced pools per area (each source in its cell's area), by sex.
+    div: [Vec<(u16, DivPools)>; 2],
+    /// This year's unions taken, per area, by cell kind and sex, not yet
+    /// split over the cohorts or sources.
+    taken: Vec<(u16, [[u64; 2]; CellKind::COUNT])>,
     /// This year's partnering rate of the never-partnered, by sex:
     /// `[natives, arrival cohorts]` (R1d).
     rate: [[f64; 2]; 2],
+    /// A founder block during the first year's market, which pairs the
+    /// founders already partnered: its capacity is the expected partnered
+    /// members, and the unions it takes leave the never-partnered alone.
+    founding: bool,
+    /// Wants carried to next year from couples deferred as isolated, per
+    /// area, by sex and status (`[never partnered, divorced]`).
+    carry: Vec<(u16, [[f64; 2]; 2])>,
+    /// This year's never-partnered availability per area ([`Self::refresh`]),
+    /// kept current by `settle`, so the markets' caps need no cohort scan.
+    avail: Vec<Avail>,
+    /// This year's cohorts by area: each [`Avail`]'s `cohorts` range indexes
+    /// it, in cohort order.
+    area_cohorts: Vec<u32>,
+}
+
+impl Avail {
+    fn empty(area: u16) -> Self {
+        Self {
+            area,
+            cohorts: (0, 0),
+            never: [0.0; 2],
+            unused: [0; 2],
+            partnered: [0.0; 2],
+            want: [0.0; 2],
+        }
+    }
+
+    fn add(&mut self, c: &CohortPool, rate: &[[f64; 2]; 2]) {
+        for si in 0..2 {
+            let never = c.never[si].max(0.0);
+            self.never[si] += never;
+            self.unused[si] += c.size[si] - c.used[si];
+            self.partnered[si] += (c.size[si] - c.used[si]) as f64 - never;
+            self.want[si] += never * rate[si][c.arrival as usize];
+        }
+    }
+}
+
+/// A pool's never-partnered availability in one area, by sex, before this
+/// year's takings: expected never-partnered members, members not yet in a
+/// union, and (founding pools) expected members partnered before the world
+/// starts and not yet placed in a union.
+#[derive(Clone, Copy, Debug)]
+struct Avail {
+    area: u16,
+    /// The area's cohorts: `area_cohorts[cohorts.0..cohorts.1]`.
+    cohorts: (u32, u32),
+    never: [f64; 2],
+    unused: [u64; 2],
+    partnered: [f64; 2],
+    /// Desired first unions: each cohort's expected never-partnered times
+    /// its rate.
+    want: [f64; 2],
 }
 
 /// Below this many expected survivors a divorced source is retired from
@@ -645,31 +963,141 @@ const NEVER_KINDS: [CellKind; 4] = [
 const DIVORCED_KINDS: [CellKind; 2] = [CellKind::SecondWithFirst, CellKind::SecondWithSecond];
 
 impl Pool {
-    fn one(c: CohortPool) -> Self {
+    fn one(c: CohortPool, own: u16) -> Self {
         Self {
             cohorts: vec![c],
-            div: [DivPools::default(), DivPools::default()],
-            taken: [[0; 2]; CellKind::COUNT],
+            own,
+            div: [Vec::new(), Vec::new()],
+            taken: Vec::new(),
             rate: [[1.0; 2]; 2],
+            founding: false,
+            carry: Vec::new(),
+            avail: Vec::new(),
+            area_cohorts: Vec::new(),
         }
     }
 
-    fn taken_of(&self, kinds: &[CellKind], s: Sex) -> u64 {
-        kinds
-            .iter()
-            .map(|&k| self.taken[k as usize][s as usize])
-            .sum()
-    }
-
-    /// This year's desired first in-world unions of the never-partnered:
-    /// each cohort's expected members times its rate.
-    fn want(&self, s: Sex) -> f64 {
-        let si = s as usize;
-        self.cohorts
+    /// Recompute this year's cohorts by area and each area's availability
+    /// (after this year's rates are set), sorted by area, each area's
+    /// cohorts in cohort order.
+    fn refresh(&mut self, t: i32) {
+        let own = self.own;
+        let mut by_area: Vec<(u16, u32)> = self
+            .cohorts
             .iter()
             .enumerate()
-            .map(|(i, c)| c.never[si].max(0.0) * self.rate[si][(i > 0) as usize])
-            .sum()
+            .map(|(i, c)| (c.area(own, t), i as u32))
+            .collect();
+        by_area.sort_unstable();
+        self.area_cohorts.clear();
+        self.area_cohorts.extend(by_area.iter().map(|e| e.1));
+        self.avail.clear();
+        let mut start = 0;
+        while start < by_area.len() {
+            let area = by_area[start].0;
+            let end = start + by_area[start..].partition_point(|e| e.0 == area);
+            self.avail
+                .push(self.avail_of(area, (start as u32, end as u32)));
+            start = end;
+        }
+    }
+
+    /// Availability in `area` from its cohorts (an `area_cohorts` range).
+    fn avail_of(&self, area: u16, cohorts: (u32, u32)) -> Avail {
+        let mut a = Avail::empty(area);
+        a.cohorts = cohorts;
+        for &i in &self.area_cohorts[cohorts.0 as usize..cohorts.1 as usize] {
+            a.add(&self.cohorts[i as usize], &self.rate);
+        }
+        a
+    }
+
+    fn avail(&self, area: u16) -> Option<&Avail> {
+        self.avail
+            .binary_search_by_key(&area, |a| a.area)
+            .ok()
+            .map(|i| &self.avail[i])
+    }
+
+    /// The want carried into this year for `area`, sex and status.
+    fn carried(&self, area: u16, s: Sex, divorced: bool) -> f64 {
+        self.carry
+            .iter()
+            .find(|e| e.0 == area)
+            .map_or(0.0, |e| e.1[s as usize][divorced as usize])
+    }
+
+    /// Carry one deferred union's want to next year.
+    fn carry_one(&mut self, area: u16, s: Sex, divorced: bool) {
+        let i = match self.carry.iter().position(|e| e.0 == area) {
+            Some(i) => i,
+            None => {
+                self.carry.push((area, [[0.0; 2]; 2]));
+                self.carry.len() - 1
+            }
+        };
+        self.carry[i].1[s as usize][divorced as usize] += 1.0;
+    }
+
+    fn taken(&self, area: u16) -> Option<&[[u64; 2]; CellKind::COUNT]> {
+        self.taken
+            .binary_search_by_key(&area, |e| e.0)
+            .ok()
+            .map(|i| &self.taken[i].1)
+    }
+
+    fn taken_mut(&mut self, area: u16) -> &mut [[u64; 2]; CellKind::COUNT] {
+        let i = match self.taken.binary_search_by_key(&area, |e| e.0) {
+            Ok(i) => i,
+            Err(i) => {
+                self.taken.insert(i, (area, [[0; 2]; CellKind::COUNT]));
+                i
+            }
+        };
+        &mut self.taken[i].1
+    }
+
+    fn taken_of(&self, kinds: &[CellKind], s: Sex, area: u16) -> u64 {
+        self.taken(area).map_or(0, |t| {
+            kinds.iter().map(|&k| t[k as usize][s as usize]).sum()
+        })
+    }
+
+    /// The divorced pools of `area`, by sex.
+    fn div_in(&self, s: Sex, area: u16) -> Option<&DivPools> {
+        self.div[s as usize]
+            .iter()
+            .find(|d| d.0 == area)
+            .map(|d| &d.1)
+    }
+
+    fn div_in_mut(&mut self, s: Sex, area: u16) -> &mut DivPools {
+        let v = &mut self.div[s as usize];
+        let i = match v.iter().position(|d| d.0 == area) {
+            Some(i) => i,
+            None => {
+                v.push((area, DivPools::default()));
+                v.len() - 1
+            }
+        };
+        &mut v[i].1
+    }
+
+    /// The areas this block has seekers in this year (after
+    /// [`Self::refresh`]): its own, its migration classes' destinations, and
+    /// its divorced pools' areas.
+    fn areas(&self) -> Vec<u16> {
+        let mut out: Vec<u16> = self.avail.iter().map(|a| a.area).collect();
+        out.extend(self.div.iter().flatten().map(|d| d.0));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// This year's desired first in-world unions of the never-partnered in
+    /// `area`: each cohort's expected members times its rate.
+    fn want(&self, s: Sex, area: u16) -> f64 {
+        self.avail(area).map_or(0.0, |a| a.want[s as usize])
     }
 
     /// The yearly partnering rate of the block's natives who are single at
@@ -677,47 +1105,57 @@ impl Pool {
     /// single arrival of that age is given (R1d). `h` alone when the block
     /// has no single natives.
     fn single_rate(&self, s: Sex, age: i32, t: i32, h: f64, rp: &Repartnering) -> f64 {
-        let never = self.cohorts[0].never[s as usize].max(0.0);
-        let d = &self.div[s as usize];
-        let divorced: f64 = d
-            .available(t)
+        let never: f64 = self
+            .cohorts
             .iter()
-            .map(|y| y.scaled.max(0.0))
-            .sum::<f64>()
-            * d.factor;
+            .filter(|c| !c.arrival)
+            .map(|c| c.never[s as usize].max(0.0))
+            .sum();
+        let mut divorced = 0.0;
+        let mut div_want = 0.0;
+        for (area, d) in &self.div[s as usize] {
+            divorced += d
+                .available(t)
+                .iter()
+                .map(|y| y.scaled.max(0.0))
+                .sum::<f64>()
+                * d.factor;
+            div_want += self.div_want(s, age, t, rp, *area);
+        }
         if never + divorced <= 0.0 {
             return h;
         }
-        (h * never + self.div_want(s, age, t, rp)) / (never + divorced)
+        (h * never + div_want) / (never + divorced)
     }
 
-    /// Expected never-partnered members left this year.
-    fn never(&self, s: Sex) -> f64 {
-        let n: f64 = self
-            .cohorts
-            .iter()
-            .map(|c| c.never[s as usize].max(0.0))
-            .sum();
-        n - self.taken_of(&NEVER_KINDS, s) as f64
+    /// Expected never-partnered members in `area` left this year.
+    fn never(&self, s: Sex, area: u16) -> f64 {
+        let n = self.avail(area).map_or(0.0, |a| a.never[s as usize]);
+        n - self.taken_of(&NEVER_KINDS, s, area) as f64
     }
 
-    /// Members not yet in a union, net of this year's takings.
-    fn unused(&self, s: Sex) -> u64 {
-        let n: u64 = self
-            .cohorts
-            .iter()
-            .map(|c| c.size[s as usize] - c.used[s as usize])
-            .sum();
-        n - self.taken_of(&NEVER_KINDS, s)
+    /// A founding pool's expected members in `area` partnered before the
+    /// world starts and not yet placed, net of this year's takings.
+    fn partnered(&self, s: Sex, area: u16) -> f64 {
+        let n = self.avail(area).map_or(0.0, |a| a.partnered[s as usize]);
+        n - self.taken_of(&NEVER_KINDS, s, area) as f64
     }
 
-    /// Desired second unions this year of the divorced, aged `age`.
-    fn div_want(&self, s: Sex, age: i32, t: i32, rp: &Repartnering) -> f64 {
+    /// Members in `area` not yet in a union, net of this year's takings.
+    fn unused(&self, s: Sex, area: u16) -> u64 {
+        let n = self.avail(area).map_or(0, |a| a.unused[s as usize]);
+        n - self.taken_of(&NEVER_KINDS, s, area)
+    }
+
+    /// Desired second unions this year of the divorced in `area`, aged `age`.
+    fn div_want(&self, s: Sex, age: i32, t: i32, rp: &Repartnering, area: u16) -> f64 {
         let base = rp.base(s, age, t);
         if base == 0.0 {
             return 0.0;
         }
-        let d = &self.div[s as usize];
+        let Some(d) = self.div_in(s, area) else {
+            return 0.0;
+        };
         d.available(t)
             .iter()
             .map(|y| rp.duration(t - y.year) * y.scaled.max(0.0))
@@ -726,58 +1164,94 @@ impl Pool {
             * base
     }
 
-    /// Most second unions the divorced can take this year: expected
-    /// available survivors, and available members, net of this year's
-    /// takings.
-    fn div_cap(&self, s: Sex, t: i32) -> u64 {
-        let d = &self.div[s as usize];
+    /// Most second unions the divorced in `area` can take this year:
+    /// expected available survivors (rounded up), and available members,
+    /// net of this year's takings.
+    fn div_cap(&self, s: Sex, t: i32, area: u16) -> u64 {
+        let Some(d) = self.div_in(s, area) else {
+            return 0;
+        };
         let (mut e, mut n) = (0.0, 0u64);
         for y in d.available(t) {
             e += y.scaled.max(0.0);
             n += y.unused;
         }
-        let taken = self.taken_of(&DIVORCED_KINDS, s);
-        ((e * d.factor).floor() as u64).min(n).saturating_sub(taken)
+        let taken = self.taken_of(&DIVORCED_KINDS, s, area);
+        ceil_count(e * d.factor).min(n).saturating_sub(taken)
     }
 
-    /// Most unions of `divorced` or never-partnered seekers this year.
-    fn cap(&self, s: Sex, divorced: bool, t: i32) -> u64 {
+    /// Most unions of `divorced` or never-partnered seekers in `area` this
+    /// year: expected available survivors, rounded up, and never more than
+    /// the members available. A seeker's expected unions are well below its
+    /// pool's expected survivors (a yearly rate, at most doubled by the
+    /// market's scaling), so this cap only stops rounding from overshooting
+    /// a small pool; a floor (or any rounding that can fall below the
+    /// expectation) would trim small pools' unions systematically.
+    fn cap(&self, s: Sex, divorced: bool, t: i32, area: u16) -> u64 {
         if divorced {
-            self.div_cap(s, t)
+            self.div_cap(s, t, area)
+        } else if self.founding {
+            ceil_count(self.partnered(s, area)).min(self.unused(s, area))
         } else {
-            (self.never(s).floor().max(0.0) as u64).min(self.unused(s))
+            ceil_count(self.never(s, area)).min(self.unused(s, area))
         }
     }
 
-    /// Split this year's takings of one never-partnered kind over the
-    /// cohorts: by never-partnered pool, capped by each cohort's unused
-    /// members. Returns `(cohort, count)`.
-    fn settle(&mut self, kind: CellKind, s: Sex) -> Vec<(u32, u64)> {
+    /// Split this year's takings of one never-partnered kind in `area` over
+    /// the cohorts there: by never-partnered pool, capped by each cohort's
+    /// unused members. Returns `(cohort, count)`.
+    fn settle(&mut self, kind: CellKind, s: Sex, area: u16, t: i32, n: u64) -> Vec<(u32, u64)> {
         let si = s as usize;
-        let n = std::mem::take(&mut self.taken[kind as usize][si]);
+        let taken = &mut self.taken_mut(area)[kind as usize][si];
+        debug_assert!(*taken >= n, "settling more than was taken");
+        *taken -= n;
         if n == 0 {
             return Vec::new();
         }
-        let weights: Vec<f64> = self
-            .cohorts
+        let own = self.own;
+        let range = self
+            .avail(area)
+            .map(|a| a.cohorts)
+            .expect("a settled area was refreshed");
+        let here: Vec<usize> = self.area_cohorts[range.0 as usize..range.1 as usize]
             .iter()
-            .enumerate()
-            .map(|(i, c)| c.never[si].max(0.0) * self.rate[si][(i > 0) as usize])
+            .map(|&i| i as usize)
             .collect();
-        let caps: Vec<u64> = self
-            .cohorts
+        let founding = self.founding;
+        let weights: Vec<f64> = here
             .iter()
-            .map(|c| c.size[si] - c.used[si])
+            .map(|&i| {
+                let c = &self.cohorts[i];
+                if founding {
+                    (c.size[si] - c.used[si]) as f64 - c.never[si].max(0.0)
+                } else {
+                    c.never[si].max(0.0) * self.rate[si][c.arrival as usize]
+                }
+            })
             .collect();
-        let split = apportion_capped(n, &weights, &caps);
+        let caps: Vec<u64> = here
+            .iter()
+            .map(|&i| self.cohorts[i].size[si] - self.cohorts[i].used[si])
+            .collect();
+        let split = apportion_largest_remainder_capped(n, &weights, &caps);
         let mut out = Vec::new();
-        for (ci, (c, &k)) in self.cohorts.iter_mut().zip(&split).enumerate() {
+        for (&i, &k) in here.iter().zip(&split) {
             if k > 0 {
+                let c = &mut self.cohorts[i];
+                debug_assert_eq!(c.area(own, t), area);
                 c.used[si] += k;
-                c.never[si] -= k as f64;
-                out.push((ci as u32, k));
+                if !founding {
+                    c.never[si] -= k as f64;
+                }
+                out.push((i as u32, k));
             }
         }
+        let fresh = self.avail_of(area, range);
+        let i = self
+            .avail
+            .binary_search_by_key(&area, |a| a.area)
+            .expect("a settled area was refreshed");
+        self.avail[i] = fresh;
         out
     }
 
@@ -785,7 +1259,7 @@ impl Pool {
     /// sources: first over divorce years by want (hazard times expected
     /// survivors), then within each year over its sources by expected
     /// survivors, capped by members not yet re-partnered. Each level is a
-    /// keyed systematic sweep ([`sweep`]): exact, unbiased, linear and
+    /// keyed systematic sweep ([`sweep_capped`]): exact, unbiased, linear and
     /// allocation-free. Returns `(source, count)` in source order.
     fn settle_div(
         &mut self,
@@ -794,18 +1268,22 @@ impl Pool {
         t: i32,
         key: Key,
         rp: &Repartnering,
+        area: u16,
+        n: u64,
     ) -> Vec<(u32, u64)> {
         let si = s as usize;
-        let n = std::mem::take(&mut self.taken[kind as usize][si]);
+        let taken = &mut self.taken_mut(area)[kind as usize][si];
+        debug_assert!(*taken >= n, "settling more than was taken");
+        *taken -= n;
         if n == 0 {
             return Vec::new();
         }
-        let d = &mut self.div[si];
+        let d = self.div_in_mut(s, area);
         let ny = d.available(t).len();
         let mut by_year = vec![0u64; ny];
         {
             let years = &d.years[..ny];
-            sweep(
+            sweep_capped(
                 n,
                 ny,
                 |yi| {
@@ -824,7 +1302,7 @@ impl Pool {
             let mut got: Vec<(usize, u64)> = Vec::new();
             {
                 let srcs = &d.years[yi].sources;
-                sweep(
+                sweep_capped(
                     ky,
                     srcs.len(),
                     |k| (srcs[k].scaled.max(0.0), srcs[k].left),
@@ -852,73 +1330,25 @@ impl Pool {
     }
 }
 
-/// Keyed systematic split of `n` over `len` items by weight, capped: item
-/// `k` is `item(k) = (weight, cap)`; `n` points spaced `W / n` apart from
-/// offset `u` fall into the items' weight intervals. An item over its cap
-/// passes the excess on; a second pass gives what remains to items with room,
-/// in order. `give(k, count)` receives the counts (an item can get two calls).
-/// Requires `n` at most the caps' sum. With no positive weight, the caps are
-/// the weights.
-fn sweep(
-    n: u64,
-    len: usize,
-    item: impl Fn(usize) -> (f64, u64),
-    u: f64,
-    mut give: impl FnMut(usize, u64),
-) {
-    let total: f64 = (0..len).map(|k| item(k).0).sum();
-    let by_cap = total <= 0.0;
-    let weight = |k: usize| {
-        let (w, c) = item(k);
-        if by_cap {
-            c as f64
-        } else {
-            w
+/// Year `t`'s cells were recorded market by market (and area by area);
+/// order them by (kind, class, area) after the earlier years' (every lookup
+/// searches cells by (year, kind, class, area)).
+fn sort_year_cells(blocks: &mut [Block], t: i32) {
+    blocks.par_iter_mut().for_each(|b| {
+        for cells in [&mut b.union_f, &mut b.union_m] {
+            let from = cells.partition_point(|c| c.year < t);
+            cells[from..].sort_by_key(|c| (c.kind, c.class, c.area));
         }
-    };
-    let total = if by_cap {
-        (0..len).map(|k| item(k).1 as f64).sum()
+    });
+}
+
+/// The smallest count at least `x` (0 for a non-positive or NaN `x`).
+fn ceil_count(x: f64) -> u64 {
+    if x > 0.0 {
+        x.ceil() as u64
     } else {
-        total
-    };
-    let step = total / n as f64;
-    let (mut next, mut cum, mut placed, mut carry) = (u * step, 0.0, 0u64, 0u64);
-    let mut given = vec![0u64; 0];
-    let mut room_left = false;
-    for k in 0..len {
-        cum += weight(k);
-        let mut c = carry;
-        while placed < n && next < cum {
-            c += 1;
-            placed += 1;
-            next += step;
-        }
-        let cap = item(k).1;
-        let g = c.min(cap);
-        carry = c - g;
-        if g > 0 {
-            give(k, g);
-        }
-        room_left |= g < cap;
-        given.push(g);
+        0
     }
-    // Points lost to rounding at the end, and excess carried past the last
-    // item: to items with room, in order.
-    let mut rest = carry + (n - placed);
-    if rest > 0 && room_left {
-        for k in 0..len {
-            if rest == 0 {
-                break;
-            }
-            let room = item(k).1 - given[k];
-            let g = room.min(rest);
-            if g > 0 {
-                give(k, g);
-                rest -= g;
-            }
-        }
-    }
-    assert_eq!(rest, 0, "more takings than members");
 }
 
 /// Register a first-union class-cell that separates as a divorced source
@@ -931,54 +1361,21 @@ fn add_source(block: &mut Block, pool: &mut Pool, s: Sex, cell: &UnionCell) {
         year: cell.year,
         kind: cell.kind,
         class: cell.class,
+        area: cell.area,
         members: cell.total,
         parts: Vec::new(),
+        part_areas: Vec::new(),
     };
-    pool.div[s as usize].add(src.divorce_year(), cell.total);
+    let index = match s {
+        Sex::Female => block.div_f.len(),
+        Sex::Male => block.div_m.len(),
+    } as u32;
+    pool.div_in_mut(s, cell.area)
+        .add(src.divorce_year(), cell.total, index);
     match s {
         Sex::Female => block.div_f.push(src),
         Sex::Male => block.div_m.push(src),
     }
-}
-
-/// Apportion `n` by `weights` (largest remainder) without exceeding `caps`:
-/// cohorts that would exceed their cap are fixed at it and the rest is
-/// re-apportioned among the others; when their weights run out, by spare
-/// capacity. `n` must not exceed the caps' sum.
-fn apportion_capped(n: u64, weights: &[f64], caps: &[u64]) -> Vec<u64> {
-    assert!(n <= caps.iter().sum::<u64>(), "more unions than members");
-    let mut out = vec![0u64; weights.len()];
-    let mut open: Vec<bool> = caps.iter().map(|&c| c > 0).collect();
-    let mut left = n;
-    while left > 0 {
-        let idx: Vec<usize> = (0..weights.len()).filter(|&i| open[i]).collect();
-        let mut w: Vec<f64> = idx.iter().map(|&i| weights[i].max(0.0)).collect();
-        if w.iter().all(|&x| x <= 0.0) {
-            w = idx.iter().map(|&i| (caps[i] - out[i]) as f64).collect();
-        }
-        let add = apportion(left, &w);
-        let over: Vec<usize> = idx
-            .iter()
-            .zip(&add)
-            .filter(|&(&i, &a)| a > caps[i] - out[i])
-            .map(|(&i, _)| i)
-            .collect();
-        if over.is_empty() {
-            for (&i, &a) in idx.iter().zip(&add) {
-                out[i] += a;
-            }
-            left = 0;
-        } else {
-            // Fill the overflowing cohorts to their caps and re-apportion
-            // the rest; each round closes at least one cohort.
-            for i in over {
-                left -= caps[i] - out[i];
-                out[i] = caps[i];
-                open[i] = false;
-            }
-        }
-    }
-    out
 }
 
 impl Ledger {
@@ -995,10 +1392,16 @@ impl Ledger {
             &params.fertility,
             &params.heritage,
         );
+        // Area mode: lineage regions are residence areas, and the ledger
+        // tracks where people live (spec `2026-10-01-ledger-areas.md`).
+        let areas_on = params.places.by_area;
+        let migration = areas_on.then(|| Migration::new(&params));
+        let couple_moves = migration.as_ref().map(|m| CoupleMoves::new(&params, m));
         let plans = Plans {
             root: plan_root,
             tables: &plan_tables,
             params: &params,
+            moves: couple_moves.as_ref(),
         };
         let mut class_moves = 0u64;
         let arrival_density: Vec<Vec<f64>> = (params.y0..=params.y1)
@@ -1025,7 +1428,7 @@ impl Ledger {
         let survivors = |f: MortalityFactor| -> f64 {
             (0..=params.founder_max_age)
                 .map(|age| {
-                    procedural_core::dmath::exp(-params.founder_growth * age as f64)
+                    stable_age_weight(params.founder_growth, age as f64)
                         * ((1.0 - male_share)
                             * period_survival(&params, f, Sex::Female, age, params.y0)
                             + male_share * period_survival(&params, f, Sex::Male, age, params.y0))
@@ -1052,7 +1455,7 @@ impl Ledger {
             for g in 0..groups {
                 let (region, heritage) = (g / heritages, g % heritages);
                 let born = params.founder_births
-                    * procedural_core::dmath::exp(-params.founder_growth * age as f64)
+                    * stable_age_weight(params.founder_growth, age as f64)
                     * params.regions[region].founder_weight
                     / weight_sum
                     * founder_mix[heritage]
@@ -1078,6 +1481,7 @@ impl Ledger {
                     females: f,
                     cohorts: vec![Cohort {
                         arrival: None,
+                        class: None,
                         size: f + m,
                         females: f,
                         mothers: Vec::new(),
@@ -1088,22 +1492,26 @@ impl Ledger {
                     div_f: Vec::new(),
                     div_m: Vec::new(),
                 });
-                pools.push(Pool::one(CohortPool::new(
-                    f,
-                    m,
-                    [
-                        f as f64 * never_partnered_share(&params, Sex::Female, age, params.y0),
-                        m as f64 * never_partnered_share(&params, Sex::Male, age, params.y0),
-                    ],
-                )));
-                add_nonunion_births(
+                pools.push(Pool::one(
+                    CohortPool::new(
+                        f,
+                        m,
+                        [
+                            f as f64 * never_partnered_share(&params, Sex::Female, age, params.y0),
+                            m as f64 * never_partnered_share(&params, Sex::Male, age, params.y0),
+                        ],
+                    ),
+                    if areas_on { region as u16 } else { 0 },
+                ));
+                settle_natives(
+                    idx as usize,
+                    &mut blocks,
+                    &mut pools,
                     &mut births,
-                    idx,
-                    f,
-                    y,
-                    params.y0 + 1,
-                    params.y1,
-                    (&params, Heritage(heritage as u8)),
+                    migration.as_ref(),
+                    &params,
+                    params.y0,
+                    key,
                 );
             }
         }
@@ -1111,20 +1519,34 @@ impl Ledger {
         // Founder couples already partnered at y0.
         {
             let y0 = params.y0;
-            let wants = |b: usize, sex: Sex| -> Option<f64> {
-                (y0 - blocks[b].year >= MIN_UNION_AGE).then(|| match sex {
-                    Sex::Female => blocks[b].females as f64 - pools[b].never(sex),
-                    Sex::Male => (blocks[b].size - blocks[b].females) as f64 - pools[b].never(sex),
+            for p in pools.iter_mut() {
+                p.founding = true;
+                p.refresh(y0);
+            }
+            let wanting: Vec<Seeker> = (0..blocks.len())
+                .filter(|&b| y0 - blocks[b].year >= MIN_UNION_AGE)
+                .map(|b| {
+                    let own = pools[b].own;
+                    let partnered = |sex: Sex| {
+                        let n = match sex {
+                            Sex::Female => blocks[b].females,
+                            Sex::Male => blocks[b].size - blocks[b].females,
+                        };
+                        Some(n as f64 - pools[b].never(sex, own))
+                    };
+                    Seeker {
+                        block: b as u32,
+                        area: own,
+                        region: blocks[b].region,
+                        never: [partnered(Sex::Female), partnered(Sex::Male)],
+                        div: [None, None],
+                    }
                 })
-            };
-            let f: Vec<Option<f64>> = (0..blocks.len()).map(|b| wants(b, Sex::Female)).collect();
-            let m: Vec<Option<f64>> = (0..blocks.len()).map(|b| wants(b, Sex::Male)).collect();
-            let none = vec![None; blocks.len()];
+                .collect();
             clear_year(
                 y0,
                 &params,
-                (&f, &m),
-                (&none, &none),
+                &wanting,
                 &mut blocks,
                 &mut pools,
                 &mut births,
@@ -1133,6 +1555,10 @@ impl Ledger {
                 plans,
                 &mut class_moves,
             );
+            sort_year_cells(&mut blocks, y0);
+            for p in pools.iter_mut() {
+                p.founding = false;
+            }
         }
 
         // Expected living, carried from year to year for the inflow's base.
@@ -1156,13 +1582,24 @@ impl Ledger {
                     nonunion_births: nu,
                 });
             }
+            // Births in another area than the mother block's own (area
+            // mode): the child's block is the area's, of the mother's
+            // heritage.
+            for (mother, area, &(u, nu)) in births.others(t) {
+                let g = area as usize * heritages + blocks[mother as usize].heritage.index();
+                by_group[g].push(MotherShare {
+                    mother,
+                    union_births: u,
+                    nonunion_births: nu,
+                });
+            }
             for (g, mut mothers) in by_group.into_iter().enumerate() {
                 mothers.sort_by_key(|m| m.mother);
                 let size: u64 = mothers
                     .iter()
                     .map(|m| m.union_births + m.nonunion_births)
                     .sum();
-                let females = crate::plan::apportion(size, &[1.0 - male_share, male_share])[0];
+                let females = apportion_largest_remainder(size, &[1.0 - male_share, male_share])[0];
                 let idx = blocks.len() as u32;
                 blocks.push(Block {
                     year: t,
@@ -1174,6 +1611,7 @@ impl Ledger {
                     females,
                     cohorts: vec![Cohort {
                         arrival: None,
+                        class: None,
                         size,
                         females,
                         mothers: Vec::new(),
@@ -1184,19 +1622,23 @@ impl Ledger {
                     div_f: Vec::new(),
                     div_m: Vec::new(),
                 });
-                pools.push(Pool::one(CohortPool::new(
-                    females,
-                    size - females,
-                    [females as f64, (size - females) as f64],
-                )));
-                add_nonunion_births(
+                pools.push(Pool::one(
+                    CohortPool::new(
+                        females,
+                        size - females,
+                        [females as f64, (size - females) as f64],
+                    ),
+                    if areas_on { (g / heritages) as u16 } else { 0 },
+                ));
+                settle_natives(
+                    idx as usize,
+                    &mut blocks,
+                    &mut pools,
                     &mut births,
-                    idx,
-                    females,
-                    t,
-                    t + 1,
-                    params.y1,
-                    (&params, Heritage((g % heritages) as u8)),
+                    migration.as_ref(),
+                    &params,
+                    params.y0,
+                    key,
                 );
                 alive += size as f64;
             }
@@ -1207,41 +1649,74 @@ impl Ledger {
             //    know, so they partner at the rate of the natives of their
             //    age who are single, never partnered and divorced together
             //    (R1d): statistically like the people around them.
-            for (b, pool) in pools.iter_mut().enumerate() {
-                let age = t - blocks[b].year;
-                for sex in [Sex::Female, Sex::Male] {
-                    pool.rate[sex as usize] = if age >= MIN_UNION_AGE {
+            // Each pool is its own task: rates, then this year's availability
+            // (blocks too young to partner have neither).
+            {
+                let blocks: &[Block] = &blocks;
+                pools.par_iter_mut().enumerate().for_each(|(b, pool)| {
+                    let age = t - blocks[b].year;
+                    if age < MIN_UNION_AGE {
+                        pool.rate = [[0.0; 2]; 2];
+                        return;
+                    }
+                    for sex in [Sex::Female, Sex::Male] {
                         let h = params.unions.first_union_hazard(sex, age as u32, t);
-                        [h, pool.single_rate(sex, age, t, h, &params.repartnering)]
-                    } else {
-                        [0.0; 2]
-                    };
-                }
+                        pool.rate[sex as usize] =
+                            [h, pool.single_rate(sex, age, t, h, &params.repartnering)];
+                    }
+                    pool.refresh(t);
+                });
             }
-            let want = |b: usize, sex: Sex| -> Option<f64> {
-                let w = pools[b].want(sex);
-                (w > MIN_WANT).then_some(w)
-            };
-            let f: Vec<Option<f64>> = (0..blocks.len()).map(|b| want(b, Sex::Female)).collect();
-            let m: Vec<Option<f64>> = (0..blocks.len()).map(|b| want(b, Sex::Male)).collect();
-            // The divorced's desired second unions (R1c).
-            let div_want = |b: usize, sex: Sex| -> Option<f64> {
-                let age = t - blocks[b].year;
-                if !(MIN_UNION_AGE..=MAX_REMARRIAGE_AGE).contains(&age) {
-                    return None;
-                }
-                let w = pools[b].div_want(sex, age, t, &params.repartnering);
-                (w > MIN_WANT).then_some(w)
-            };
-            let df: Vec<Option<f64>> = (0..blocks.len())
-                .map(|b| div_want(b, Sex::Female))
+            // Each block's seekers, per area it has people in this year (its
+            // own, its migration classes' destinations, its divorced pools'
+            // areas), in block order.
+            let per_block: Vec<Vec<Seeker>> = pools
+                .par_iter()
+                .enumerate()
+                .map(|(b, pool)| {
+                    let mut wanting: Vec<Seeker> = Vec::new();
+                    let age = t - blocks[b].year;
+                    if age < MIN_UNION_AGE {
+                        return wanting;
+                    }
+                    let div_age = (MIN_UNION_AGE..=MAX_REMARRIAGE_AGE).contains(&age);
+                    for area in pool.areas() {
+                        // Wants deferred last year (couples isolated on both
+                        // sides) come back on top: delayed, not lost.
+                        let never = [Sex::Female, Sex::Male].map(|sex| {
+                            let w = pool.want(sex, area) + pool.carried(area, sex, false);
+                            (w > MIN_WANT).then_some(w)
+                        });
+                        // The divorced's desired second unions (R1c).
+                        let div = [Sex::Female, Sex::Male].map(|sex| {
+                            if !div_age {
+                                return None;
+                            }
+                            let w = pool.div_want(sex, age, t, &params.repartnering, area)
+                                + pool.carried(area, sex, true);
+                            (w > MIN_WANT).then_some(w)
+                        });
+                        if never.iter().chain(&div).any(Option::is_some) {
+                            wanting.push(Seeker {
+                                block: b as u32,
+                                area,
+                                region: if areas_on { area } else { blocks[b].region },
+                                never,
+                                div,
+                            });
+                        }
+                    }
+                    wanting
+                })
                 .collect();
-            let dm: Vec<Option<f64>> = (0..blocks.len()).map(|b| div_want(b, Sex::Male)).collect();
+            let wanting: Vec<Seeker> = per_block.into_iter().flatten().collect();
+            for pool in pools.iter_mut() {
+                pool.carry.clear();
+            }
             clear_year(
                 t,
                 &params,
-                (&f, &m),
-                (&df, &dm),
+                &wanting,
                 &mut blocks,
                 &mut pools,
                 &mut births,
@@ -1266,23 +1741,20 @@ impl Ledger {
                 (key, plans),
                 &arrival_density[(t - params.y0) as usize],
             );
-            // This year's cells were recorded market by market; order them
-            // by (kind, class) after the earlier years' (every lookup
-            // searches cells by (year, kind, class)).
-            blocks.par_iter_mut().for_each(|b| {
-                for cells in [&mut b.union_f, &mut b.union_m] {
-                    let from = cells.partition_point(|c| c.year < t);
-                    cells[from..].sort_by_key(|c| (c.kind, c.class));
-                }
-            });
+            sort_year_cells(&mut blocks, t);
 
             // 4. Mortality over the year; the survivors are next year's base.
-            alive = 0.0;
-            for (b, pool) in pools.iter_mut().enumerate() {
+            // Each pool on its own core; the living are then summed in pool
+            // order, so the total is the same on any number of cores.
+            let living = |b: usize| {
                 let age = t - blocks[b].year;
-                if age < 0 || age as u32 > MAX_AGE {
-                    continue;
+                (0..=MAX_AGE as i32).contains(&age)
+            };
+            pools.par_iter_mut().enumerate().for_each(|(b, pool)| {
+                if !living(b) {
+                    return;
                 }
+                let age = t - blocks[b].year;
                 let f = params.heritage.mortality_factor(blocks[b].heritage, t);
                 let q = [
                     params
@@ -1296,17 +1768,27 @@ impl Ledger {
                     for ((never, living), q) in c.never.iter_mut().zip(&mut c.alive).zip(q) {
                         *never *= 1.0 - q;
                         *living *= 1.0 - q;
-                        alive += *living;
                     }
                 }
-                for (d, q) in pool.div.iter_mut().zip(q) {
-                    if age > MAX_REMARRIAGE_AGE {
-                        // Too old to re-partner: retire every source.
-                        d.years.clear();
-                        continue;
+                for (ds, q) in pool.div.iter_mut().zip(q) {
+                    for (_, d) in ds.iter_mut() {
+                        if age > MAX_REMARRIAGE_AGE {
+                            // Too old to re-partner: retire every source.
+                            d.years.clear();
+                            continue;
+                        }
+                        d.factor *= 1.0 - q;
+                        d.retire_years();
                     }
-                    d.factor *= 1.0 - q;
-                    d.retire_years();
+                }
+            });
+            alive = 0.0;
+            for (b, pool) in pools.iter().enumerate() {
+                if living(b) {
+                    for c in &pool.cohorts {
+                        alive += c.alive[0];
+                        alive += c.alive[1];
+                    }
                 }
             }
         }
@@ -1328,6 +1810,7 @@ impl Ledger {
             class_moves,
             arrival_density,
             plan_tables,
+            couple_moves,
         }
     }
 
@@ -1384,24 +1867,36 @@ fn arrive(
     let block_of = |year: i32, g: usize| ((year - first_year) as usize) * groups + g;
     // Share ever partnered by each age under this year's schedule, per sex.
     let ever: [Vec<f64>; 2] = [Sex::Female, Sex::Male].map(|sex| {
-        let mut never = 1.0;
-        (0..=MAX_ARRIVAL_AGE)
-            .map(|a| {
-                let e = 1.0 - never;
-                never *= 1.0 - params.unions.first_union_hazard(sex, a as u32, t);
-                e
-            })
-            .collect()
+        cumulative_incidence(MAX_ARRIVAL_AGE, |a| {
+            params.unions.first_union_hazard(sex, a as u32, t)
+        })
     });
     let partnered = |sex: Sex, age: i32| ever[sex as usize][age as usize];
-    for (r, &nr) in apportion(arriving, &group_w).iter().enumerate() {
+    for (r, &nr) in apportion_largest_remainder(arriving, &group_w)
+        .iter()
+        .enumerate()
+    {
         let men_share = params
             .heritage
             .immigrant_male_share(Heritage((r % heritages) as u8), t)
             .unwrap_or_else(|| im.male_share(t));
+        // `r` is the group; arrivals live in its region (area mode).
+        let arrival_area = if params.places.by_area {
+            (r / heritages) as u16
+        } else {
+            0
+        };
         // Couples: wives by age, then husbands by the age-gap kernel, never
         // more than `max_husband_younger` years younger.
-        let couples = (im.couple_share(t) * nr as f64 / 2.0).round() as u64;
+        // Rounded without bias: a group's few arrivals a year still arrive
+        // as couples at the couple share.
+        let couples = round_unbiased(
+            im.couple_share(t) * nr as f64 / 2.0,
+            key.with(TAG_ARRIVAL_COUPLES)
+                .with2(t as u64, r as u64)
+                .unit(),
+        )
+        .min(nr / 2);
         let singles = nr - 2 * couples;
         let wife_w: Vec<f64> = ages
             .iter()
@@ -1415,7 +1910,10 @@ fn arrive(
             })
             .collect();
         let mut pairs: Vec<(i32, i32, u64)> = Vec::new();
-        for (&aw, &n) in ages.iter().zip(&apportion(couples, &wife_w)) {
+        for (&aw, &n) in ages
+            .iter()
+            .zip(&apportion_largest_remainder(couples, &wife_w))
+        {
             if n == 0 {
                 continue;
             }
@@ -1430,7 +1928,7 @@ fn arrive(
                     }
                 })
                 .collect();
-            for (&am, &k) in ages.iter().zip(&apportion(n, &husband_w)) {
+            for (&am, &k) in ages.iter().zip(&apportion_largest_remainder(n, &husband_w)) {
                 if k > 0 {
                     pairs.push((aw, am, k));
                 }
@@ -1440,8 +1938,8 @@ fn arrive(
         let single_men = ((men_share * (2 * couples + singles) as f64).round() as i64
             - couples as i64)
             .clamp(0, singles as i64) as u64;
-        let single_f = apportion(singles - single_men, &age_w);
-        let single_m = apportion(single_men, &age_w);
+        let single_f = apportion_largest_remainder(singles - single_men, &age_w);
+        let single_m = apportion_largest_remainder(single_men, &age_w);
         // Per block: couple women, couple men, single women, single men.
         let mut per_block: BTreeMap<usize, [u64; 4]> = BTreeMap::new();
         for &(aw, am, n) in &pairs {
@@ -1461,6 +1959,7 @@ fn arrive(
             cohort_of.insert(b, blocks[b].cohorts.len() as u16);
             blocks[b].cohorts.push(Cohort {
                 arrival: Some(t),
+                class: None,
                 size: f + m,
                 females: f,
                 mothers: Vec::new(),
@@ -1469,6 +1968,7 @@ fn arrive(
             blocks[b].females += f;
             let mut pool = CohortPool::new(f, m, [sf as f64, sm as f64]);
             pool.used = [cf, cm];
+            pool.arrival = true;
             pools[b].cohorts.push(pool);
             let year = blocks[b].year;
             add_nonunion_births(
@@ -1514,25 +2014,30 @@ fn arrive(
             let cells = class_cells(
                 t,
                 CellKind::Arrival,
+                arrival_area,
                 &mut partners,
                 &[(cohort as u32, n)],
                 Members::Cohorts,
                 ckey.with3(t as u64, bf as u64, 0),
             );
             for cell in cells {
-                let pk = plan_key(plans.root, bf, t, CellKind::Arrival, cell.class);
+                let pk = area_key(
+                    plan_key(plans.root, bf, t, CellKind::Arrival, cell.class),
+                    arrival_area,
+                    params.places.by_area,
+                );
                 let mca = params.immigration.min_couple_age;
                 let h = blocks[bf as usize].heritage;
                 for leaf in arrival_plans(cell.total, t, age, pk, dens, plans.tables, h, mca) {
                     let (in_world, abroad) = arrival_births(&leaf, age, cell.class, params);
                     let count = leaf.plan.count;
-                    for o in bits(in_world) {
+                    for o in ones(in_world) {
                         let year = t + o;
                         if year <= params.y1 {
                             births.at(year, bf).0 += count;
                         }
                     }
-                    for c in bits(abroad) {
+                    for c in ones(abroad) {
                         *kids.entry((block_of(t - c, r), bf)).or_default() += count;
                     }
                 }
@@ -1551,6 +2056,7 @@ fn arrive(
             let cells = class_cells(
                 t,
                 CellKind::Arrival,
+                arrival_area,
                 &mut partners,
                 &[(cohort as u32, n)],
                 Members::Cohorts,
@@ -1582,18 +2088,19 @@ fn arrive(
         for (b, mothers) in by_child {
             let size: u64 = mothers.iter().map(|m| m.union_births).sum();
             let male = params.male_share_at_birth;
-            let f = apportion(size, &[1.0 - male, male])[0];
+            let f = apportion_largest_remainder(size, &[1.0 - male, male])[0];
             blocks[b].cohorts.push(Cohort {
                 arrival: Some(t),
+                class: None,
                 size,
                 females: f,
                 mothers,
             });
             blocks[b].size += size;
             blocks[b].females += f;
-            pools[b]
-                .cohorts
-                .push(CohortPool::new(f, size - f, [f as f64, (size - f) as f64]));
+            let mut pool = CohortPool::new(f, size - f, [f as f64, (size - f) as f64]);
+            pool.arrival = true;
+            pools[b].cohorts.push(pool);
             let year = blocks[b].year;
             add_nonunion_births(
                 births,
@@ -1608,17 +2115,6 @@ fn arrive(
     }
 }
 
-/// Set bits of a mask, as offsets.
-fn bits(mut mask: u32) -> impl Iterator<Item = i32> {
-    std::iter::from_fn(move || {
-        (mask != 0).then(|| {
-            let b = mask.trailing_zeros() as i32;
-            mask &= mask - 1;
-            b
-        })
-    })
-}
-
 /// Record a block's non-union births in the years `[from, to]`.
 fn add_nonunion_births(
     births: &mut Births,
@@ -1629,14 +2125,128 @@ fn add_nonunion_births(
     to: i32,
     (params, h): (&Params, Heritage),
 ) {
+    add_nonunion_births_in(
+        births,
+        mother,
+        females,
+        block_year,
+        from,
+        to,
+        (params, h),
+        (0, None),
+    );
+}
+
+/// Non-union births of a cohort's `females`, in the area the cohort lives
+/// in at each birth (`(own, class)`: the block's area, and the cohort's
+/// migration class).
+#[allow(clippy::too_many_arguments)]
+fn add_nonunion_births_in(
+    births: &mut Births,
+    mother: u32,
+    females: u64,
+    block_year: i32,
+    from: i32,
+    to: i32,
+    (params, h): (&Params, Heritage),
+    (own, class): (u16, Option<(u16, i32)>),
+) {
     let factor = params.heritage.fertility_factor(h, block_year + 25);
     for leaf in nonunion_plans(females, block_year, &params.fertility, factor) {
         for k in 0..leaf.births as usize {
             let year = block_year + leaf.ages[k] as i32;
             if (from..=to).contains(&year) {
-                births.at(year, mother).1 += leaf.count;
+                let area = match class {
+                    Some((dest, moves)) if year >= moves => dest,
+                    _ => own,
+                };
+                births.in_area(year, mother, area, own).1 += leaf.count;
             }
         }
+    }
+}
+
+/// Area mode: split block `b`'s natives (its only cohort so far) into the
+/// stayers and migration classes, in the block and its pool, and record
+/// each native cohort's non-union births in its areas. Otherwise just the
+/// natives' non-union births.
+#[allow(clippy::too_many_arguments)]
+fn settle_natives(
+    b: usize,
+    blocks: &mut [Block],
+    pools: &mut [Pool],
+    births: &mut Births,
+    migration: Option<&Migration>,
+    params: &Params,
+    after: i32,
+    key: Key,
+) {
+    let block = &mut blocks[b];
+    let pool = &mut pools[b];
+    let (year, h, own) = (block.year, block.heritage, pool.own);
+    if let Some(mig) = migration {
+        let natives = block.cohorts[0].clone();
+        let (f, m) = (natives.females, natives.size - natives.females);
+        let classes = mig.classes(
+            params,
+            year,
+            own,
+            f,
+            m,
+            after,
+            key.with2(TAG_MIGRATION, b as u64),
+        );
+        let base = pool.cohorts[0];
+        let scale = |x: f64, part: u64, whole: u64| {
+            if whole == 0 {
+                0.0
+            } else {
+                x * part as f64 / whole as f64
+            }
+        };
+        let (mut f0, mut m0) = (f, m);
+        for &(dest, moves, cf, cm) in &classes {
+            f0 -= cf;
+            m0 -= cm;
+            block.cohorts.push(Cohort {
+                arrival: None,
+                class: Some((dest, moves)),
+                size: cf + cm,
+                females: cf,
+                mothers: Vec::new(),
+            });
+            let mut c = CohortPool::new(
+                cf,
+                cm,
+                [scale(base.never[0], cf, f), scale(base.never[1], cm, m)],
+            );
+            c.alive = [scale(base.alive[0], cf, f), scale(base.alive[1], cm, m)];
+            c.dest = dest;
+            c.moves = moves;
+            pool.cohorts.push(c);
+        }
+        block.cohorts[0].size = f0 + m0;
+        block.cohorts[0].females = f0;
+        let c0 = &mut pool.cohorts[0];
+        *c0 = CohortPool {
+            never: [scale(base.never[0], f0, f), scale(base.never[1], m0, m)],
+            alive: [scale(base.alive[0], f0, f), scale(base.alive[1], m0, m)],
+            size: [f0, m0],
+            ..base
+        };
+    }
+    let from = (year + 1).max(params.y0 + 1);
+    for c in &blocks[b].cohorts {
+        add_nonunion_births_in(
+            births,
+            b as u32,
+            c.females,
+            year,
+            from,
+            params.y1,
+            (params, h),
+            (own, c.class),
+        );
     }
 }
 
@@ -1645,14 +2255,30 @@ fn add_nonunion_births(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Who {
     block: u32,
+    /// The area the seekers live in (area mode; 0 otherwise).
+    area: u16,
     divorced: bool,
 }
 
 impl Who {
-    /// Key code for rounding: the block and the status.
+    /// Key code for rounding: the block, the area and the status.
     fn code(self) -> u64 {
-        (self.block as u64) << 1 | self.divorced as u64
+        (self.area as u64) << 33 | (self.block as u64) << 1 | self.divorced as u64
     }
+}
+
+/// One block's seekers in one area this year: desired unions by sex
+/// (`Sex as usize`), never partnered and divorced.
+#[derive(Clone, Copy, Debug)]
+struct Seeker {
+    block: u32,
+    /// The area they live in (area mode; 0 otherwise).
+    area: u16,
+    /// The region whose markets they join: their area in area mode, the
+    /// block's lineage region otherwise.
+    region: u16,
+    never: [Option<f64>; 2],
+    div: [Option<f64>; 2],
 }
 
 /// A market: opposite-sex (rows women, columns men), or one sex's same-sex
@@ -1700,11 +2326,49 @@ impl Market {
     }
 }
 
+/// Every market kernel value by birth-year gap: the kernels depend only on
+/// the gap and the partners' statuses, so they are tabled once.
+struct Kernels {
+    /// `[opposite (row divorced, column divorced) × 4, same-sex][gap + GAPS]`.
+    values: [Vec<f64>; 5],
+}
+
+/// Gaps beyond this many years (never between two living seekers) are
+/// computed directly.
+const GAPS: i32 = 128;
+
+impl Kernels {
+    fn new(u: &Unions) -> Self {
+        let table = |f: &dyn Fn(i32) -> f64| (-GAPS..=GAPS).map(f).collect::<Vec<f64>>();
+        let opp = |row: bool, col: bool| table(&|gap| Market::Opposite.kernel(gap, row, col, u));
+        Self {
+            values: [
+                opp(false, false),
+                opp(false, true),
+                opp(true, false),
+                opp(true, true),
+                table(&|gap| Market::Same(Sex::Female).kernel(gap, false, false, u)),
+            ],
+        }
+    }
+
+    fn at(&self, market: Market, gap: i32, row: bool, col: bool, u: &Unions) -> f64 {
+        if gap.abs() > GAPS {
+            return market.kernel(gap, row, col, u);
+        }
+        let k = match market {
+            Market::Opposite => (row as usize) << 1 | col as usize,
+            Market::Same(_) => 4,
+        };
+        self.values[k][(gap + GAPS) as usize]
+    }
+}
+
 /// A market's couples by row and column seeker.
 type Pairs = FxHashMap<(Who, Who), u64>;
 
 /// One market's key, kind, row seekers and column seekers.
-type Seekers = (u64, Market, Vec<(Who, f64)>, Vec<(Who, f64)>);
+type MarketSeekers = (u64, Market, Vec<(Who, f64)>, Vec<(Who, f64)>);
 
 /// Clear one year's markets and record the merged cells.
 ///
@@ -1727,11 +2391,23 @@ type Seekers = (u64, Market, Vec<(Who, f64)>, Vec<(Who, f64)>);
 /// kinds), split into dissolution classes and recorded as one cell per
 /// block, sex, kind and class.
 #[allow(clippy::too_many_arguments)]
+/// The kind of a market a seeker's wants are shared into ([`clear_year`]).
+#[derive(Clone, Copy)]
+enum Share {
+    Local,
+    National,
+    Open,
+    RegionOpen,
+    SameHeritage,
+    SameOpen,
+    SameLocal,
+    SameRegion,
+}
+
 fn clear_year(
     t: i32,
     params: &Params,
-    (want_f, want_m): (&[Option<f64>], &[Option<f64>]),
-    (div_f, div_m): (&[Option<f64>], &[Option<f64>]),
+    wanting: &[Seeker],
     blocks: &mut [Block],
     pools: &mut [Pool],
     births: &mut Births,
@@ -1742,35 +2418,79 @@ fn clear_year(
 ) {
     let groups = params.group_count();
     let heritages = params.heritage_count();
+    let regions = groups / heritages;
     let sigma = (params.unions.same_sex_share(t) * params.same_sex_boost).min(0.5);
     let rho = if params.region_count() > 1 {
         params.unions.national_market_share(t)
     } else {
         0.0
     };
-    let omega = |b: usize, sex: Sex| {
-        (params
-            .heritage
-            .open_market_share(t, blocks[b].heritage, sex)
-            * params.open_market_boost)
-            .min(1.0)
+    // The open-market share by heritage and sex, once for the year.
+    let omegas: Vec<[f64; 2]> = (0..heritages)
+        .map(|h| {
+            [Sex::Female, Sex::Male].map(|sex| {
+                (params.heritage.open_market_share(t, Heritage(h as u8), sex)
+                    * params.open_market_boost)
+                    .min(1.0)
+            })
+        })
+        .collect();
+    let omega = |b: usize, sex: Sex| omegas[blocks[b].heritage.index()][sex as usize];
+    // The seekers of each market, by index into `wanting` (in block order):
+    // by group (region × heritage), by heritage, by region, and everyone.
+    let mut of_group: Vec<Vec<usize>> = vec![Vec::new(); groups];
+    let mut of_heritage: Vec<Vec<usize>> = vec![Vec::new(); heritages];
+    let mut of_region: Vec<Vec<usize>> = vec![Vec::new(); regions];
+    for (i, sk) in wanting.iter().enumerate() {
+        let h = blocks[sk.block as usize].heritage.index();
+        of_group[sk.region as usize * heritages + h].push(i);
+        of_heritage[h].push(i);
+        of_region[sk.region as usize].push(i);
+    }
+    let everyone: Vec<usize> = (0..wanting.len()).collect();
+    // The opposite-sex share of a status's wants (first unions lose the
+    // same-sex share; re-partnering is opposite-sex only).
+    let opposite = |divorced: bool| if divorced { 1.0 } else { 1.0 - sigma };
+    // With local open markets, the open and same-sex markets split like the
+    // heritage ones: a share per region and the national share across.
+    let local_open = params.unions.local_open_markets && rho > 0.0;
+    let open_local = if local_open { 1.0 - rho } else { 0.0 };
+    let (same_local, same_national) = if local_open {
+        (1.0 - rho, rho)
+    } else {
+        (0.0, 1.0)
     };
-    // A market's seekers: every block passing `member`, each status's
-    // wants times `share(block, divorced)`.
-    let parts = |never: &[Option<f64>],
-                 div: &[Option<f64>],
-                 member: &dyn Fn(&Block) -> bool,
-                 share: &dyn Fn(usize, bool) -> f64|
-     -> Vec<(Who, f64)> {
+    // A seeker's share of its wants in a market of kind `s`.
+    let share = |s: Share, sex: Sex, b: usize, divorced: bool| -> f64 {
+        let w = omega(b, sex);
+        match s {
+            Share::Local => opposite(divorced) * (1.0 - w) * (1.0 - rho),
+            Share::National => opposite(divorced) * (1.0 - w) * rho,
+            Share::Open => opposite(divorced) * w * (1.0 - open_local),
+            Share::RegionOpen => opposite(divorced) * w * open_local,
+            Share::SameHeritage => sigma / 2.0 * (1.0 - w) * same_national,
+            Share::SameOpen => sigma / 2.0 * w * same_national,
+            Share::SameLocal => sigma / 2.0 * (1.0 - w) * same_local,
+            Share::SameRegion => sigma / 2.0 * w * same_local,
+        }
+    };
+    // A market's seekers: the listed seekers, each status's wants times
+    // their share; `with_div` adds the divorced.
+    let parts = |sex: Sex, members: &[usize], with_div: bool, s: Share| -> Vec<(Who, f64)> {
+        let si = sex as usize;
         let mut out = Vec::new();
-        for (b, (&n, &d)) in never.iter().zip(div).enumerate() {
-            if !member(&blocks[b]) {
-                continue;
-            }
-            for (w, divorced) in [(n, false), (d, true)] {
-                if let Some(w) = w.map(|w| w * share(b, divorced)).filter(|&w| w > 0.0) {
+        for &i in members {
+            let sk = &wanting[i];
+            let b = sk.block as usize;
+            let div = if with_div { sk.div[si] } else { None };
+            for (w, divorced) in [(sk.never[si], false), (div, true)] {
+                if let Some(w) = w
+                    .map(|w| w * share(s, sex, b, divorced))
+                    .filter(|&w| w > 0.0)
+                {
                     let who = Who {
-                        block: b as u32,
+                        block: sk.block,
+                        area: sk.area,
                         divorced,
                     };
                     out.push((who, w));
@@ -1779,71 +2499,88 @@ fn clear_year(
         }
         out
     };
-    let none = vec![None; want_f.len()];
-    // The opposite-sex share of a status's wants (first unions lose the
-    // same-sex share; re-partnering is opposite-sex only).
-    let opposite = |divorced: bool| if divorced { 1.0 } else { 1.0 - sigma };
-    let local_share = |sex: Sex| {
-        move |b: usize, divorced: bool| opposite(divorced) * (1.0 - omega(b, sex)) * (1.0 - rho)
-    };
-    let national_share =
-        |sex: Sex| move |b: usize, divorced: bool| opposite(divorced) * (1.0 - omega(b, sex)) * rho;
-    let open_share = |sex: Sex| move |b: usize, divorced: bool| opposite(divorced) * omega(b, sex);
-    let everyone = |_: &Block| true;
+    // Ids of the markets added by local open markets, after the others.
+    let extra = (groups + heritages + 1 + 2 * (heritages + 1)) as u64;
+    let (fe, ma) = (Sex::Female, Sex::Male);
 
-    // Every market's participants, before any cell is recorded.
-    let mut seekers: Vec<Seekers> = Vec::new();
-    for g in 0..groups {
-        let member = |bl: &Block| bl.group as usize == g;
-        seekers.push((
-            g as u64,
-            Market::Opposite,
-            parts(want_f, div_f, &member, &local_share(Sex::Female)),
-            parts(want_m, div_m, &member, &local_share(Sex::Male)),
-        ));
+    // Every market, in order: its id, kind, members and share.
+    let mut defs: Vec<(u64, Market, &[usize], Share)> = Vec::new();
+    for (g, members) in of_group.iter().enumerate() {
+        defs.push((g as u64, Market::Opposite, members, Share::Local));
     }
     if rho > 0.0 {
-        for h in (0..heritages).map(|h| Heritage(h as u8)) {
-            let member = |bl: &Block| bl.heritage == h;
-            seekers.push((
-                (groups + h.index()) as u64,
+        for (h, members) in of_heritage.iter().enumerate() {
+            defs.push((
+                (groups + h) as u64,
                 Market::Opposite,
-                parts(want_f, div_f, &member, &national_share(Sex::Female)),
-                parts(want_m, div_m, &member, &national_share(Sex::Male)),
+                members,
+                Share::National,
             ));
         }
     }
-    seekers.push((
+    defs.push((
         (groups + heritages) as u64,
         Market::Opposite,
-        parts(want_f, div_f, &everyone, &open_share(Sex::Female)),
-        parts(want_m, div_m, &everyone, &open_share(Sex::Male)),
+        &everyone,
+        Share::Open,
     ));
-    let opposite_markets = seekers.len();
-    // Same-sex: each sex's seekers split into a left and a right half,
-    // paired like women and men; per heritage, then one open market.
-    for (sex, want) in [(Sex::Female, want_f), (Sex::Male, want_m)] {
-        let base = (groups + heritages + 1 + sex as usize * (heritages + 1)) as u64;
-        for h in (0..heritages).map(|h| Heritage(h as u8)) {
-            let member = |bl: &Block| bl.heritage == h;
-            let share = |b: usize, _: bool| sigma / 2.0 * (1.0 - omega(b, sex));
-            let half = parts(want, &none, &member, &share);
-            seekers.push((
-                base + h.index() as u64,
-                Market::Same(sex),
-                half.clone(),
-                half,
+    if local_open {
+        for (r, members) in of_region.iter().enumerate() {
+            defs.push((
+                extra + r as u64,
+                Market::Opposite,
+                members,
+                Share::RegionOpen,
             ));
         }
-        let share = |b: usize, _: bool| sigma / 2.0 * omega(b, sex);
-        let half = parts(want, &none, &everyone, &share);
-        seekers.push((
-            base + heritages as u64,
-            Market::Same(sex),
-            half.clone(),
-            half,
-        ));
     }
+    let opposite_markets = defs.len();
+    // Same-sex: each sex's seekers split into a left and a right half,
+    // paired like women and men; per heritage, then one open market. With
+    // local open markets, each heritage market splits into a part per
+    // region and the national part, and so does the open one.
+    let mut same_markets = [0usize; 2];
+    for sex in [fe, ma] {
+        let before = defs.len();
+        let base = (groups + heritages + 1 + sex as usize * (heritages + 1)) as u64;
+        let same = Market::Same(sex);
+        for (h, members) in of_heritage.iter().enumerate() {
+            defs.push((base + h as u64, same, members, Share::SameHeritage));
+        }
+        defs.push((base + heritages as u64, same, &everyone, Share::SameOpen));
+        if local_open {
+            let sbase = extra + regions as u64 + sex as u64 * (groups + regions) as u64;
+            for (g, members) in of_group.iter().enumerate() {
+                defs.push((sbase + g as u64, same, members, Share::SameLocal));
+            }
+            for (r, members) in of_region.iter().enumerate() {
+                defs.push((
+                    sbase + (groups + r) as u64,
+                    same,
+                    members,
+                    Share::SameRegion,
+                ));
+            }
+        }
+        same_markets[sex as usize] = defs.len() - before;
+    }
+    // Every market's participants, before any cell is recorded; each is a
+    // pure function of the seekers, so they are listed on every core.
+    let seekers: Vec<MarketSeekers> = defs
+        .par_iter()
+        .map(|&(mk, market, members, s)| match market {
+            Market::Opposite => (
+                mk,
+                market,
+                parts(fe, members, true, s),
+                parts(ma, members, true, s),
+            ),
+            Market::Same(sex) => {
+                let half = parts(sex, members, false, s);
+                (mk, market, half.clone(), half)
+            }
+        })
+        .collect();
     let specs: Vec<MarketSpec> = seekers
         .iter()
         .map(|(mk, market, rows, cols)| MarketSpec {
@@ -1857,11 +2594,12 @@ fn clear_year(
     // Every market's matrix depends only on its participants (fixed above)
     // and the blocks' birth years, so all of them are solved at once; the
     // caps then apply in order, since they depend on earlier takings.
-    let solved: Vec<Sparse> = {
+    let kernels = Kernels::new(&params.unions);
+    let solved: Vec<SparseCounts> = {
         let blocks: &[Block] = blocks;
         specs
             .par_iter()
-            .map(|spec| solve_market(t, spec, blocks, key, &params.unions))
+            .map(|spec| solve_market(t, spec, blocks, key, &params.unions, &kernels))
             .collect()
     };
     let mut solved = specs.iter().zip(solved);
@@ -1887,7 +2625,7 @@ fn clear_year(
     // kind and class.
     for sex in [Sex::Female, Sex::Male] {
         let mut pairs = Pairs::default();
-        for (spec, x) in solved.by_ref().take(heritages + 1) {
+        for (spec, x) in solved.by_ref().take(same_markets[sex as usize]) {
             debug_assert!(spec.market == Market::Same(sex));
             apply_market(t, spec, x, pools, &mut pairs);
         }
@@ -1942,31 +2680,21 @@ fn split_classes(
 type ByBlock = Vec<(u32, Vec<(u8, u32, u64)>)>;
 
 /// A group's couples on one side, by block in ascending order: `side(e)`
-/// gives an entry's block and its `(class, partner block, couples)`. A
-/// counting sort, since blocks are small integers; each list keeps the
-/// split's order (class cells sort their own).
+/// gives an entry's block and its `(class, partner block, couples)`. Each
+/// list keeps the split's order (class cells sort their own).
 fn by_block(
     split: &ClassSplit,
     side: impl Fn(&(u32, u32, u8, u64)) -> (u32, (u8, u32, u64)),
 ) -> ByBlock {
-    let Some(max) = split.iter().map(|e| side(e).0).max() else {
-        return Vec::new();
-    };
-    let mut count = vec![0u32; max as usize + 1];
-    for e in split {
-        count[side(e).0 as usize] += 1;
-    }
-    let mut out = Vec::new();
-    let mut slot = vec![u32::MAX; max as usize + 1];
-    for (b, &k) in count.iter().enumerate() {
-        if k > 0 {
-            slot[b] = out.len() as u32;
-            out.push((b as u32, Vec::with_capacity(k as usize)));
+    // A stable sort by block keeps each block's entries in split order.
+    let mut entries: Vec<(u32, (u8, u32, u64))> = split.iter().map(&side).collect();
+    entries.sort_by_key(|e| e.0);
+    let mut out: ByBlock = Vec::new();
+    for (b, p) in entries {
+        match out.last_mut() {
+            Some(last) if last.0 == b => last.1.push(p),
+            _ => out.push((b, vec![p])),
         }
-    }
-    for e in split {
-        let (b, p) = side(e);
-        out[slot[b as usize] as usize].1.push(p);
     }
     out
 }
@@ -2085,19 +2813,26 @@ fn deisolate(split: &mut ClassSplit) -> u64 {
 /// isolated couple appears.
 fn defer_isolated(pairs: &mut Pairs, market: Market, pools: &mut [Pool]) {
     let (rsex, csex) = market.sexes();
-    let mut per_row: FxHashMap<(u32, CellKind), u64> = FxHashMap::default();
-    let mut per_col: FxHashMap<(u32, CellKind), u64> = FxHashMap::default();
+    // A cell is (block, kind, area): the couple's area is the row's.
+    let mut per_row: FxHashMap<(u32, CellKind, u16), u64> = FxHashMap::default();
+    let mut per_col: FxHashMap<(u32, CellKind, u16), u64> = FxHashMap::default();
     for (&(rw, cw), &n) in pairs.iter() {
         let (kf, km) = market.kinds(rw, cw);
-        *per_row.entry((rw.block, kf)).or_default() += n;
-        *per_col.entry((cw.block, km)).or_default() += n;
+        *per_row.entry((rw.block, kf, rw.area)).or_default() += n;
+        *per_col.entry((cw.block, km, rw.area)).or_default() += n;
     }
     pairs.retain(|&(rw, cw), &mut n| {
         let (kf, km) = market.kinds(rw, cw);
-        let isolated = n == 1 && per_row[&(rw.block, kf)] == 1 && per_col[&(cw.block, km)] == 1;
+        let isolated = n == 1
+            && per_row[&(rw.block, kf, rw.area)] == 1
+            && per_col[&(cw.block, km, rw.area)] == 1;
         if isolated {
-            pools[rw.block as usize].taken[kf as usize][rsex as usize] -= 1;
-            pools[cw.block as usize].taken[km as usize][csex as usize] -= 1;
+            // Both sides' wants are carried to next year.
+            for (w, kind, sex) in [(rw, kf, rsex), (cw, km, csex)] {
+                let pool = &mut pools[w.block as usize];
+                pool.taken_mut(w.area)[kind as usize][sex as usize] -= 1;
+                pool.carry_one(w.area, sex, w.divorced);
+            }
         }
         !isolated
     });
@@ -2123,15 +2858,36 @@ fn record(
     class_moves: &mut u64,
 ) {
     let (rsex, csex) = market.sexes();
-    let mut groups: BTreeMap<(CellKind, CellKind), FxHashMap<(u32, u32), u64>> = BTreeMap::new();
+    let areas_on = plans.params.places.by_area;
+    // Cells are per kind and area: a couple lives in the row's (the woman's,
+    // or the left partner's) area.
+    type Grouped = BTreeMap<(CellKind, CellKind, u16), FxHashMap<(u32, u32), u64>>;
+    let mut groups: Grouped = BTreeMap::new();
+    // Each side's members by block and the area they live in (the column
+    // side can join the row's area from another one).
+    type Areas = BTreeMap<(CellKind, CellKind, u16), [BTreeMap<u32, Vec<(u16, u64)>>; 2]>;
+    let mut member_areas: Areas = BTreeMap::new();
     for (&(rw, cw), &n) in pairs {
+        let (kf, km) = market.kinds(rw, cw);
         *groups
-            .entry(market.kinds(rw, cw))
+            .entry((kf, km, rw.area))
             .or_default()
             .entry((rw.block, cw.block))
             .or_default() += n;
+        let sides = member_areas.entry((kf, km, rw.area)).or_default();
+        for (side, w) in [(0, rw), (1, cw)] {
+            let list = sides[side].entry(w.block).or_default();
+            match list.iter_mut().find(|e| e.0 == w.area) {
+                Some(e) => e.1 += n,
+                None => list.push((w.area, n)),
+            }
+        }
     }
-    for ((kf, km), slices) in groups {
+    for ((kf, km, area), slices) in groups {
+        let sides = member_areas
+            .remove(&(kf, km, area))
+            .expect("both sides' areas");
+        let key = area_key(key, area, areas_on);
         let mut split = match market {
             Market::Opposite => split_classes(
                 &slices,
@@ -2147,7 +2903,11 @@ fn record(
         // couples)`.
         let by_row = by_block(&split, |&(a, b, c, n)| (a, (c, b, n)));
         let by_col = by_block(&split, |&(a, b, c, n)| (b, (c, a, n)));
-        for (sex, kind, grouped) in [(rsex, kf, by_row), (csex, km, by_col)] {
+        for (side_i, (sex, kind, grouped)) in [(rsex, kf, by_row), (csex, km, by_col)]
+            .into_iter()
+            .enumerate()
+        {
+            let areas_of = &sides[side_i];
             // Each block's cells, plans and sources touch only that block
             // and its pool, so the blocks are recorded on every core; their
             // births (sums) are merged after, so the result is the same.
@@ -2155,30 +2915,46 @@ fn record(
             // not across threads.
             let mut grouped = grouped;
             let mut tasks = Vec::with_capacity(grouped.len());
-            let mut next = grouped.iter_mut().peekable();
-            for (b, (block, pool)) in blocks.iter_mut().zip(pools.iter_mut()).enumerate() {
-                if next.peek().is_some_and(|g| g.0 as usize == b) {
-                    let (_, partners) = next.next().unwrap();
-                    tasks.push((b as u32, partners, block, pool));
-                }
+            // Each block's `&mut`, taken by splitting the slices at the
+            // group's blocks (ascending), not by walking every block.
+            let (mut rest_b, mut rest_p): (&mut [Block], &mut [Pool]) =
+                (&mut blocks[..], &mut pools[..]);
+            let mut base = 0usize;
+            for (b, partners) in grouped.iter_mut() {
+                let skip = *b as usize - base;
+                let (block, tail_b) = std::mem::take(&mut rest_b)[skip..]
+                    .split_first_mut()
+                    .expect("every block recorded");
+                let (pool, tail_p) = std::mem::take(&mut rest_p)[skip..]
+                    .split_first_mut()
+                    .expect("every pool recorded");
+                (rest_b, rest_p) = (tail_b, tail_p);
+                base = *b as usize + 1;
+                let mut ar = areas_of[b].clone();
+                ar.sort_unstable();
+                tasks.push((*b, partners, block, pool, ar));
             }
-            assert!(next.next().is_none(), "every block recorded");
             let side = Side {
                 t,
                 sex,
                 kind,
+                area,
                 key,
                 plans,
             };
-            let born: Vec<(u32, [u64; 32])> = tasks
+            let born: Vec<(u32, Born)> = tasks
                 .into_par_iter()
-                .map(|(b, partners, block, pool)| (b, side.record_block(b, partners, block, pool)))
+                .map(|(b, partners, block, pool, ar)| {
+                    (b, side.record_block(b, partners, block, pool, &ar))
+                })
                 .collect();
-            for (b, by_offset) in born {
-                for (o, &n) in by_offset.iter().enumerate() {
+            for (b, born) in born {
+                let own = pools[b as usize].own;
+                let here = born.here.iter().enumerate().map(|(o, &n)| (o as u8, area, n));
+                for (o, a, n) in here.chain(born.moved) {
                     let year = t + o as i32;
                     if n > 0 && year <= y1 {
-                        births.at(year, b).0 += n;
+                        births.in_area(year, b, a, own).0 += n;
                     }
                 }
             }
@@ -2193,6 +2969,8 @@ struct Side<'a> {
     t: i32,
     sex: Sex,
     kind: CellKind,
+    /// The cells' area (area mode; 0 otherwise).
+    area: u16,
     key: Key,
     plans: Plans<'a>,
 }
@@ -2209,44 +2987,75 @@ impl Side<'_> {
         partners: &mut [(u8, u32, u64)],
         block: &mut Block,
         pool: &mut Pool,
-    ) -> [u64; 32] {
+        member_areas: &[(u16, u64)],
+    ) -> Born {
         let Self {
             t,
             sex,
             kind,
+            area,
             key,
             plans,
         } = *self;
         let n: u64 = partners.iter().map(|p| p.2).sum();
         let age = t - block.year;
-        let (members, from) = if kind.second() {
-            let skey =
-                key.with(TAG_SETTLE)
-                    .with3(t as u64, b as u64, (kind as u64) << 1 | sex as u64);
-            (
-                pool.settle_div(kind, sex, t, skey, &plans.params.repartnering),
-                Members::Sources,
-            )
+        // Each area the members live in settles its own takings (the cell
+        // is in the union's area, `area`).
+        let mut members: Vec<(u32, u64)> = Vec::new();
+        let from = if kind.second() {
+            Members::Sources
         } else {
-            (pool.settle(kind, sex), Members::Cohorts)
+            Members::Cohorts
         };
+        for &(a, na) in member_areas {
+            if kind.second() {
+                let skey =
+                    key.with(TAG_SETTLE)
+                        .with3(t as u64, b as u64, (kind as u64) << 1 | sex as u64);
+                let skey = if a == area {
+                    skey
+                } else {
+                    skey.with2(TAG_AREA, a as u64)
+                };
+                members.extend(pool.settle_div(
+                    kind,
+                    sex,
+                    t,
+                    skey,
+                    &plans.params.repartnering,
+                    a,
+                    na,
+                ));
+            } else {
+                members.extend(pool.settle(kind, sex, a, t, na));
+            }
+        }
+        members.sort_unstable();
         debug_assert_eq!(members.iter().map(|c| c.1).sum::<u64>(), n);
         let cells = class_cells(
             t,
             kind,
+            area,
             partners,
             &members,
             from,
             key.with(TAG_CONTINGENCY)
                 .with3(t as u64, b as u64, (kind as u64) << 1 | sex as u64),
         );
-        let mut born = [0u64; 32];
+        let mut born = Born {
+            here: [0; 32],
+            moved: Vec::new(),
+        };
         let mut leaves: Vec<PlanLeaf> = Vec::new();
         for cell in cells {
             // Opposite-sex women's plans give births; same-sex unions have
             // none in R1.
             if sex == Sex::Female && !kind.same_sex() {
-                let pk = plan_key(plans.root, b, t, kind, cell.class);
+                let pk = area_key(
+                    plan_key(plans.root, b, t, kind, cell.class),
+                    area,
+                    plans.params.places.by_area,
+                );
                 leaves.clear();
                 plans.tables.at(t, block.heritage).plans_into(
                     cell.total,
@@ -2254,11 +3063,35 @@ impl Side<'_> {
                     pk,
                     &mut leaves,
                 );
-                for leaf in &leaves {
+                // Area mode: each leaf splits over the couples' moves
+                // (stage 3); a child is born into the area of their
+                // upbringing, where the family lives when they turn
+                // `UPBRINGING_AGE` ([`upbringing_moved`]).
+                let moves = plans
+                    .moves
+                    .map(|m| (m, m.offsets(t, age, cutoff(cell.class))));
+                for (li, leaf) in leaves.iter().enumerate() {
                     let (offs, nb) =
                         leaf_births(leaf, age, cutoff(cell.class), &plans.params.fertility);
-                    for &o in &offs[..nb] {
-                        born[o as usize] += leaf.count;
+                    let mut add = |k: u8, dest: u16, n: u64| {
+                        for &o in &offs[..nb] {
+                            if upbringing_moved(o as i32, k, cutoff(cell.class)) {
+                                born.moved.push((o, dest, n));
+                            } else {
+                                born.here[o as usize] += n;
+                            }
+                        }
+                    };
+                    match &moves {
+                        Some((m, offsets)) => m.split(
+                            offsets,
+                            leaf.count,
+                            t,
+                            area,
+                            move_key(pk, li),
+                            &mut add,
+                        ),
+                        None => add(0, area, leaf.count),
                     }
                 }
             }
@@ -2269,7 +3102,11 @@ impl Side<'_> {
                 Sex::Male => &mut block.div_m,
             };
             for &(src, count) in &cell.sources {
-                div[src as usize].parts.push((t, kind, cell.class, count));
+                let d = &mut div[src as usize];
+                d.parts.push((t, kind, cell.class, count));
+                if plans.params.places.by_area {
+                    d.part_areas.push(cell.area);
+                }
             }
             add_source(block, pool, sex, &cell);
             match sex {
@@ -2279,6 +3116,33 @@ impl Side<'_> {
         }
         born
     }
+}
+
+/// A block side's plan births from one market group, by offset from the
+/// union year: in the cells' area, and (area mode) in the areas couples
+/// moved to, `(offset, area, births)`.
+struct Born {
+    here: [u64; 32],
+    moved: Vec<(u8, u16, u64)>,
+}
+
+/// The age at which a child's area of upbringing is taken: their block's
+/// area is where the family lives then (spec §2; stage 3).
+pub const UPBRINGING_AGE: i32 = 18;
+
+/// True if a child born `o` years after the union year grows up in the
+/// destination of the couple's move `k` years after it (`k = 0`: no move):
+/// the move comes by the child's `UPBRINGING_AGE` and the couple has not
+/// separated by then (a separated couple that moved returns to where it
+/// formed, spec §9). `cutoff` is the separation offset, if any.
+pub fn upbringing_moved(o: i32, k: u8, cutoff: Option<i32>) -> bool {
+    let at = o + UPBRINGING_AGE;
+    k > 0 && at >= k as i32 && cutoff.is_none_or(|c| at < c)
+}
+
+/// The key of plan leaf `li`'s move split (stage 3), shared with the world.
+pub fn move_key(plan_key: Key, li: usize) -> Key {
+    plan_key.with2(TAG_MOVES, li as u64)
 }
 
 /// One of a year's markets: its key, its seekers (rows and columns, each
@@ -2294,7 +3158,14 @@ struct MarketSpec<'a> {
 /// gap and statuses) and keyed rounding. Returns the row-major integer
 /// matrix before caps (empty if the market is). A pure function of the
 /// seekers and the blocks' birth years.
-fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key, u: &Unions) -> Sparse {
+fn solve_market(
+    t: i32,
+    spec: &MarketSpec,
+    blocks: &[Block],
+    key: Key,
+    u: &Unions,
+    kernels: &Kernels,
+) -> SparseCounts {
     let MarketSpec {
         mk,
         rows,
@@ -2303,169 +3174,106 @@ fn solve_market(t: i32, spec: &MarketSpec, blocks: &[Block], key: Key, u: &Union
     } = *spec;
     let (nr, nc) = (rows.len(), cols.len());
     if nr == 0 || nc == 0 {
-        return Sparse::default();
+        return SparseCounts::default();
     }
     let (sf, sm): (f64, f64) = (
         rows.iter().map(|p| p.1).sum(),
         cols.iter().map(|p| p.1).sum(),
     );
     if sf <= 0.0 || sm <= 0.0 {
-        return Sparse::default();
+        return SparseCounts::default();
     }
     let total = 2.0 * sf * sm / (sf + sm);
     let r: Vec<f64> = rows.iter().map(|p| p.1 * total / sf).collect();
     let c: Vec<f64> = cols.iter().map(|p| p.1 * total / sm).collect();
     // The kernel depends only on the birth-year gap and the statuses, so
-    // the IPF runs over (birth year, status) groups and each seeker takes
-    // its share of its group's margin: the fixed point `a_i b_j g(...)` has
-    // `a_i ∝ r_i` within a group, so `x_ij = X[g_i][g_j] · r_i / R[g_i] ·
-    // c_j / C[g_j]` exactly (R1 plan, R1b-1).
-    let group = |parts: &[(Who, f64)], margin: &[f64]| {
-        let mut keys: Vec<(i32, bool)> = parts
-            .iter()
-            .map(|&(w, _)| (blocks[w.block as usize].year, w.divorced))
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        let idx: Vec<usize> = parts
-            .iter()
-            .map(|&(w, _)| {
-                keys.binary_search(&(blocks[w.block as usize].year, w.divorced))
-                    .unwrap()
-            })
-            .collect();
-        let mut sums = vec![0.0; keys.len()];
-        for (&g, &v) in idx.iter().zip(margin) {
-            sums[g] += v;
-        }
-        (keys, idx, sums)
-    };
-    let (keys_f, gi, rs) = group(rows, &r);
-    let (keys_m, gj, cs) = group(cols, &c);
-    let (gr, gc) = (keys_f.len(), keys_m.len());
-    let mut g = vec![0.0; gr * gc];
-    for (a, &(yf, df)) in keys_f.iter().enumerate() {
-        for (b, &(ym, dm)) in keys_m.iter().enumerate() {
-            // age_col - age_row = year_row - year_col
-            g[a * gc + b] = market.kernel(yf - ym, df, dm, u);
-        }
-    }
-    ipf(&mut g, gr, gc, &rs, &cs);
-    let share = |v: f64, sum: f64| if sum > 0.0 { v / sum } else { 0.0 };
+    // the IPF runs over (birth year, status) classes and each seeker takes
+    // its share of its class's margin (R1 plan, R1b-1).
+    let class = |w: Who| (blocks[w.block as usize].year, w.divorced);
+    let row_keys: Vec<(i32, bool)> = rows.iter().map(|p| class(p.0)).collect();
+    let col_keys: Vec<(i32, bool)> = cols.iter().map(|p| class(p.0)).collect();
+    // age_col - age_row = year_row - year_col
+    let fit = GroupedIpf::new(
+        &row_keys,
+        &r,
+        &col_keys,
+        &c,
+        |&(yf, df), &(ym, dm)| kernels.at(market, yf - ym, df, dm, u),
+        IpfStop::DEFAULT,
+    );
 
-    // Keyed systematic rounding, row by row. Row i's expected couples with
-    // column j are `s_i · w_a(j)`, where `a` is the row's group, `s_i` its
-    // share of the group's margin and `w_a(j) = X[a][g_j] · c_j / C[g_j]`.
-    // So each row group has one cumulative weight over the columns, and a
-    // row places points `u, u + 1, ...` (`u` keyed by the row) along
-    // `s_i · W_a`: every cell gets the floor or ceiling of its expectation,
-    // exactly in expectation, and the row's total is within one of its
-    // expectation. Cost: O(groups · columns + couples · log columns)
-    // instead of a draw per cell.
+    // Keyed systematic rounding, row by row, in two levels: a row's points
+    // fall first in a column class (its class's weights over the column
+    // classes), then in a column of that class (the class's shares, the
+    // same for every row). Every cell gets the floor or ceiling of its
+    // expectation, exactly in expectation, and the row's total is within
+    // one of its expectation. Cost: O(classes² + columns + couples · log)
+    // instead of a draw per cell or a `classes × columns` table.
     let key = key.with2(t as u64, mk);
-    let col_share: Vec<f64> = (0..nc).map(|j| share(c[j], cs[gj[j]])).collect();
-    let (gj_ref, col_share_ref) = (&gj, &col_share);
-    let cum: Vec<f64> = (0..gr)
-        .into_par_iter()
-        .flat_map_iter(|a| {
-            let (gj, col_share) = (gj_ref, col_share_ref);
-            let grow = &g[a * gc..(a + 1) * gc];
-            let mut acc = 0.0;
-            (0..nc).map(move |j| {
-                acc += grow[gj[j]] * col_share[j];
-                acc
-            })
-        })
+    let fit = &fit;
+    let by = fit.columns_by_class();
+    let gc = fit.cols.keys.len();
+    let class_cum: Vec<f64> = (0..fit.rows.keys.len())
+        .flat_map(|a| fit.class_weights_cumulative(a, &by))
         .collect();
     // Each row is a pure function of its seeker, so rows round in parallel.
     let rows_out: Vec<Vec<(u32, u64)>> = (0..nr)
         .into_par_iter()
         .map(|i| {
-            let w = &cum[gi[i] * nc..(gi[i] + 1) * nc];
-            let s = share(r[i], rs[gi[i]]);
-            let total = s * w[nc - 1];
+            let a = fit.rows.of[i];
             let mut out: Vec<(u32, u64)> = Vec::new();
-            if total.is_nan() || total <= 0.0 {
-                return out;
-            }
-            let mut p = key.with(rows[i].0.code()).unit();
-            while p < total {
-                // The first column whose cumulative weight passes p.
-                let j = w.partition_point(|&x| x * s <= p).min(nc - 1) as u32;
-                match out.last_mut() {
-                    Some((last, n)) if *last == j => *n += 1,
-                    _ => out.push((j, 1)),
-                }
-                p += 1.0;
-            }
+            fit.round_row(
+                i,
+                &by,
+                &class_cum[a * gc..(a + 1) * gc],
+                key.with(rows[i].0.code()).unit(),
+                |j, n| out.push((j as u32, n)),
+            );
+            out.sort_unstable();
             out
         })
         .collect();
-    let mut x = Sparse {
-        start: Vec::with_capacity(nr + 1),
-        col: Vec::new(),
-        n: Vec::new(),
-    };
-    for row in rows_out {
-        x.start.push(x.col.len() as u32);
-        for (j, k) in row {
-            x.col.push(j);
-            x.n.push(k);
-        }
-    }
-    x.start.push(x.col.len() as u32);
-    x
-}
-
-/// A market's integer matrix as sparse rows: row i's entries are
-/// `start[i]..start[i + 1]`, by increasing column.
-#[derive(Default)]
-struct Sparse {
-    start: Vec<u32>,
-    col: Vec<u32>,
-    n: Vec<u64>,
+    SparseCounts::from_rows(rows_out)
 }
 
 /// Apply a solved market's matrix `x`: capacity caps, then the takings in
 /// the pools by cell kind, and the couples added to `pairs`. Rows' takings
 /// count against the columns' caps when both sides share a pool (same-sex
 /// markets), so a pool is never over-drawn.
-fn apply_market(t: i32, spec: &MarketSpec, mut x: Sparse, pools: &mut [Pool], pairs: &mut Pairs) {
-    if x.col.is_empty() {
+fn apply_market(
+    t: i32,
+    spec: &MarketSpec,
+    mut x: SparseCounts,
+    pools: &mut [Pool],
+    pairs: &mut Pairs,
+) {
+    if x.is_empty() {
         return;
     }
     let MarketSpec {
         rows, cols, market, ..
     } = *spec;
-    let (nr, nc) = (rows.len(), cols.len());
+    let nc = cols.len();
     let (rsex, csex) = market.sexes();
-    let row_range = |i: usize| x.start[i] as usize..x.start[i + 1] as usize;
     // Caps: never more unions than expected available survivors, and never
     // more than the seeker's available members. Rows first; their takings
     // count against the columns' caps when both sides share a pool.
     let mut row_take: FxHashMap<Who, u64> = FxHashMap::default();
     for (i, &(rw, _)) in rows.iter().enumerate() {
-        let row = &mut x.n[row_range(i)];
-        trim(row, pools[rw.block as usize].cap(rsex, rw.divorced, t));
+        let range = x.row(i);
+        // Most seekers get no couple in a given market.
+        if range.is_empty() {
+            continue;
+        }
+        let row = &mut x.n[range];
+        trim_largest_first(
+            row,
+            pools[rw.block as usize].cap(rsex, rw.divorced, t, rw.area),
+        );
         *row_take.entry(rw).or_default() += row.iter().sum::<u64>();
     }
-    // Entries by column, rows ascending (a counting sort).
-    let mut col_start = vec![0u32; nc + 1];
-    for &j in &x.col {
-        col_start[j as usize + 1] += 1;
-    }
-    for j in 0..nc {
-        col_start[j + 1] += col_start[j];
-    }
-    let mut by_col = vec![(0u32, 0u32); x.col.len()];
-    let mut fill = col_start.clone();
-    for i in 0..nr {
-        for e in row_range(i) {
-            let j = x.col[e] as usize;
-            by_col[fill[j] as usize] = (i as u32, e as u32);
-            fill[j] += 1;
-        }
-    }
+    // Entries by column, rows ascending.
+    let (col_start, by_col) = x.column_index(nc);
     let mut col: Vec<u64> = Vec::new();
     for (j, &(cw, _)) in cols.iter().enumerate() {
         let entries = &by_col[col_start[j] as usize..col_start[j + 1] as usize];
@@ -2477,11 +3285,11 @@ fn apply_market(t: i32, spec: &MarketSpec, mut x: Sparse, pools: &mut [Pool], pa
             Market::Opposite => 0,
         };
         let cap = pools[cw.block as usize]
-            .cap(csex, cw.divorced, t)
+            .cap(csex, cw.divorced, t, cw.area)
             .saturating_sub(shared);
         col.clear();
         col.extend(entries.iter().map(|&(_, e)| x.n[e as usize]));
-        trim(&mut col, cap);
+        trim_largest_first(&mut col, cap);
         for (&(i, e), v) in entries.iter().zip(&col) {
             let cut = x.n[e as usize] - v;
             if cut > 0 {
@@ -2493,37 +3301,16 @@ fn apply_market(t: i32, spec: &MarketSpec, mut x: Sparse, pools: &mut [Pool], pa
 
     // Record the takings by cell kind and add the matrix to the pairs.
     for (i, &(rw, _)) in rows.iter().enumerate() {
-        for e in row_range(i) {
+        for e in x.row(i) {
             let n = x.n[e];
             if n > 0 {
                 let cw = cols[x.col[e] as usize].0;
                 let (kf, km) = market.kinds(rw, cw);
-                pools[rw.block as usize].taken[kf as usize][rsex as usize] += n;
-                pools[cw.block as usize].taken[km as usize][csex as usize] += n;
+                pools[rw.block as usize].taken_mut(rw.area)[kf as usize][rsex as usize] += n;
+                pools[cw.block as usize].taken_mut(cw.area)[km as usize][csex as usize] += n;
                 *pairs.entry((rw, cw)).or_default() += n;
             }
         }
-    }
-}
-
-/// Reduce `cells` until they sum to at most `cap`, taking from the largest
-/// cell first (ties: lowest index).
-fn trim(cells: &mut [u64], cap: u64) {
-    let mut sum: u64 = cells.iter().sum();
-    if sum <= cap {
-        return;
-    }
-    // Cutting the largest cell either empties it or ends the trim, so the
-    // cells are taken once each in (size descending, index) order.
-    let mut order: Vec<usize> = (0..cells.len()).filter(|&i| cells[i] > 0).collect();
-    order.sort_unstable_by(|&a, &b| cells[b].cmp(&cells[a]).then(a.cmp(&b)));
-    for i in order {
-        if sum <= cap {
-            break;
-        }
-        let cut = (sum - cap).min(cells[i]);
-        cells[i] -= cut;
-        sum -= cut;
     }
 }
 
@@ -2542,18 +3329,27 @@ mod tests {
                     .iter()
                     .map(|m| m.union_births + m.nonunion_births)
                     .sum();
-                assert_eq!(s, b.cohorts[0].size, "block {}", b.year);
+                let natives: u64 = b
+                    .cohorts
+                    .iter()
+                    .filter(|c| c.arrival.is_none())
+                    .map(|c| c.size)
+                    .sum();
+                assert_eq!(s, natives, "block {}", b.year);
             }
             assert_eq!(b.cohorts.iter().map(|c| c.size).sum::<u64>(), b.size);
             assert_eq!(b.cohorts.iter().map(|c| c.females).sum::<u64>(), b.females);
-            assert!(b.cohorts[1..].iter().all(|c| c.arrival.is_some()));
+            // Natives (the stayers, then migration classes) come first.
+            let n_native = b.cohorts.iter().take_while(|c| c.arrival.is_none()).count();
+            assert!(n_native >= 1);
+            assert!(b.cohorts[n_native..].iter().all(|c| c.arrival.is_some()));
         }
         // Cells split exactly over cohorts; nobody partners before the
         // year after arrival, and no cohort partners more members than it has.
         let immigrants: u64 = l
             .blocks
             .iter()
-            .flat_map(|b| &b.cohorts[1..])
+            .flat_map(|b| b.cohorts.iter().filter(|c| c.arrival.is_some()))
             .map(|c| c.size)
             .sum();
         assert!(immigrants > 500, "only {immigrants} immigrants");
@@ -2679,64 +3475,5 @@ mod tests {
             assert!(left.keys().any(|k| k.1 == kind), "no {kind:?} unions");
         }
         assert!(l.population() > 1000);
-    }
-
-    #[test]
-    fn capped_apportionment_is_exact_and_capped() {
-        assert_eq!(apportion_capped(10, &[1.0, 1.0], &[2, 20]), vec![2, 8]);
-        assert_eq!(apportion_capped(5, &[0.0, 0.0], &[3, 3]), vec![3, 2]);
-        assert_eq!(apportion_capped(0, &[1.0], &[0]), vec![0]);
-        let caps = [5u64, 0, 7, 100, 1];
-        for n in 0..=113 {
-            let v = apportion_capped(n, &[3.0, 9.0, 0.5, 0.1, 2.0], &caps);
-            assert_eq!(v.iter().sum::<u64>(), n);
-            assert!(v.iter().zip(&caps).all(|(a, c)| a <= c));
-        }
-    }
-
-    #[test]
-    fn sweep_is_exact_capped_and_proportional() {
-        let weights = [0.5, 0.0, 2.0, 1.0, 0.25];
-        let caps = [3u64, 4, 2, 5, 9];
-        for n in 0..=caps.iter().sum::<u64>() {
-            for seed in 0..40 {
-                let mut got = [0u64; 5];
-                sweep(
-                    n,
-                    5,
-                    |k| (weights[k], caps[k]),
-                    Key::from_seed(seed).unit(),
-                    |k, c| got[k] += c,
-                );
-                assert_eq!(got.iter().sum::<u64>(), n);
-                assert!(got.iter().zip(&caps).all(|(g, c)| g <= c));
-            }
-        }
-        // Small takings follow the weights on average.
-        let mut sums = [0u64; 5];
-        let trials = 20_000;
-        for seed in 0..trials {
-            sweep(
-                1,
-                5,
-                |k| (weights[k], caps[k]),
-                Key::from_seed(seed).unit(),
-                |k, c| sums[k] += c,
-            );
-        }
-        let total: f64 = weights.iter().sum();
-        for (s, w) in sums.iter().zip(weights) {
-            assert!((*s as f64 / trials as f64 - w / total).abs() < 0.01);
-        }
-    }
-
-    #[test]
-    fn trim_respects_cap() {
-        let mut v = vec![5, 9, 1, 9];
-        trim(&mut v, 10);
-        assert_eq!(v.iter().sum::<u64>(), 10);
-        let mut v = vec![1, 2];
-        trim(&mut v, 10);
-        assert_eq!(v, vec![1, 2]);
     }
 }

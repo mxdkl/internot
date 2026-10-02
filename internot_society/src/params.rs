@@ -16,7 +16,14 @@ use std::path::Path;
 use internot_def::{
     Bands, BySex, DefError, Dir, Embedded, EmbeddedFile, Pack, Ranges, Series, Steps, VecSeries,
 };
-use procedural_core::dmath::{exp, ln};
+use procedural_core::curve::{
+    dilated, gaussian_bump, gaussian_kernel, log_logistic_cdf, logistic_floor_quantile,
+    logistic_rise, ramp, rogers_castro_labour, symmetrized,
+};
+use procedural_core::fit::tilt_mean;
+use procedural_core::interp::{bracket, lerp, log_lerp, piecewise_linear};
+use procedural_core::life::{cure_hazard, Siler};
+use procedural_core::pmf::{floored, mix_into, normalized, one_fewer_or_none, spread_evenly};
 use serde::Deserialize;
 
 /// The packs compiled into the binary (`worlds/` at build time).
@@ -112,6 +119,11 @@ pub struct Params {
     pub immigration: Immigration,
     pub heritage: Heritages,
     pub households: Households,
+    pub residence: Residence,
+    pub places: PlacesSection,
+    /// The place tree's data (`places.ron`'s `data` file), parsed by
+    /// [`crate::residence::Places::from_params`].
+    pub place_data: std::sync::Arc<[u8]>,
     pub names: Names,
     /// The pack's name tables (`names.data`), shared by every world built
     /// from the same bytes.
@@ -219,10 +231,14 @@ impl Params {
             immigration: pack.section("immigration")?,
             heritage: pack.section("heritage")?,
             households: pack.section("households")?,
+            residence: pack.section("residence")?,
+            places: pack.section("places")?,
+            place_data: std::sync::Arc::from(&[][..]),
             names: pack.section("names")?,
             name_data: std::sync::Arc::new(crate::names::NameData::empty()),
         };
         let mut p = p;
+        p.place_data = std::sync::Arc::from(pack.data(&p.places.data)?);
         p.name_data = crate::names::NameData::cached(pack.data(&p.names.data)?)
             .map_err(|m| DefError::invalid(pack.name(), &p.names.data, "", m))?;
         p.validate(pack.name())?;
@@ -248,9 +264,7 @@ impl Params {
     /// `mix` with every share raised to at least [`Params::heritage_floor`],
     /// renormalized.
     pub fn floored(&self, mix: &[f64]) -> Vec<f64> {
-        let raised: Vec<f64> = mix.iter().map(|m| m.max(self.heritage_floor)).collect();
-        let sum: f64 = raised.iter().sum();
-        raised.iter().map(|m| m / sum).collect()
+        floored(mix, self.heritage_floor)
     }
 
     fn validate(&self, pack: &str) -> Result<(), DefError> {
@@ -628,6 +642,111 @@ impl Params {
                 "band_years and epoch_years must be at least 1".into(),
             ));
         }
+
+        // residence.ron
+        let r = &self.residence;
+        let rate = |at: &str, st: &Steps| {
+            check(
+                "residence.ron",
+                at,
+                st.validate().and_then(|()| {
+                    if st.steps.iter().all(|s| s.1 >= 0.0) && st.above >= 0.0 {
+                        Ok(())
+                    } else {
+                        Err("rates must be non-negative".into())
+                    }
+                }),
+            )
+        };
+        rate("local.by_age", &r.local.by_age)?;
+        rate("long.by_age", &r.long.by_age)?;
+        check(
+            "residence.ron",
+            "local.era",
+            r.local.era.validate_within(0.0, 100.0),
+        )?;
+        check(
+            "residence.ron",
+            "long.era",
+            r.long.era.validate_within(0.0, 100.0),
+        )?;
+        check(
+            "residence.ron",
+            "local.levels",
+            shares_sum_to_one(&r.local.levels.as_array()),
+        )?;
+        for (at, l) in [
+            ("formation.leave_home", &r.formation.leave_home),
+            ("formation.union", &r.formation.union),
+            ("formation.separation", &r.formation.separation),
+        ] {
+            check("residence.ron", at, l.validate())?;
+        }
+        if r.local.frailty_variance.is_nan() || r.local.frailty_variance < 0.0 {
+            return Err(err(
+                "residence.ron",
+                "local.frailty_variance",
+                "must be non-negative".into(),
+            ));
+        }
+        for (at, g) in [("gravity", &r.gravity), ("local_gravity", &r.local_gravity)] {
+            if g.flat_miles.is_nan()
+                || g.flat_miles <= 0.0
+                || g.segments.windows(2).any(|w| w[0].0 >= w[1].0)
+                || g.segments.first().is_some_and(|s| s.0 <= g.flat_miles)
+            {
+                return Err(err(
+                    "residence.ron",
+                    at,
+                    "needs flat_miles > 0 and segment ends increasing past it".into(),
+                ));
+            }
+        }
+        share("residence.ron", "long.own_region", r.long.own_region)?;
+        share("residence.ron", "union_source_woman", r.union_source_woman)?;
+        share("residence.ron", "union_keep", r.union_keep)?;
+        share("residence.ron", "stays.woman", r.stays.woman)?;
+        share("residence.ron", "stays.man", r.stays.man)?;
+        if r.stays.woman + r.stays.man > 1.0 {
+            return Err(err(
+                "residence.ron",
+                "stays",
+                "woman + man must be at most 1".into(),
+            ));
+        }
+
+        // places.ron
+        let ids: Vec<&str> = self.regions.iter().map(|r| r.id.as_str()).collect();
+        let pl = &self.places;
+        for (i, sr) in pl.regions.iter().enumerate() {
+            if !ids.contains(&sr.region.as_str()) {
+                return Err(err(
+                    "places.ron",
+                    &format!("regions[{i}]"),
+                    format!("`{}` is not a region of world.ron", sr.region),
+                ));
+            }
+        }
+        if !pl.by_area && !ids.contains(&pl.others.as_str()) {
+            return Err(err(
+                "places.ron",
+                "others",
+                format!("`{}` is not a region of world.ron", pl.others),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(s) = pl
+            .regions
+            .iter()
+            .flat_map(|r| &r.states)
+            .find(|&&s| !seen.insert(s))
+        {
+            return Err(err(
+                "places.ron",
+                "regions",
+                format!("state {s} is listed twice"),
+            ));
+        }
         Ok(())
     }
 }
@@ -640,63 +759,6 @@ fn unique_ids<'a>(ids: impl Iterator<Item = &'a str>) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Piecewise-linear interpolation over `n` anchors given by `year(i)` and
-/// `value(i)`, with [`Series::at`]'s exact arithmetic (no allocation).
-fn interp_with(
-    n: usize,
-    year: impl Fn(usize) -> i32,
-    value: impl Fn(usize) -> f64,
-    at: i32,
-) -> f64 {
-    let y = at as f64;
-    if y <= year(0) as f64 {
-        return value(0);
-    }
-    for i in 1..n {
-        if y <= year(i) as f64 {
-            let f = (y - year(i - 1) as f64) / (year(i) - year(i - 1)) as f64;
-            return value(i - 1) + f * (value(i) - value(i - 1));
-        }
-    }
-    value(n - 1)
-}
-
-/// `pmf` exponentially tilted, `p_k θ^k` normalized, so its mean is `factor`
-/// times the original's (θ by 200 bisection steps on `ln θ`, so the result is
-/// the same on every machine). A factor of exactly 1 returns `pmf` as is.
-fn tilt<const N: usize>(pmf: [f64; N], factor: f64) -> [f64; N] {
-    if factor == 1.0 {
-        return pmf;
-    }
-    let mean = |x: f64| {
-        let (mut z, mut m) = (0.0, 0.0);
-        for (k, &p) in pmf.iter().enumerate() {
-            let w = p * exp(x * k as f64);
-            z += w;
-            m += w * k as f64;
-        }
-        m / z
-    };
-    let target = mean(0.0) * factor;
-    let (mut lo, mut hi) = (-20.0f64, 20.0f64);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        if mean(mid) < target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let x = 0.5 * (lo + hi);
-    let mut out = pmf;
-    let mut z = 0.0;
-    for (k, o) in out.iter_mut().enumerate() {
-        *o *= exp(x * k as f64);
-        z += *o;
-    }
-    out.map(|w| w / z)
 }
 
 // --- mortality ---------------------------------------------------------------------
@@ -736,74 +798,58 @@ impl Mortality {
     fn multipliers(&self, year: i32) -> [f64; 4] {
         let a = &self.multipliers;
         let v = |m: &MortalityAnchor| [m.infant, m.background_female, m.background_male, m.old];
-        let last = a.len() - 1;
-        let i = a.iter().position(|m| year <= m.year).unwrap_or(last + 1);
-        if i == 0 {
-            return v(&a[0]);
+        let b = bracket(a.len(), |i| a[i].year as f64, year as f64);
+        if b.clamped() {
+            return v(&a[b.lo]);
         }
-        if i > last {
-            return v(&a[last]);
-        }
-        let (y0, m0, y1, m1) = (a[i - 1].year, v(&a[i - 1]), a[i].year, v(&a[i]));
-        let f = (year - y0) as f64 / (y1 - y0) as f64;
-        let mut out = [0.0; 4];
-        for k in 0..4 {
-            out[k] = exp((1.0 - f) * ln(m0[k]) + f * ln(m1[k]));
-        }
-        out
+        let (m0, m1) = (v(&a[b.lo]), v(&a[b.hi]));
+        std::array::from_fn(|k| log_lerp(m0[k], m1[k], b.f))
     }
 
-    /// Siler parameters `(infant, background, old-age level, old-age slope)`
-    /// for `sex` in `year`.
-    fn siler(&self, sex: Sex, year: i32) -> (f64, f64, f64, f64) {
+    /// The Siler hazard for `sex` in `year`.
+    pub fn siler(&self, sex: Sex, year: i32) -> Siler {
         let [infant, bf, bm, old] = self.multipliers(year);
         let b = &self.base;
-        match sex {
+        let (background, old, slope) = match sex {
             Sex::Female => (
-                infant * b.infant,
                 bf * b.background.female,
                 old * b.old.female,
                 b.old_slope.female,
             ),
-            Sex::Male => (
-                infant * b.infant,
-                bm * b.background.male,
-                old * b.old.male,
-                b.old_slope.male,
-            ),
+            Sex::Male => (bm * b.background.male, old * b.old.male, b.old_slope.male),
+        };
+        Siler {
+            infant: infant * b.infant,
+            decay: self.infant_decay,
+            background,
+            old,
+            slope,
         }
     }
 
     /// Force of mortality at exact `age` in calendar `year`.
     pub fn hazard(&self, sex: Sex, age: f64, year: i32) -> f64 {
-        let (i, b, o, s) = self.siler(sex, year);
-        i * exp(-self.infant_decay * age) + b + o * exp(s * age)
+        self.siler(sex, year).hazard(age)
     }
 
     /// [`Self::death_prob`] for a group whose infant term is scaled by
     /// `f.infant` and whose background and old-age terms by `f.adult`
     /// (heritage.ron). Factors of exactly 1 give [`Self::death_prob`]'s bits.
     pub fn death_prob_scaled(&self, sex: Sex, age: u32, year: i32, f: MortalityFactor) -> f64 {
-        let (i, b, o, s) = self.siler(sex, year);
-        self.integrate(i * f.infant, b * f.adult, o * f.adult, s, age)
+        let s = self.siler(sex, year);
+        Siler {
+            infant: s.infant * f.infant,
+            background: s.background * f.adult,
+            old: s.old * f.adult,
+            ..s
+        }
+        .year_death_prob(age)
     }
 
     /// Probability of dying within age `[a, a + 1)` during calendar year
-    /// `year`: `1 − exp(−H)` with `H` the hazard integrated over the year of
-    /// age, in closed form (each Siler term integrates exactly).
+    /// `year` ([`Siler::year_death_prob`]).
     pub fn death_prob(&self, sex: Sex, age: u32, year: i32) -> f64 {
-        let (i, b, o, s) = self.siler(sex, year);
-        self.integrate(i, b, o, s, age)
-    }
-
-    /// `1 − exp(−H)`, `H` the Siler hazard `(i, b, o, s)` integrated over
-    /// `[age, age + 1)`.
-    fn integrate(&self, i: f64, b: f64, o: f64, s: f64, age: u32) -> f64 {
-        let a = age as f64;
-        let k = self.infant_decay;
-        let infant = i * (exp(-k * a) - exp(-k * (a + 1.0))) / k;
-        let old = o * (exp(s * (a + 1.0)) - exp(s * a)) / s;
-        1.0 - exp(-(infant + b + old))
+        self.siler(sex, year).year_death_prob(age)
     }
 }
 
@@ -815,6 +861,11 @@ impl Mortality {
 pub struct Unions {
     pub first_union: FirstUnion,
     pub national_market_share: Series,
+    /// Open (cross-heritage) and same-sex markets run per region too, with
+    /// the national share across regions, as the heritage markets do (B at
+    /// area level: partners meet where they live). Off: they are national.
+    #[serde(default)]
+    pub local_open_markets: bool,
     pub same_sex_share: Series,
     pub age_gap: Ranges,
     pub repartnering_gap_factor: f64,
@@ -872,20 +923,8 @@ impl Unions {
         }
         let median = fu.median_female.at(year) + if sex == Sex::Male { fu.male_delay } else { 0.0 };
         let e = fu.ever_partnered.at(year);
-        let shape = fu.shape;
-        let origin = fu.origin;
-        // Log-logistic CDF relative to `origin`.
-        let cdf = |a: f64| {
-            let x = (a - origin).max(0.0) / (median - origin);
-            let xs = procedural_core::dmath::pow(x, shape);
-            xs / (1.0 + xs)
-        };
-        let (f0, f1) = (cdf(age as f64), cdf(age as f64 + 1.0));
-        let surv = 1.0 - e * f0;
-        if surv <= 1e-9 {
-            return 0.0;
-        }
-        (e * (f1 - f0) / surv).clamp(0.0, 1.0)
+        let cdf = |a: f64| log_logistic_cdf(a, fu.origin, median, fu.shape);
+        cure_hazard(e, cdf(age as f64), cdf(age as f64 + 1.0))
     }
 
     /// Share of each block's desired unions that goes to the national
@@ -907,12 +946,16 @@ impl Unions {
     /// Age-gap kernel for same-sex couples: the opposite-sex kernel made
     /// symmetric.
     pub fn same_sex_gap_weight(&self, gap: i32) -> f64 {
-        0.5 * (self.age_gap_weight(gap) + self.age_gap_weight(-gap))
+        symmetrized(|g| self.age_gap_weight(g), gap)
     }
 
     /// Age-gap kernel for unions with a divorced partner: wider.
     pub fn remarriage_gap_weight(&self, gap: i32) -> f64 {
-        self.age_gap_weight((gap as f64 * self.repartnering_gap_factor).round() as i32)
+        dilated(
+            |g| self.age_gap_weight(g),
+            gap,
+            self.repartnering_gap_factor,
+        )
     }
 
     /// Relative affinity of a union by whether each partner is divorced.
@@ -1013,7 +1056,9 @@ impl Fertility {
     /// exponentially tilted (`p_k θ^k`, normalized) until its mean is
     /// `factor` times the base mean. A factor of exactly 1 is the base.
     pub fn union_parity_pmf(&self, year: i32, factor: f64) -> [f64; 9] {
-        tilt(self.union_parity.at::<9>(year), factor)
+        let mut pmf = self.union_parity.at::<9>(year);
+        tilt_mean(&mut pmf, factor);
+        pmf
     }
 
     /// Parity pmf in a re-partnering union (R1c): with probability
@@ -1021,15 +1066,10 @@ impl Fertility {
     /// down; otherwise no birth. Mother-age truncation at [`MAX_BIRTH_AGE`]
     /// does the rest.
     pub fn second_union_parity_pmf(&self, year: i32, factor: f64) -> [f64; 9] {
-        let p = self.union_parity_pmf(year, factor);
-        let mut shifted = [0.0; 9];
-        for (k, &pk) in p.iter().enumerate() {
-            shifted[k.saturating_sub(1)] += pk;
-        }
-        let f = self.second_union_fertile;
-        let mut out = shifted.map(|x| f * x);
-        out[0] += 1.0 - f;
-        out
+        one_fewer_or_none(
+            &self.union_parity_pmf(year, factor),
+            self.second_union_fertile,
+        )
     }
 
     /// First-birth offsets in years after union start (1..=4), by era.
@@ -1037,9 +1077,7 @@ impl Fertility {
         let modern = self.first_birth.shift.at(year);
         let (hist, now) = (&self.first_birth.historical, &self.first_birth.modern);
         let mut out = [0.0; 4];
-        for k in 0..4 {
-            out[k] = hist[k] * (1.0 - modern) + now[k] * modern;
-        }
+        mix_into(&hist[..4], &now[..4], modern, &mut out);
         out
     }
 
@@ -1077,8 +1115,10 @@ impl Fertility {
         if !(MIN_BIRTH_AGE..MAX_BIRTH_AGE).contains(&age) {
             return 0.0;
         }
-        let x = (age - self.nonunion.age_peak) as f64;
-        exp(-x * x / (2.0 * self.nonunion.age_variance))
+        gaussian_kernel(
+            (age - self.nonunion.age_peak) as f64,
+            self.nonunion.age_variance,
+        )
     }
 }
 
@@ -1108,7 +1148,7 @@ impl Dissolution {
         let d = self.separation_share.at(year);
         let (old, new) = (&self.bands.early, &self.bands.late);
         let f = self.bands.shift.at(year);
-        let within: [f64; 5] = std::array::from_fn(|k| old[k] + f * (new[k] - old[k]));
+        let within: [f64; 5] = std::array::from_fn(|k| lerp(old[k], new[k], f));
         let mut out = [0.0; 6];
         out[0] = 1.0 - d;
         for k in 0..5 {
@@ -1140,9 +1180,7 @@ impl Dissolution {
                 } else {
                     0.0
                 };
-                for k in *lo..*hi {
-                    out[k as usize] = share / (hi - lo) as f64;
-                }
+                spread_evenly(&mut out, *lo as usize, *hi as usize, share);
             }
         }
         out
@@ -1192,8 +1230,7 @@ impl Immigration {
             return 0.0;
         }
         let p = &self.age_profile;
-        let x = (age - p.mu) as f64;
-        exp(-p.alpha * x - exp(-p.lambda * x))
+        rogers_castro_labour((age - p.mu) as f64, p.alpha, p.lambda)
     }
 
     /// Share of adult immigrants who arrive as a couple.
@@ -1325,12 +1362,6 @@ impl Heritages {
             .get(sex.is_female())
             .at(year)
     }
-}
-
-fn normalized(values: impl Iterator<Item = f64>) -> Vec<f64> {
-    let out: Vec<f64> = values.collect();
-    let sum: f64 = out.iter().sum();
-    out.iter().map(|m| m / sum).collect()
 }
 
 // --- names (N1) ---------------------------------------------------------------
@@ -1536,6 +1567,176 @@ impl Names {
     }
 }
 
+// --- residence (L4) -----------------------------------------------------------------
+
+/// `residence.ron`: how households move (spec `2026-10-01-residence.md`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Residence {
+    pub local: LocalMoves,
+    pub long: LongMoves,
+    pub gravity: Gravity,
+    pub local_gravity: Gravity,
+    pub formation: Formation,
+    pub union_source_woman: f64,
+    pub union_keep: f64,
+    pub stays: Stays,
+}
+
+/// Moves of a continuing household within its area, per year.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMoves {
+    pub by_age: Steps,
+    pub era: Series,
+    pub frailty_variance: f64,
+    pub levels: MoveLevels,
+}
+
+/// Shares of the level a local move redraws.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveLevels {
+    pub zone: f64,
+    pub county: f64,
+    pub cluster: f64,
+    pub tract: f64,
+}
+
+impl MoveLevels {
+    /// The shares as `[zone, county, cluster, tract]`.
+    pub fn as_array(&self) -> [f64; 4] {
+        [self.zone, self.county, self.cluster, self.tract]
+    }
+}
+
+/// Moves to another area, per person per year.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LongMoves {
+    pub by_age: Steps,
+    pub era: Series,
+    pub own_region: f64,
+}
+
+/// A piecewise power-law distance decay (miles): flat to `flat_miles`,
+/// then `(end, exponent)` segments, then `beyond`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gravity {
+    pub flat_miles: f64,
+    pub segments: Vec<(f64, f64)>,
+    pub beyond: f64,
+}
+
+/// Where new households form, relative to their source, per channel.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Formation {
+    pub leave_home: FormLevels,
+    pub union: FormLevels,
+    pub separation: FormLevels,
+}
+
+/// Shares of a new home's place relative to its source: the same tract,
+/// or a fresh draw from the county, cluster or tract level (within the
+/// source's zone).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormLevels {
+    pub same: f64,
+    pub county: f64,
+    pub cluster: f64,
+    pub tract: f64,
+}
+
+impl FormLevels {
+    /// The first level redrawn for a uniform `u`, in the residence tree's
+    /// numbering (2 county, 3 cluster, 4 tract), or 5 for the same tract.
+    pub fn level(&self, u: f64) -> u8 {
+        if u < self.county {
+            2
+        } else if u < self.county + self.cluster {
+            3
+        } else if u < self.county + self.cluster + self.tract {
+            4
+        } else {
+            5
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        shares_sum_to_one(&[self.same, self.county, self.cluster, self.tract])
+    }
+}
+
+/// Who keeps the home after a separation; the rest of the time neither does.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stays {
+    pub woman: f64,
+    pub man: f64,
+}
+
+fn shares_sum_to_one(a: &[f64]) -> Result<(), String> {
+    if a.iter().any(|x| !(0.0..=1.0).contains(x)) {
+        return Err("shares must lie in [0, 1]".into());
+    }
+    if (a.iter().sum::<f64>() - 1.0).abs() > 1e-9 {
+        return Err("shares must sum to 1".into());
+    }
+    Ok(())
+}
+
+/// `places.ron`: the place tree's data, and which lineage region each
+/// state's basins belong to.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacesSection {
+    pub data: String,
+    /// Each area is its own lineage region: the world region whose id is
+    /// the area's name (B at area level, spec `2026-10-01-ledger-areas.md`).
+    #[serde(default)]
+    pub by_area: bool,
+    #[serde(default)]
+    pub regions: Vec<StateRegion>,
+    #[serde(default)]
+    pub others: String,
+}
+
+/// The states of one lineage region (FIPS codes).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateRegion {
+    pub region: String,
+    pub states: Vec<u8>,
+}
+
+impl Params {
+    /// The lineage region (index into [`Params::regions`]) whose id is
+    /// `id`, if any.
+    pub fn region_by_id(&self, id: &str) -> Option<u16> {
+        self.regions
+            .iter()
+            .position(|r| r.id == id)
+            .map(|i| i as u16)
+    }
+
+    /// The lineage region (index into [`Params::regions`]) of state `fips`.
+    pub fn region_of_state(&self, fips: u8) -> u16 {
+        let id = self
+            .places
+            .regions
+            .iter()
+            .find(|r| r.states.contains(&fips))
+            .map_or(self.places.others.as_str(), |r| r.region.as_str());
+        self.regions
+            .iter()
+            .position(|r| r.id == id)
+            .expect("places.ron regions are checked against world.ron") as u16
+    }
+}
+
 // --- households (L3) ------------------------------------------------------------
 
 /// `households.ron`: leaving home, kin co-residence, custody, roommates.
@@ -1625,8 +1826,14 @@ impl Households {
             Sex::Female => &self.independence.female,
             Sex::Male => &self.independence.male,
         };
-        let at =
-            |k: usize| interp_with(a.len(), |i| a[i].0, |i| [a[i].1, a[i].2, a[i].3][k], cohort);
+        let at = |k: usize| {
+            piecewise_linear(
+                a.len(),
+                |i| a[i].0 as f64,
+                |i| [a[i].1, a[i].2, a[i].3][k],
+                cohort as f64,
+            )
+        };
         (at(0), at(1), at(2))
     }
 
@@ -1635,13 +1842,7 @@ impl Households {
     /// `S(a) = u`. `None` if they never do (`u` below the tail).
     pub fn independence_age(&self, sex: Sex, cohort: i32, u: f64) -> Option<f64> {
         let (m, s, tail) = self.independence_curve(sex, cohort);
-        if u < tail {
-            return None;
-        }
-        // (1 − tail) / (1 + exp((a − m)/s)) = u − tail.
-        let r = (1.0 - tail) / (u - tail) - 1.0;
-        let a = if r > 0.0 { m + s * ln(r) } else { 0.0 };
-        Some(a.max(self.independence.min_age))
+        logistic_floor_quantile(m, s, tail, u).map(|a| a.max(self.independence.min_age))
     }
 
     /// The probability that an elder unit lives with a child, by the unit's
@@ -1649,7 +1850,7 @@ impl Households {
     pub fn elder_coresidence(&self, age: f64, cohort: i32, single: bool) -> f64 {
         let e = &self.kin.elder;
         let level = if single { &e.single } else { &e.couple };
-        level.at(cohort) / (1.0 + exp(-(age - e.midpoint) / e.width))
+        logistic_rise(level.at(cohort), age, e.midpoint, e.width)
     }
 
     /// Propensity of an independent single adult to live with kin.
@@ -1665,7 +1866,7 @@ impl Households {
         let y = &self.kin.young_couple;
         let young = y.level.at(year);
         let young = if age < y.max_age {
-            young * (1.0 - ((age - y.from) / y.years).clamp(0.0, 1.0))
+            young * (1.0 - ramp(age, y.from, y.years, 0.0, 1.0))
         } else {
             0.0
         };
@@ -1677,9 +1878,7 @@ impl Households {
         if !(b.min_age..b.max_age).contains(&age) {
             return 0.0;
         }
-        let level = b.level.at(year);
-        let z = (age - b.peak) / b.width;
-        level * exp(-z * z)
+        b.level.at(year) * gaussian_bump(age, b.peak, b.width)
     }
 
     fn kin_other(&self, age: f64, year: i32) -> f64 {
@@ -1687,7 +1886,7 @@ impl Households {
         if age < o.from {
             return 0.0;
         }
-        o.level.at(year) * ((age - o.from) / o.years).clamp(o.floor, 1.0)
+        o.level.at(year) * ramp(age, o.from, o.years, o.floor, 1.0)
     }
 
     /// Probability that an eligible adult seeks roommates in an epoch.
@@ -1700,6 +1899,7 @@ impl Households {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use procedural_core::dmath::exp;
 
     fn us() -> Params {
         Params::prototype()

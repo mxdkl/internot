@@ -12,6 +12,9 @@
 //! Every type checks itself with `validate`, which returns a message for
 //! the caller to place (see [`crate::DefError::invalid`]).
 
+use procedural_core::interp::{
+    bracket, interval_value, lerp, piecewise_linear, step_at_most, step_below,
+};
 use serde::{Deserialize, Serialize};
 
 /// A value by calendar year: piecewise-linear between `(year, value)`
@@ -21,24 +24,11 @@ use serde::{Deserialize, Serialize};
 pub struct Series(pub Vec<(i32, f64)>);
 
 impl Series {
-    /// The value at `year`.
-    ///
-    /// The arithmetic is fixed (worlds are bit-identical across machines):
-    /// `a + f·(b − a)` with `f = (year − y_a) / (y_b − y_a)` in `f64`.
+    /// The value at `year` ([`piecewise_linear`]: `a + f·(b − a)` with
+    /// `f = (year − y_a) / (y_b − y_a)` in `f64`, the same on every machine).
     pub fn at(&self, year: i32) -> f64 {
-        let anchors = &self.0;
-        let y = year as f64;
-        if y <= anchors[0].0 as f64 {
-            return anchors[0].1;
-        }
-        for w in anchors.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if y <= b.0 as f64 {
-                let f = (y - a.0 as f64) / (b.0 - a.0) as f64;
-                return a.1 + f * (b.1 - a.1);
-            }
-        }
-        anchors[anchors.len() - 1].1
+        let a = &self.0;
+        piecewise_linear(a.len(), |i| a[i].0 as f64, |i| a[i].1, year as f64)
     }
 
     /// Anchors exist, years increase strictly, values are finite.
@@ -78,21 +68,11 @@ impl VecSeries {
     /// The components at `year`, written into `out` (no allocation).
     /// Panics unless `out.len() == self.width()`.
     pub fn at_into(&self, year: i32, out: &mut [f64]) {
-        let anchors = &self.0;
+        let a = &self.0;
         assert_eq!(out.len(), self.width(), "component count");
-        let y = year as f64;
-        let (lo, hi) = match anchors.iter().position(|a| y <= a.0 as f64) {
-            Some(0) => (0, 0),
-            Some(i) => (i - 1, i),
-            None => (anchors.len() - 1, anchors.len() - 1),
-        };
-        let f = if lo == hi {
-            0.0
-        } else {
-            (y - anchors[lo].0 as f64) / (anchors[hi].0 - anchors[lo].0) as f64
-        };
+        let b = bracket(a.len(), |i| a[i].0 as f64, year as f64);
         for (k, o) in out.iter_mut().enumerate() {
-            *o = anchors[lo].1[k] + f * (anchors[hi].1[k] - anchors[lo].1[k]);
+            *o = lerp(a[b.lo].1[k], a[b.hi].1[k], b.f);
         }
     }
 
@@ -149,10 +129,7 @@ pub struct Steps {
 impl Steps {
     /// The value at `x`.
     pub fn at(&self, x: i32) -> f64 {
-        self.steps
-            .iter()
-            .find(|s| x <= s.0)
-            .map_or(self.above, |s| s.1)
+        step_at_most(self.steps.iter().copied(), x, self.above)
     }
 
     /// Bounds increase strictly; values are finite.
@@ -181,10 +158,7 @@ pub struct Bands {
 impl Bands {
     /// The value at `x`.
     pub fn at(&self, x: f64) -> f64 {
-        self.below
-            .iter()
-            .find(|b| x < b.0)
-            .map_or(self.above, |b| b.1)
+        step_below(self.below.iter().copied(), x, self.above)
     }
 
     /// Bounds increase strictly; values are finite.
@@ -212,10 +186,7 @@ pub struct Ranges(pub Vec<(i32, i32, f64)>);
 impl Ranges {
     /// The value at `x` (the first range containing it), or 0.
     pub fn at(&self, x: i32) -> f64 {
-        self.0
-            .iter()
-            .find(|r| r.0 <= x && x <= r.1)
-            .map_or(0.0, |r| r.2)
+        interval_value(self.0.iter().copied(), x, 0.0)
     }
 
     /// Ranges are non-empty, disjoint and finite.

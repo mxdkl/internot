@@ -26,9 +26,13 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use procedural_core::dmath::ln;
+use procedural_core::fit::{rake_columns, raked_weight};
+use procedural_core::interp::first_above;
 use procedural_core::key::{label, Key};
+use procedural_core::pmf::normalized;
+use procedural_core::sample::exp1_by_inversion;
 use procedural_core::stream::{year_of, year_start};
+use procedural_core::table::CumTable;
 
 use crate::params::{Heritage, Sex};
 use crate::world::{PersonId, Union, World};
@@ -273,40 +277,9 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 // --- sampling tables ---------------------------------------------------------------
 
-/// Cumulative weights in fixed point (`u32`, the last entry `u32::MAX`) over
-/// a list of ids; a draw is a binary search.
-#[derive(Debug)]
-struct Table {
-    ids: Vec<u32>,
-    cum: Vec<u32>,
-}
-
-impl Table {
-    fn new(items: impl Iterator<Item = (u32, f64)>) -> Option<Table> {
-        let items: Vec<(u32, f64)> = items.filter(|x| x.1 > 0.0).collect();
-        let total: f64 = items.iter().map(|x| x.1).sum();
-        if items.is_empty() || total.is_nan() || total <= 0.0 {
-            return None;
-        }
-        let mut acc = 0.0;
-        let mut cum = Vec::with_capacity(items.len());
-        for &(_, w) in &items {
-            acc += w;
-            cum.push(((acc / total) * u32::MAX as f64).round() as u32);
-        }
-        *cum.last_mut().unwrap() = u32::MAX;
-        Some(Table {
-            ids: items.iter().map(|x| x.0).collect(),
-            cum,
-        })
-    }
-
-    fn draw(&self, key: Key) -> u32 {
-        let u = (key.bits() >> 32) as u32;
-        let i = self.cum.partition_point(|&c| c < u).min(self.ids.len() - 1);
-        self.ids[i]
-    }
-}
+/// A sampling table over name ids: fixed-point cumulative weights, a draw
+/// is a binary search.
+type Table = CumTable<u32>;
 
 /// One year and sex of first names: a table per heritage group.
 type YearTables = Vec<Option<Table>>;
@@ -396,13 +369,13 @@ impl World {
         let m = &self.ledger().params.unions.marriage;
         let k = u.key.with(TAG_MARRIAGE);
         let year = year_of(u.start);
-        let delay = |k: Key| (-ln(1.0 - k.unit()) * m.delay_years * YEAR) as i64;
+        let delay = |k: Key| (exp1_by_inversion(k.unit()) * m.delay_years * YEAR) as i64;
         let date = if self.sex(x) == self.sex(u.partner) {
             // The couple's legal date: the first year the legal share passes
             // their keyed draw.
             let v = k.with(1).unit();
             let (lo, hi) = (m.same_sex_legal.0[0].0, m.same_sex_legal.0.last()?.0);
-            let legal = (lo..=hi).find(|&y| m.same_sex_legal.at(y) > v)?;
+            let legal = first_above(lo, hi, |y| m.same_sex_legal.at(y), v)?;
             let earliest = u.start.max(year_start(legal));
             if earliest == u.start && k.unit() < m.at_start.at(year) {
                 earliest
@@ -555,11 +528,16 @@ impl World {
         let mut births = vec![0.0; groups];
         for b in self.ledger().blocks_of_year(year) {
             let block = &self.ledger().blocks[b as usize];
-            births[block.heritage.index()] += block.cohorts[0].size as f64;
+            births[block.heritage.index()] += block
+                .cohorts
+                .iter()
+                .filter(|c| c.arrival.is_none())
+                .map(|c| c.size)
+                .sum::<u64>() as f64;
         }
         let total_births: f64 = births.iter().sum();
         let pi: Vec<f64> = if total_births > 0.0 {
-            births.iter().map(|b| b / total_births).collect()
+            normalized(births.iter().copied())
         } else {
             vec![1.0 / groups as f64; groups]
         };
@@ -587,37 +565,17 @@ impl World {
             }
         };
         let total: f64 = rows.iter().map(|r| r.1 as f64).sum();
-        // Column factors `b` with w_ih = c_i q_ih b_h / Σ_h' q_ih' b_h'.
-        let mut b = vec![1.0; groups];
-        for _ in 0..60 {
-            let mut col = vec![0.0; groups];
-            for (i, &(_, c)) in rows.iter().enumerate() {
-                let z: f64 = (0..groups).map(|h| q(i, h) * b[h]).sum();
-                if z > 0.0 {
-                    for (h, col) in col.iter_mut().enumerate() {
-                        *col += c as f64 * q(i, h) * b[h] / z;
-                    }
-                }
-            }
-            for h in 0..groups {
-                if col[h] > 0.0 && pi[h] > 0.0 {
-                    b[h] *= pi[h] * total / col[h];
-                }
-            }
-        }
+        // Column factors `b` with w_ih = c_i q_ih b_h / Σ_h' q_ih' b_h', so
+        // every name keeps its count and each group gets its share.
+        let targets: Vec<f64> = pi.iter().map(|&p| p * total).collect();
+        let b = rake_columns(rows.len(), groups, |i| rows[i].1 as f64, q, &targets, 60);
         (0..groups)
             .map(|h| {
-                Table::new(rows.iter().enumerate().map(|(i, &(name, c))| {
-                    let z: f64 = (0..groups).map(|g| q(i, g) * b[g]).sum();
-                    (
-                        name,
-                        if z > 0.0 {
-                            c as f64 * q(i, h) * b[h] / z
-                        } else {
-                            0.0
-                        },
-                    )
-                }))
+                CumTable::new(
+                    rows.iter()
+                        .enumerate()
+                        .map(|(i, &(name, c))| (name, raked_weight(c as f64, |g| q(i, g), &b, h))),
+                )
             })
             .collect()
     }
@@ -635,7 +593,7 @@ impl World {
                 .flat_map(|sex| (0..groups).map(move |h| (sex, h)))
                 .map(|(sex, h)| {
                     let col = p.names.column(&p.heritage, d, Heritage(h as u8));
-                    Table::new((0..d.first.len() as u32).filter_map(|i| {
+                    CumTable::new((0..d.first.len() as u32).filter_map(|i| {
                         if d.in_ssa[i as usize] {
                             return None;
                         }
@@ -682,7 +640,7 @@ impl World {
                     } else {
                         1.0
                     };
-                    Table::new((0..d.surnames.len()).map(|s| {
+                    CumTable::new((0..d.surnames.len()).map(|s| {
                         let w = count(s) as f64;
                         (s as u32, if total(s) < rare { w * lift } else { w })
                     }))

@@ -1,5 +1,6 @@
-//! A fingerprint of whole worlds: a hash of every ledger block, and a
-//! checksum of kinship, union and household answers over sampled ids. Two
+//! A fingerprint of whole worlds: a hash of every ledger block, a checksum
+//! of kinship, union and household answers over sampled ids, and a hash of
+//! names (first, middle, surnames at several dates, marriage dates). Two
 //! builds with equal fingerprints give the same worlds; refactors that must
 //! not change the world (moving parameters into world packs, build-time
 //! work) are checked with it.
@@ -31,6 +32,13 @@ fn fingerprint(name: &str, w: &World, samples: usize) {
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);
     // Heritage groups print as their index whatever their representation.
     let mut blocks = format!("{:?}", ledger.blocks);
+    // Fields added for the area mode (2026-10-01) are hashed only when set,
+    // so worlds without areas keep their fingerprints.
+    blocks = blocks
+        .replace(", class: None", "")
+        .replace(", area: 0,", ",")
+        .replace(", part_areas: []", "")
+        .replace(", couple_moves: None", "");
     for (i, name) in ["White", "Black", "Aian", "Asian", "Hispanic"]
         .iter()
         .enumerate()
@@ -69,10 +77,33 @@ fn fingerprint(name: &str, w: &World, samples: usize) {
             }
         }
     }
-    println!("{name}: ledger+households {:016x}  lookups {sum:016x}", h.0);
+    // Names: first and middle names, marriage dates, and surnames at the
+    // dates the person is alive.
+    let mut nh = Fnv(0xcbf2_9ce4_8422_2325);
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    for _ in 0..samples / 4 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let id = (x % n) as PersonId;
+        write!(nh, "{} {:?}", w.first_name_id(id), w.middle_name_of(id)).unwrap();
+        for u in w.unions(id).into_iter().flatten() {
+            write!(nh, " m{:?}", w.marriage_date(id, &u)).unwrap();
+        }
+        for &t in &dates {
+            if w.alive_at(id, t) {
+                write!(nh, " {:?}", w.surname(id, t)).unwrap();
+            }
+        }
+        write!(nh, ";").unwrap();
+    }
+    println!(
+        "{name}: ledger+households {:016x}  lookups {sum:016x}  names {:016x}",
+        h.0, nh.0
+    );
 }
 
 fn main() {
-    fingerprint("tiny", &World::build(Params::tiny(), 7), 20_000);
-    fingerprint("prototype", &World::build(Params::prototype(), 42), 20_000);
+    fingerprint("tiny", &World::build_keeping_ledger(Params::tiny(), 7), 20_000);
+    fingerprint("prototype", &World::build_keeping_ledger(Params::prototype(), 42), 20_000);
 }

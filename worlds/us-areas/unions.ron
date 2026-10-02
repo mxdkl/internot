@@ -1,0 +1,9 @@
+// Markets by area: partners meet where they live. A small national
+// share pairs across areas (couples who met far apart); provisional,
+// calibrated on the share of natives living outside their birth state
+// (residence_realism) and on the about 25% of couples who lived more than
+// 50 km apart before moving in together (research note §5d).
+(
+    national_market_share: [(1840, 0.06), (1950, 0.08), (2020, 0.10)],
+    local_open_markets: true,
+)

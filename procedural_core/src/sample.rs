@@ -306,6 +306,103 @@ fn binomial_btpe(u: &mut Uniforms, n: u64, p: f64) -> u64 {
     }
 }
 
+/// Gamma draw with `shape` and `scale` (mean `shape · scale`), by
+/// Marsaglia & Tsang (2000): squeeze-and-reject on a transformed normal,
+/// attempt `i` keyed by `key.with(i)`, so the draw is a pure function of the
+/// key. A shape below 1 uses the boost `Γ(shape + 1) · U^(1/shape)`.
+/// Returns 0 for a non-positive shape or scale.
+pub fn gamma(key: Key, shape: f64, scale: f64) -> f64 {
+    if !(shape > 0.0 && scale > 0.0) {
+        return 0.0;
+    }
+    if shape < 1.0 {
+        let u = key.with(u64::MAX).unit_open0();
+        return gamma(key.with(u64::MAX - 1), shape + 1.0, scale) * pow(u, 1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    let mut i = 0u64;
+    loop {
+        let k = key.with(i);
+        i += 1;
+        let x = std_normal(k.with(1));
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v = v * v * v;
+        let u = k.with(2).unit_open0();
+        let x2 = x * x;
+        if u < 1.0 - 0.0331 * x2 * x2 || ln(u) < 0.5 * x2 + d * (1.0 - v + ln(v)) {
+            return d * v * scale;
+        }
+    }
+}
+
+/// A frailty: a gamma draw with mean 1 and variance `var` (1 if `var` is
+/// not positive), the standard multiplicative heterogeneity of a hazard.
+pub fn frailty(key: Key, var: f64) -> f64 {
+    if var > 0.0 {
+        gamma(key, 1.0 / var, var)
+    } else {
+        1.0
+    }
+}
+
+/// Exponential(1) by textbook inversion, `-ln(1 - u)` for `u ∈ [0, 1)`.
+///
+/// The same law as [`exp1_from_unit`], which uses `ln_1p` and is more
+/// accurate near 0; the two differ in the last bits, so a world keyed on one
+/// must keep it.
+#[inline]
+pub fn exp1_by_inversion(u: f64) -> f64 {
+    -ln(1.0 - u)
+}
+
+/// An index drawn by weight from a uniform `u ∈ [0, 1)` by a linear scan:
+/// `u` is scaled by the weights' total, and the first index whose
+/// cumulative weight passes it wins (0 if rounding leaves `u` past the end).
+#[inline]
+pub fn pick_linear(weights: &[f64], u: f64) -> usize {
+    let u = u * weights.iter().sum::<f64>();
+    let mut acc = 0.0;
+    weights
+        .iter()
+        .position(|&w| {
+            acc += w;
+            u < acc
+        })
+        .unwrap_or(0)
+}
+
+/// An exact draw of `X` conditioned on `X ≥ r`, where `r` is costly to
+/// compute but bracketed by cheap bounds `own ≤ r ≤ bound`.
+///
+/// `draw(req, key)` draws `X` conditioned on `X ≥ req` (by inversion, say).
+/// Stage 1 draws `A0 = draw(own, k1)` and keeps it if `A0 ≥ bound`, without
+/// computing `r`; otherwise `r = required()`, and `A0` is kept if `A0 ≥ r`,
+/// else stage 2 redraws `draw(r, k2)`. For `a ≥ r`, `P(a) = f(a)/S(own) +
+/// (1 − S(r)/S(own))·f(a)/S(r) = f(a)/S(r)`: exactly the conditional law.
+#[inline]
+pub fn lazy_conditional<T: PartialOrd + Copy>(
+    own: T,
+    bound: T,
+    required: impl FnOnce() -> T,
+    mut draw: impl FnMut(T, Key) -> T,
+    (k1, k2): (Key, Key),
+) -> T {
+    let a0 = draw(own, k1);
+    if a0 >= bound {
+        return a0;
+    }
+    let r = required();
+    if a0 >= r {
+        a0
+    } else {
+        draw(r, k2)
+    }
+}
+
 /// One Stirling-series error term from BTPE Step 52.
 #[inline]
 fn stirling_term(x: f64) -> f64 {
@@ -315,6 +412,41 @@ fn stirling_term(x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn gamma_moments() {
+        for &(shape, scale) in &[(0.4, 1.5), (1.0, 1.0), (2.0, 0.5), (3.3, 0.3), (12.0, 2.0)] {
+            let n = 200_000u64;
+            let root = Key::from_seed(4242).with((shape * 100.0) as u64);
+            let (mut s1, mut s2) = (0.0, 0.0);
+            for i in 0..n {
+                let x = gamma(root.with(i), shape, scale);
+                assert!(x >= 0.0);
+                s1 += x;
+                s2 += x * x;
+            }
+            let mean = s1 / n as f64;
+            let var = s2 / n as f64 - mean * mean;
+            let (m, v) = (shape * scale, shape * scale * scale);
+            assert!(
+                (mean - m).abs() < 0.01 * m.max(1.0),
+                "shape {shape}: mean {mean} vs {m}"
+            );
+            assert!(
+                (var - v).abs() < 0.03 * v.max(1.0),
+                "shape {shape}: var {var} vs {v}"
+            );
+        }
+        assert_eq!(gamma(Key::from_seed(1), 0.0, 1.0), 0.0);
+        assert_eq!(frailty(Key::from_seed(1), 0.0), 1.0);
+    }
+
+    #[test]
+    fn gamma_golden() {
+        let k = Key::from_seed(2026);
+        assert_eq!(gamma(k, 2.0, 0.5).to_bits(), 0x3FFC17991EB0592B);
+        assert_eq!(gamma(k.with(1), 0.4, 1.0).to_bits(), 0x3FEA1698B4E213E3);
+    }
     use super::*;
 
     fn mean_var(xs: impl Iterator<Item = f64>) -> (f64, f64, usize) {
@@ -501,4 +633,86 @@ mod tests {
         assert_eq!(binomial(k, 5000, 0.4), binomial(k, 5000, 0.4));
         assert_eq!(std_normal(k).to_bits(), std_normal(k).to_bits());
     }
+
+    #[test]
+    fn inversion_exponential_has_unit_mean() {
+        let (m, v, _) = mean_var((0..200_000).map(|i| exp1_by_inversion(Key::from_seed(i).unit())));
+        assert!((m - 1.0).abs() < 0.01 && (v - 1.0).abs() < 0.03, "{m} {v}");
+        assert_eq!(exp1_by_inversion(0.0), 0.0);
+    }
+
+    #[test]
+    fn linear_pick_follows_the_weights() {
+        let w = [0.2, 0.0, 0.5, 0.3];
+        let mut hits = [0u64; 4];
+        let trials = 100_000;
+        for i in 0..trials {
+            hits[pick_linear(&w, Key::from_seed(i).unit())] += 1;
+        }
+        for (h, p) in hits.iter().zip(w) {
+            assert!((*h as f64 / trials as f64 - p).abs() < 0.01);
+        }
+        assert_eq!(pick_linear(&w, 0.0), 0);
+        assert_eq!(pick_linear(&[0.0, 0.0], 0.5), 0);
+    }
+
+    #[test]
+    fn lazy_conditional_has_the_conditional_law() {
+        // Geometric-ish ages 0..40; draw by inversion of the survival.
+        let f: Vec<f64> = (0..40).map(|a| 0.9f64.powi(a) * 0.1).collect();
+        let s = |a: usize| f[a..].iter().sum::<f64>();
+        let draw = |req: usize, k: Key| {
+            let target = k.unit() * s(req);
+            let mut acc = 0.0;
+            (req..40)
+                .find(|&a| {
+                    acc += f[a];
+                    target < acc
+                })
+                .unwrap_or(39)
+        };
+        let (own, r, bound) = (3usize, 9usize, 15usize);
+        let trials = 200_000u64;
+        let mut hist = [0u64; 40];
+        let mut computed = 0u64;
+        for i in 0..trials {
+            let k = Key::from_seed(i);
+            let a = lazy_conditional(
+                own,
+                bound,
+                || {
+                    computed += 1;
+                    r
+                },
+                draw,
+                (k, k.with(3)),
+            );
+            assert!(a >= r);
+            hist[a] += 1;
+        }
+        for a in r..40 {
+            let want = f[a] / s(r);
+            let got = hist[a] as f64 / trials as f64;
+            assert!(
+                (got - want).abs() < 4.0 * (want / trials as f64).sqrt() + 1e-4,
+                "{a}"
+            );
+        }
+        // r is computed only when the first draw falls below the bound.
+        let below = 1.0 - s(bound) / s(own);
+        assert!((computed as f64 / trials as f64 - below).abs() < 0.01);
+    }
+
+    #[test]
+    fn sampling_helpers_golden() {
+        let bits = [exp1_by_inversion(0.3), exp1_by_inversion(0.999)].map(f64::to_bits);
+        assert_eq!(bits, GOLDEN_HELPERS);
+        let picks: Vec<usize> = (0..6)
+            .map(|i| pick_linear(&[0.1, 0.4, 0.2, 0.3], Key::from_seed(i).unit()))
+            .collect();
+        assert_eq!(picks, GOLDEN_PICKS);
+    }
+
+    const GOLDEN_HELPERS: [u64; 2] = [4600096904496365392, 4619463459452485535];
+    const GOLDEN_PICKS: [usize; 6] = [1, 1, 3, 3, 1, 3];
 }

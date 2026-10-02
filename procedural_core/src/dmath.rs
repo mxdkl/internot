@@ -56,6 +56,18 @@ pub fn cos(x: f64) -> f64 {
     libm::cos(x)
 }
 
+/// Arcsine, in `[-π/2, π/2]`.
+#[inline]
+pub fn asin(x: f64) -> f64 {
+    libm::asin(x)
+}
+
+/// Four-quadrant arctangent of `y / x`, in `[-π, π]`.
+#[inline]
+pub fn atan2(y: f64, x: f64) -> f64 {
+    libm::atan2(y, x)
+}
+
 /// Hyperbolic cosine.
 #[inline]
 pub fn cosh(x: f64) -> f64 {
@@ -95,7 +107,7 @@ mod tests {
     /// would silently change. Update only as a deliberate world-version bump.
     #[test]
     fn golden_bits() {
-        let cases: [(&str, f64, u64); 8] = [
+        let cases: [(&str, f64, u64); 10] = [
             ("ln(2)", ln(2.0), 0x3FE62E42FEFA39EF),
             ("ln(0.1)", ln(0.1), 0xC0026BB1BBB55515),
             // libm's exp(1) is 1 ulp from the correctly rounded e
@@ -107,6 +119,8 @@ mod tests {
             ("pow(2.5, 1.7)", pow(2.5, 1.7), 0x4012FDCF53F3E6F3),
             ("sin(1)", sin(1.0), 0x3FEAED548F090CEE),
             ("ln_gamma(10.5)", ln_gamma(10.5), 0x402BE199A0F64393),
+            ("asin(0.3)", asin(0.3), 0x3FD380159E14F6FF),
+            ("atan2(1, -2)", atan2(1.0, -2.0), 0x40056C6E7397F5AE),
         ];
         for (name, got, want) in cases {
             assert_eq!(

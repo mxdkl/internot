@@ -1,0 +1,4 @@
+// Each area is its own lineage region (the world region named after it).
+(
+    by_area: true,
+)

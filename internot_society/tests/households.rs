@@ -11,9 +11,22 @@ use internot_society::{Household, Members, Params, PersonId, World};
 
 const SECS_PER_YEAR: f64 = 365.2425 * 86_400.0;
 
+/// The tiny test pack, or the pack named by `TEST_PACK` (in `worlds/`), so
+/// the suite also checks other configurations (the area mode:
+/// `TEST_PACK=us-areas-tiny`).
+fn params() -> Params {
+    match std::env::var("TEST_PACK") {
+        Ok(name) => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../worlds");
+            Params::load(&root, &name).expect("TEST_PACK names a pack in worlds/")
+        }
+        Err(_) => Params::tiny(),
+    }
+}
+
 fn world() -> &'static World {
     static W: OnceLock<World> = OnceLock::new();
-    W.get_or_init(|| World::build(Params::tiny(), 7))
+    W.get_or_init(|| World::build(params(), 7))
 }
 
 fn age_at(w: &World, id: PersonId, t: i64) -> f64 {
@@ -64,8 +77,8 @@ fn partition(w: &World, t: i64) -> HashMap<Household, Members> {
         .collect()
 }
 
-/// True if minor `x` has no living parent, grandparent or adult sibling at
-/// `t`: nobody in the world to take them in.
+/// True if minor `x` has no living parent or grandparent and no adult
+/// sibling on their own at `t`: nobody the guardian rule could pick.
 fn kinless(w: &World, x: PersonId, t: i64) -> bool {
     let parents: Vec<PersonId> = [w.mother(x), w.father(x)].into_iter().flatten().collect();
     let grandparents = parents
@@ -77,9 +90,11 @@ fn kinless(w: &World, x: PersonId, t: i64) -> bool {
         .copied()
         .chain(grandparents)
         .all(|p| !w.present_at(p, t))
-        && w.siblings(x)
-            .iter()
-            .all(|&s| !w.present_at(s, t) || age_at(w, s, t) < 18.0)
+        && w.siblings(x).iter().all(|&s| {
+            // A guardian sibling is an adult on their own (L3 rule 1): not a
+            // paternal half-sibling still living with their own mother.
+            !w.present_at(s, t) || age_at(w, s, t) < 18.0 || w.dependent_of(s, t).is_some()
+        })
 }
 
 #[test]

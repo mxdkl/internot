@@ -7,22 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 procedural_core = { path = "../procedural_core" }
-procedural_overlay = { path = "../procedural_overlay" }
-internot_renderer = { path = "../internot_renderer", optional = true }
+internot_society = { path = "../internot_society" }
 chrono = { workspace = true }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = { version = "1", features = ["chrono04"] }
 thiserror = "1"
-blake3 = "1"
-bs58 = "0.5"
-base64 = "0.22"
-
-[features]
-# Off by default — pulls reqwest/rustls. Re-enable when rebuilt
-# services need LLM rendering. The `internot_renderer` crate
-# (shared infrastructure) remains; only its consumers were nuked.
-llm = ["dep:internot_renderer"]
 
 [dev-dependencies]

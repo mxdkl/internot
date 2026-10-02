@@ -4,10 +4,12 @@
 //! checksums differ do not give the same answers.
 //!
 //! ```sh
-//! cargo run --release -p internot_society --example lookup_timing -- [ids]
+//! cargo run --release -p internot_society --example lookup_timing -- [ids] [pack]
 //! ```
 //!
 //! Prints `query p50/p90/p99` in nanoseconds for each query, then `sum`.
+//! With a pack (in `worlds/`) instead of the prototype, it also times
+//! households and ledger areas in 2020 (not in the sum).
 
 use internot_society::{Params, PersonId, World};
 use std::time::Instant;
@@ -16,7 +18,15 @@ fn main() {
     let n_ids: usize = std::env::args()
         .nth(1)
         .map_or(200_000, |s| s.parse().expect("an id count"));
-    let w = World::build(Params::prototype(), 42);
+    let pack = std::env::args().nth(2);
+    let params = match &pack {
+        Some(name) => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../worlds");
+            Params::load(&root, name).expect("a pack in worlds/")
+        }
+        None => Params::prototype(),
+    };
+    let w = World::build(params, 42);
     let n = w.population();
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     let ids: Vec<PersonId> = (0..n_ids)
@@ -52,6 +62,30 @@ fn main() {
             pct(&lat, 0.9),
             pct(&lat, 0.99)
         );
+    }
+    if pack.is_some() {
+        let t = internot_society::world::year_start(2020) + 100 * internot_society::world::DAY;
+        let mut extra = 0u64;
+        for name in ["household", "area_at"] {
+            let mut lat = Vec::with_capacity(ids.len());
+            for &id in ids.iter().take(ids.len() / 4) {
+                let t0 = Instant::now();
+                let v = match name {
+                    "household" => w.household(id, t).is_some() as u64,
+                    _ => w.area_at(id, t) as u64,
+                };
+                lat.push(t0.elapsed().as_nanos() as u64);
+                extra = extra.wrapping_add(v);
+            }
+            lat.sort_unstable();
+            line += &format!(
+                "{name} {}/{}/{}  ",
+                pct(&lat, 0.5),
+                pct(&lat, 0.9),
+                pct(&lat, 0.99)
+            );
+        }
+        std::hint::black_box(extra);
     }
     println!("{line}sum {sum:016x}");
 }

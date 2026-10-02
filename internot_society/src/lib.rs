@@ -11,12 +11,15 @@
 //! - [`world`]: people, unions, parents and children as keyed lookups.
 //! - [`household`]: who lives with whom at a time (L3), a view over the
 //!   world.
+//! - [`residence`]: where households live and who lives in a place (L4,
+//!   prototype).
 
 pub mod household;
 pub mod ledger;
 pub mod names;
 pub mod params;
 pub mod plan;
+pub mod residence;
 pub mod world;
 
 pub use household::{Household, Members};

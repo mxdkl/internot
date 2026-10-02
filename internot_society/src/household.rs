@@ -17,10 +17,12 @@
 //! confirms each candidate with them, so the two always agree.
 
 use procedural_core::key::label;
+use procedural_core::partition::{even_parts, locate_in_segments, segment_offset};
 use procedural_core::perm::{Bijection, CompactPerm};
-use procedural_core::stream::{year_of, year_start, DAY};
+use procedural_core::stream::{year_of, year_start, Epochs, DAY};
 
 use crate::params::{Households, Sex, ROOMMATE_FRAME};
+use crate::ledger::UPBRINGING_AGE;
 use crate::world::{PersonId, Union, World};
 
 const TAG_LEAVE: u64 = label("household/leave");
@@ -110,24 +112,6 @@ impl std::fmt::Debug for Members {
     }
 }
 
-/// Roommate group sizes by the number of eligible people in a frame (plan
-/// §5): pairs and triples, in slot order.
-const CHUNKS: [&[u8]; ROOMMATE_FRAME + 1] = [
-    &[],
-    &[],
-    &[2],
-    &[3],
-    &[2, 2],
-    &[3, 2],
-    &[3, 3],
-    &[3, 2, 2],
-    &[3, 3, 2],
-    &[3, 3, 3],
-    &[3, 3, 2, 2],
-    &[3, 3, 3, 2],
-    &[3, 3, 3, 3],
-];
-
 /// A roommate frame: one lineage region's band of birth years in one epoch.
 #[derive(Clone, Copy, Debug)]
 struct Frame {
@@ -153,12 +137,12 @@ impl World {
     }
 
     /// Age in years at `t`.
-    fn age_at(&self, x: PersonId, t: i64) -> f64 {
+    pub(crate) fn age_at(&self, x: PersonId, t: i64) -> f64 {
         (t - self.birth(x)) as f64 / YEAR
     }
 
     /// The union `x` is in at `t`, if any.
-    fn union_during(&self, x: PersonId, t: i64) -> Option<Union> {
+    pub(crate) fn union_during(&self, x: PersonId, t: i64) -> Option<Union> {
         self.unions(x)
             .into_iter()
             .flatten()
@@ -166,7 +150,7 @@ impl World {
     }
 
     /// Unions of `x` that ended by `t`.
-    fn unions_ended(&self, x: PersonId, t: i64) -> u8 {
+    pub(crate) fn unions_ended(&self, x: PersonId, t: i64) -> u8 {
         self.unions(x)
             .into_iter()
             .flatten()
@@ -176,19 +160,38 @@ impl World {
 
     // --- rule 1: living at home -----------------------------------------------
 
-    /// When `x` leaves home: at the independence age or the first union's
-    /// start, whichever comes first (`None`: neither ever happens).
-    fn leave_time(&self, x: PersonId) -> Option<i64> {
+    /// When `x` leaves home: at the independence age, the first union's start
+    /// or (area mode) a single long move or the parents' household moving to
+    /// another area once `x` is an adult, whichever comes first (`None`:
+    /// none ever happens).
+    pub(crate) fn leave_time(&self, x: PersonId) -> Option<i64> {
         let u = self.key().with2(TAG_LEAVE, x as u64).unit();
         let independence = self
             .hh()
             .independence_age(self.sex(x), self.birth_year(x), u)
             .map(|a| self.birth(x) + (a * YEAR) as i64);
         let union = self.union(x).map(|u| u.start);
-        match (independence, union) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // Area mode: a single long move to another area is leaving home, and
+        // so is the parents' household moving away once `x` is an adult:
+        // `x` stays in the area of upbringing, as the ledger counts them.
+        let migration = self.migration(x).map(|m| m.1);
+        let parents_move = if self.ledger().params.places.by_area {
+            [self.mother(x), self.father(x)]
+                .into_iter()
+                .flatten()
+                .flat_map(|p| self.couple_moves(p))
+                .flatten()
+                .map(|(_, t)| t)
+                // The ledger's area of upbringing, by calendar year.
+                .filter(|&t| year_of(t) > self.birth_year(x) + UPBRINGING_AGE)
+                .min()
+        } else {
+            None
+        };
+        [independence, union, migration, parents_move]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// The parent `x` lives with at `t` if `x` is still at home: the mother,
@@ -273,7 +276,7 @@ impl World {
     /// The unit an independent `x` belongs to at `t`: `x` alone, or the
     /// couple, as `(decider, partner)`. A couple decides together: the
     /// woman (the lower id, for a same-sex couple).
-    fn unit(&self, x: PersonId, t: i64) -> (PersonId, Option<PersonId>) {
+    pub(crate) fn unit(&self, x: PersonId, t: i64) -> (PersonId, Option<PersonId>) {
         match self.union_during(x, t).map(|u| u.partner) {
             None => (x, None),
             Some(p) => {
@@ -382,9 +385,14 @@ impl World {
                 candidates.extend(self.children_by_preference(o));
             }
         }
+        // Area mode: only kin the ledger counts in the unit's own area (a
+        // guest elsewhere would live away from its market; debt: no moves to
+        // kin in another area).
+        let areas = self.ledger().params.places.by_area;
+        let here = |h: PersonId| !areas || self.area_at(h, t) == self.area_at(unit.0, t);
         candidates
             .into_iter()
-            .find(|&h| h != unit.0 && Some(h) != unit.1 && self.is_anchor(h, t))
+            .find(|&h| h != unit.0 && Some(h) != unit.1 && self.is_anchor(h, t) && here(h))
     }
 
     // --- rule 4: roommates ------------------------------------------------------
@@ -400,29 +408,29 @@ impl World {
     /// the pack's `roommates.epoch_years` with a keyed phase per band, so bands don't
     /// all regroup on the same day.
     fn frame_at(&self, region: u16, band: u16, t: i64) -> Frame {
-        let (origin, span) = self.epoch_grid(region, band);
-        self.frame_in(region, band, (t - origin).div_euclid(span) as i32)
+        let epochs = self.epochs(region, band);
+        self.frame_in(region, band, epochs.index(t) as i32)
     }
 
     /// Frame `epoch` of `(region, band)`.
     fn frame_in(&self, region: u16, band: u16, epoch: i32) -> Frame {
-        let (origin, span) = self.epoch_grid(region, band);
         Frame {
             region,
             band,
             epoch,
-            start: origin + epoch as i64 * span,
+            start: self.epochs(region, band).start(epoch as i64),
         }
     }
 
-    /// The first epoch's start and the epoch length, in seconds.
-    fn epoch_grid(&self, region: u16, band: u16) -> (i64, i64) {
+    /// The band's epochs: the pack's `roommates.epoch_years` long, with a
+    /// keyed phase.
+    fn epochs(&self, region: u16, band: u16) -> Epochs {
         let span = (self.hh().roommates.epoch_years as f64 * YEAR) as i64;
-        let phase = self
-            .key()
-            .with3(TAG_ROOM_PHASE, region as u64, band as u64)
-            .below(span as u64) as i64;
-        (year_start(self.ledger().first_year) + phase, span)
+        Epochs::keyed(
+            year_start(self.ledger().first_year),
+            span,
+            self.key().with3(TAG_ROOM_PHASE, region as u64, band as u64),
+        )
     }
 
     /// The blocks of a band, as `(block, size)` in (birth year, heritage)
@@ -457,29 +465,21 @@ impl World {
     /// `x`'s index in its band.
     fn band_index(&self, x: PersonId, f: &Frame) -> u64 {
         let (block, raw) = self.decode(x);
-        let mut acc = 0;
-        for (b, size) in self.band_blocks(f.region, f.band) {
-            if b == block {
-                return acc + raw;
-            }
-            acc += size;
-        }
-        unreachable!("a person is in their own band")
+        segment_offset(self.band_blocks(f.region, f.band), block)
+            .expect("a person is in their own band")
+            + raw
     }
 
     /// The person at index `i` of a band.
-    fn band_person(&self, f: &Frame, mut i: u64) -> PersonId {
-        for (b, size) in self.band_blocks(f.region, f.band) {
-            if i < size {
-                return self.id_of(b, i);
-            }
-            i -= size;
-        }
-        unreachable!("index within the band")
+    fn band_person(&self, f: &Frame, i: u64) -> PersonId {
+        let (b, offset) = locate_in_segments(self.band_blocks(f.region, f.band), i)
+            .expect("index within the band");
+        self.id_of(b, offset)
     }
 
     /// True if `x` can stay in a roommate group at `t`: present, single, no
-    /// child under 18, and not seeking kin.
+    /// child under 18, not seeking kin, and (area mode) counted by the ledger
+    /// in the frame's area, `x`'s block's (a migrant leaves the group).
     fn roommate_ok(&self, x: PersonId, t: i64) -> bool {
         self.present_at(x, t)
             && self.union_during(x, t).is_none()
@@ -488,6 +488,7 @@ impl World {
                 .iter()
                 .all(|&c| self.birth(c) > t || self.age_at(c, t) >= ADULT_AGE)
             && !self.seeks_kin((x, None), t)
+            && (!self.ledger().params.places.by_area || self.area_at(x, t) == self.region(x))
     }
 
     /// True if `x` seeks roommates in frame `f`: at the epoch start, of
@@ -528,13 +529,13 @@ impl World {
     }
 
     /// The groups the eligible people of a frame form (plan §5), as
-    /// `(group, members)`.
+    /// `(group, members)`: pairs and triples in slot order, as few groups as
+    /// possible ([`even_parts`]).
     fn chunks(eligible: &Members) -> impl Iterator<Item = (u8, &[PersonId])> {
         let mut at = 0;
-        CHUNKS[eligible.len()]
-            .iter()
+        even_parts(eligible.len() as u64, 2, 3)
             .enumerate()
-            .map(move |(g, &size)| {
+            .map(move |(g, size)| {
                 let chunk = &eligible[at..at + size as usize];
                 at += size as usize;
                 (g as u8, chunk)
@@ -559,6 +560,78 @@ impl World {
             frame,
             group,
         })
+    }
+
+    // --- for residence (L4) ------------------------------------------------------
+
+    /// The person at the end of `x`'s dependent chain at `t` (the one whose
+    /// household `x` lives in, before any kin hosting), or `x` if
+    /// independent.
+    pub(crate) fn chain_end(&self, x: PersonId, t: i64) -> PersonId {
+        let mut p = x;
+        while let Some(q) = self.dependent_of(p, t) {
+            p = q;
+        }
+        p
+    }
+
+    /// When the roommate epoch of `x`'s band in force at `t` began.
+    pub(crate) fn roommate_epoch_start(&self, x: PersonId, t: i64) -> i64 {
+        self.frame_of(x, t).start
+    }
+
+    /// The length of a roommate epoch, in seconds.
+    pub(crate) fn roommate_epoch_span(&self) -> i64 {
+        (self.hh().roommates.epoch_years as f64 * YEAR) as i64
+    }
+
+    /// The lease holder of roommate household `h` and the start of its
+    /// epoch: the first member of the group's chunk (eligibility, and so
+    /// the chunk, is fixed at the epoch start). `None` for other households.
+    pub(crate) fn roommate_lease(&self, h: Household) -> Option<(PersonId, i64)> {
+        let Household::Roommates {
+            region,
+            band,
+            epoch,
+            frame,
+            group,
+        } = h
+        else {
+            return None;
+        };
+        let f = self.frame_in(region, band, epoch);
+        let (perm, n) = self.frame_perm(&f);
+        let eligible = self.frame_eligible(&f, &perm, n, frame);
+        let (_, chunk) = Self::chunks(&eligible).find(|&(g, _)| g == group)?;
+        Some((chunk[0], f.start))
+    }
+
+    /// The roommate household at `t` whose lease holder is `l`, if any:
+    /// `l` was eligible at the epoch start, leads its chunk, and at least
+    /// two of the chunk are still there at `t` (`l` need not be).
+    pub(crate) fn lease_group(&self, l: PersonId, t: i64) -> Option<(Household, i64)> {
+        let f = self.frame_of(l, t);
+        if !self.roommate_eligible(l, &f) {
+            return None;
+        }
+        let (perm, n) = self.frame_perm(&f);
+        let frame = (perm.fwd(self.band_index(l, &f)) / ROOMMATE_FRAME as u64) as u32;
+        let eligible = self.frame_eligible(&f, &perm, n, frame);
+        let (group, chunk) = Self::chunks(&eligible).find(|(_, c)| c.contains(&l))?;
+        if chunk[0] != l {
+            return None;
+        }
+        let staying = chunk.iter().filter(|&&m| self.roommate_ok(m, t)).count();
+        (staying >= 2).then_some((
+            Household::Roommates {
+                region: f.region,
+                band: f.band,
+                epoch: f.epoch,
+                frame,
+                group,
+            },
+            f.start,
+        ))
     }
 
     // --- households -------------------------------------------------------------

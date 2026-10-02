@@ -1,0 +1,19 @@
+// Places (L4): basins (2020 commuting zones, split above 2M people),
+// counties, clusters of neighbouring tracts, and 2020 census tracts, with
+// population weights by decade 1840–2100. Distilled by
+// internot_society/data/distill_places.py from Census Bureau and USDA ERS
+// data (sources and method in its docstring).
+(
+    data: "data/places.bin",
+
+    // Which lineage region each state's basins belong to (state FIPS codes).
+    // A basin takes the region of its most populous county. Founders and
+    // immigrants of a region settle in its basins, and long moves are tiered
+    // around it. The two regions are the Atlantic seaboard (62.6% of people
+    // in 1840, against the 0.6 founder weight in world.ron) and the rest.
+    regions: [
+        (region: "east", states: [9, 10, 11, 12, 13, 23, 24, 25, 33, 34, 36, 37, 42, 44, 45, 50, 51, 54]),
+    ],
+    // The region of every state not listed.
+    others: "west",
+)

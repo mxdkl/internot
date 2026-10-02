@@ -165,6 +165,18 @@ impl<W: BitWord> BitLayout<W> {
     }
 }
 
+/// The positions of a mask's set bits, lowest first.
+#[inline]
+pub fn ones(mut mask: u32) -> impl Iterator<Item = i32> {
+    std::iter::from_fn(move || {
+        (mask != 0).then(|| {
+            let b = mask.trailing_zeros() as i32;
+            mask &= mask - 1;
+            b
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +407,15 @@ mod tests {
         let get_hi = layout.extractor("hi");
         assert_eq!(get_lo(id), 0xAAAA_BBBB);
         assert_eq!(get_hi(id), 0xCCCC_DDDD);
+    }
+
+    #[test]
+    fn ones_lists_set_bits_in_order() {
+        assert_eq!(super::ones(0).count(), 0);
+        assert_eq!(
+            super::ones(0b1010_0110).collect::<Vec<_>>(),
+            vec![1, 2, 5, 7]
+        );
+        assert_eq!(super::ones(u32::MAX).count(), 32);
     }
 }

@@ -16,7 +16,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer};
 
-use internot::{Services, Universe, ViewRegistry};
+use internot::{Universe, ViewRegistry};
 
 pub struct InternotServer {
     universe: Arc<Universe>,
@@ -25,10 +25,8 @@ pub struct InternotServer {
 
 impl InternotServer {
     pub fn new() -> Self {
-        // Build process-wide infrastructure (LLM renderer Arcs) once.
-        // If OPENAI_API_KEY isn't set, Services::from_env returns an
-        // empty bag and the views fall back to template renderers.
-        let universe = Universe::new().with_services(Services::from_env());
+        // Builds the society world of `INTERNOT_PACK` (default `us`) once.
+        let universe = Universe::new();
         InternotServer {
             universe: Arc::new(universe),
             registry: Arc::new(internot::registry()),
@@ -47,9 +45,9 @@ impl ServerHandler for InternotServer {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::from_build_env();
         info.instructions = Some(
-            "Procedural world: people / mail / calendar / files / tasks / money / chat. \
-             All tools take a viewer-scoped param where applicable. Time is fixed at \
-             2025-06-30 09:00 UTC by default."
+            "Procedural world of people (internot society): read_person and read_household \
+             give names, family, unions, households and addresses at any time (`at`, ISO \
+             8601). Follow person ids to relatives. Time is 2025-06-30 09:00 UTC by default."
                 .to_string(),
         );
         info

@@ -1,0 +1,70 @@
+// The us pack with 51 lineage regions, one per state (and DC), instead of
+// two. A child belongs to its mother's state, so marriage markets, roommate
+// frames and the key of long moves are state-local
+// (research/2026-10-01-residence-moves-and-basins.md §4d, §6.4).
+//
+// founder_weight: the state's share of the 1840 census (Forstall, via
+// worlds/us/data/places.bin). immigrant_weight: a provisional proxy, the
+// mean of the state's population shares in 1900 and 2020 (immigrants'
+// destinations by era are debt).
+(
+    name: "United States, state lineages",
+    description: "The us pack with one lineage region per state.",
+    extends: Some("us"),
+    regions: [
+        // The parent pack's two regions, emptied (lists merge by id).
+        (id: "east", founder_weight: 0.0, immigrant_weight: 0.0),
+        (id: "west", founder_weight: 0.0, immigrant_weight: 0.0),
+        (id: "AL", name: "AL", founder_weight: 0.034691, immigrant_weight: 0.019523),
+        (id: "AK", name: "AK", founder_weight: 0.000000, immigrant_weight: 0.001522),
+        (id: "AZ", name: "AZ", founder_weight: 0.000000, immigrant_weight: 0.011591),
+        (id: "AR", name: "AR", founder_weight: 0.005730, immigrant_weight: 0.013109),
+        (id: "CA", name: "CA", founder_weight: 0.000000, immigrant_weight: 0.069344),
+        (id: "CO", name: "CO", founder_weight: 0.000000, immigrant_weight: 0.012235),
+        (id: "CT", name: "CT", founder_weight: 0.018202, immigrant_weight: 0.011373),
+        (id: "DE", name: "DE", founder_weight: 0.004585, immigrant_weight: 0.002700),
+        (id: "DC", name: "DC", founder_weight: 0.000000, immigrant_weight: 0.001040),
+        (id: "FL", name: "FL", founder_weight: 0.003199, immigrant_weight: 0.035943),
+        (id: "GA", name: "GA", founder_weight: 0.040599, immigrant_weight: 0.030634),
+        (id: "HI", name: "HI", founder_weight: 0.000000, immigrant_weight: 0.003201),
+        (id: "ID", name: "ID", founder_weight: 0.000000, immigrant_weight: 0.003831),
+        (id: "IL", name: "IL", founder_weight: 0.027963, immigrant_weight: 0.050818),
+        (id: "IN", name: "IN", founder_weight: 0.040274, immigrant_weight: 0.026671),
+        (id: "IA", name: "IA", founder_weight: 0.002532, immigrant_weight: 0.019389),
+        (id: "KS", name: "KS", founder_weight: 0.000000, immigrant_weight: 0.014036),
+        (id: "KY", name: "KY", founder_weight: 0.045792, immigrant_weight: 0.020821),
+        (id: "LA", name: "LA", founder_weight: 0.020694, immigrant_weight: 0.016050),
+        (id: "ME", name: "ME", founder_weight: 0.029466, immigrant_weight: 0.006591),
+        (id: "MD", name: "MD", founder_weight: 0.027601, immigrant_weight: 0.017078),
+        (id: "MA", name: "MA", founder_weight: 0.043318, immigrant_weight: 0.028927),
+        (id: "MI", name: "MI", founder_weight: 0.012463, immigrant_weight: 0.031014),
+        (id: "MN", name: "MN", founder_weight: 0.000000, immigrant_weight: 0.020047),
+        (id: "MS", name: "MS", founder_weight: 0.022058, immigrant_weight: 0.014599),
+        (id: "MO", name: "MO", founder_weight: 0.022532, immigrant_weight: 0.029575),
+        (id: "MT", name: "MT", founder_weight: 0.000000, immigrant_weight: 0.003225),
+        (id: "NE", name: "NE", founder_weight: 0.000000, immigrant_weight: 0.009923),
+        (id: "NV", name: "NV", founder_weight: 0.000000, immigrant_weight: 0.004960),
+        (id: "NH", name: "NH", founder_weight: 0.016710, immigrant_weight: 0.004766),
+        (id: "NJ", name: "NJ", founder_weight: 0.021921, immigrant_weight: 0.026315),
+        (id: "NM", name: "NM", founder_weight: 0.000000, immigrant_weight: 0.004470),
+        (id: "NY", name: "NY", founder_weight: 0.142629, immigrant_weight: 0.077947),
+        (id: "NC", name: "NC", founder_weight: 0.044243, immigrant_weight: 0.028117),
+        (id: "ND", name: "ND", founder_weight: 0.000000, immigrant_weight: 0.003260),
+        (id: "OH", name: "OH", founder_weight: 0.089224, immigrant_weight: 0.044953),
+        (id: "OK", name: "OK", founder_weight: 0.000000, immigrant_weight: 0.015209),
+        (id: "OR", name: "OR", founder_weight: 0.000000, immigrant_weight: 0.009093),
+        (id: "PA", name: "PA", founder_weight: 0.101238, immigrant_weight: 0.060774),
+        (id: "RI", name: "RI", founder_weight: 0.006391, immigrant_weight: 0.004454),
+        (id: "SC", name: "SC", founder_weight: 0.034904, immigrant_weight: 0.016475),
+        (id: "SD", name: "SD", founder_weight: 0.000000, immigrant_weight: 0.003960),
+        (id: "TN", name: "TN", founder_weight: 0.048693, immigrant_weight: 0.023622),
+        (id: "TX", name: "TX", founder_weight: 0.000000, immigrant_weight: 0.063878),
+        (id: "UT", name: "UT", founder_weight: 0.000000, immigrant_weight: 0.006743),
+        (id: "VT", name: "VT", founder_weight: 0.017143, immigrant_weight: 0.003214),
+        (id: "VA", name: "VA", founder_weight: 0.060203, immigrant_weight: 0.025131),
+        (id: "WA", name: "WA", founder_weight: 0.000000, immigrant_weight: 0.015007),
+        (id: "WV", name: "WV", founder_weight: 0.013186, immigrant_weight: 0.008968),
+        (id: "WI", name: "WI", founder_weight: 0.001816, immigrant_weight: 0.022404),
+        (id: "WY", name: "WY", founder_weight: 0.000000, immigrant_weight: 0.001475),
+    ],
+)

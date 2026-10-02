@@ -10,9 +10,23 @@ use internot_society::{CellKind, Params, PersonId, Sex, World};
 
 const SECS_PER_YEAR: f64 = 365.25 * 86_400.0;
 
+/// The tiny test pack, or the pack named by `TEST_PACK` (in `worlds/`), so
+/// the suite also checks other configurations (the area mode:
+/// `TEST_PACK=us-areas-tiny`).
+fn params() -> Params {
+    match std::env::var("TEST_PACK") {
+        Ok(name) => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../worlds");
+            Params::load(&root, &name).expect("TEST_PACK names a pack in worlds/")
+        }
+        Err(_) => Params::tiny(),
+    }
+}
+
 fn world() -> &'static World {
     static W: OnceLock<World> = OnceLock::new();
-    W.get_or_init(|| World::build(Params::tiny(), 7))
+    // The ledger's cells are kept: the suite checks the world against them.
+    W.get_or_init(|| World::build_keeping_ledger(params(), 7))
 }
 
 fn everyone(w: &World) -> impl Iterator<Item = PersonId> {
@@ -373,7 +387,9 @@ fn people_per_block_match_the_ledger() {
             }
         }
     }
-    let mut recorded = 0;
+    // The ledger's unions by the same key; in area mode a block has a cell
+    // per area for the same year, kind and class, so cells add up.
+    let mut recorded: HashMap<(i32, CellKind, u8, u32, u32, Sex), u64> = HashMap::new();
     for (bi, b) in ledger.blocks.iter().enumerate() {
         assert_eq!(
             per_block.get(&(bi as u32)).copied().unwrap_or((0, 0)),
@@ -395,38 +411,51 @@ fn people_per_block_match_the_ledger() {
             );
         for (c, sex) in left_cells {
             for &(pb, n) in &c.partners {
-                let class = c.class;
-                assert_eq!(
-                    unions
-                        .get(&(c.year, c.kind, class, bi as u32, pb, sex))
-                        .copied()
-                        .unwrap_or(0),
-                    n,
-                    "unions {} ({:?}, class {class}): block {bi} × block {pb}",
-                    c.year,
-                    c.kind
-                );
-                recorded += n;
+                *recorded
+                    .entry((c.year, c.kind, c.class, bi as u32, pb, sex))
+                    .or_default() += n;
             }
         }
     }
-    assert_eq!(recorded, unions.values().sum::<u64>(), "unrecorded unions");
+    for (&(year, kind, class, b, pb, sex), &n) in &recorded {
+        assert_eq!(
+            unions
+                .get(&(year, kind, class, b, pb, sex))
+                .copied()
+                .unwrap_or(0),
+            n,
+            "unions {year} ({kind:?}, class {class}): block {b} × block {pb}"
+        );
+    }
+    assert_eq!(
+        recorded.values().sum::<u64>(),
+        unions.values().sum::<u64>(),
+        "unrecorded unions"
+    );
 }
 
 #[test]
 fn children_inherit_the_mothers_group_and_unions_cross_groups() {
     let w = world();
     let (mut cross, mut unions) = (0u64, 0u64);
-    let mut directions = [0u64; 2];
+    // In area mode a block's region is the area its members grow up in,
+    // which can differ from the mother's (she moved); heritage is always
+    // the mother's.
+    let areas = w.ledger().params.places.by_area;
+    let mut directions = vec![0u64; w.ledger().params.region_count()];
     // Cross-heritage unions, by the woman's heritage.
     let mut mixed = vec![0u64; w.ledger().params.heritage_count()];
     for x in everyone(w) {
         if let Some(m) = w.mother(x) {
-            assert_eq!(
-                (w.lineage_group(x), w.region(x), w.heritage(x)),
-                (w.lineage_group(m), w.region(m), w.heritage(m)),
-                "{x} is not in its mother's group"
-            );
+            if areas {
+                assert_eq!(w.heritage(x), w.heritage(m), "{x}'s heritage");
+            } else {
+                assert_eq!(
+                    (w.lineage_group(x), w.region(x), w.heritage(x)),
+                    (w.lineage_group(m), w.region(m), w.heritage(m)),
+                    "{x} is not in its mother's group"
+                );
+            }
         }
         if w.sex(x) != Sex::Female {
             continue;
@@ -449,23 +478,40 @@ fn children_inherit_the_mothers_group_and_unions_cross_groups() {
         "cross-heritage unions: {mixed:?}"
     );
     let share = cross as f64 / unions as f64;
-    // ρ runs 0.25–0.35 over the tiny world's years and half of national
-    // unions cross regions (12–18%); the open market (boosted four-fold in
-    // the tiny world) mixes regions as well, so 15–35% in all.
-    assert!(
-        (0.06..=0.40).contains(&share),
-        "cross-region share {share:.3}"
-    );
-    assert!(
-        directions.iter().all(|&d| d > 50),
-        "one-way crossings: {directions:?}"
-    );
+    if areas {
+        // Partners grew up in different areas: the national share, those
+        // who moved before partnering, and small areas' unions spilling
+        // over. Crossings run both ways in most areas.
+        assert!(
+            (0.05..=0.70).contains(&share),
+            "cross-area share {share:.3}"
+        );
+        let both = directions.iter().filter(|&&d| d > 0).count();
+        assert!(
+            both * 2 > directions.len(),
+            "crossings from {both} of {} areas",
+            directions.len()
+        );
+    } else {
+        // ρ runs 0.25–0.35 over the tiny world's years and half of
+        // national unions cross regions (12–18%); the open market (boosted
+        // four-fold in the tiny world) mixes regions as well, so 15–35% in
+        // all.
+        assert!(
+            (0.06..=0.40).contains(&share),
+            "cross-region share {share:.3}"
+        );
+        assert!(
+            directions.iter().all(|&d| d > 50),
+            "one-way crossings: {directions:?}"
+        );
+    }
 }
 
 #[test]
 fn independently_built_worlds_agree() {
     // Same parameters and seed, built twice: every answer identical (G1).
-    let fresh = World::build(Params::tiny(), 7);
+    let fresh = World::build(params(), 7);
     let w = world();
     for x in (0..w.population() as PersonId).step_by(37) {
         assert_eq!(fresh.sex(x), w.sex(x));
@@ -479,7 +525,7 @@ fn independently_built_worlds_agree() {
     }
     // A different seed gives a different world of the same shape: among
     // people partnered in both worlds, partners almost never coincide.
-    let other = World::build(Params::tiny(), 8);
+    let other = World::build(params(), 8);
     let n = w.population().min(other.population()) as PersonId;
     let (mut both, mut same) = (0, 0);
     for x in (0..n).step_by(11) {
@@ -496,4 +542,102 @@ fn independently_built_worlds_agree() {
         same * 20 < both,
         "seeds 7 and 8 share {same} of {both} partners"
     );
+}
+
+#[test]
+fn couples_move_between_areas_and_their_children_grow_up_there() {
+    // Area mode (stage 3): a union's move comes from the woman's plan leaf;
+    // a child is in the block of their area of upbringing (where the family
+    // lives at 18), so a child under 18 at the move is in the destination's
+    // block. Both partners see the same move.
+    let w = world();
+    if !w.ledger().params.places.by_area {
+        assert!(everyone(w).all(|x| w.couple_moves(x).iter().all(Option::is_none)));
+        return;
+    }
+    let (mut unions, mut moved, mut later) = (0u64, 0u64, 0u64);
+    for x in everyone(w) {
+        if w.sex(x) != Sex::Female {
+            continue;
+        }
+        for (u, mv) in w.unions(x).iter().zip(w.couple_moves(x)) {
+            let Some(u) = u else { continue };
+            unions += 1;
+            let Some((dest, t)) = mv else { continue };
+            moved += 1;
+            assert!(u.start < t, "{x} moves before the union");
+            assert!(u.separation.is_none_or(|s| t < s), "{x} moves after separating");
+            if w.death(u.partner) > t {
+                let theirs = w.unions(u.partner);
+                let k = theirs
+                    .iter()
+                    .position(|v| v.is_some_and(|v| v.partner == x && v.start == u.start))
+                    .expect("the partner holds the union");
+                assert_eq!(w.couple_moves(u.partner)[k], Some((dest, t)), "{x}'s partner");
+            }
+            for c in w.children(x) {
+                // This union's plan births (not a later union's with the
+                // same partner, nor a non-union birth, which follows the
+                // mother's cohort: debt) under 18 in the move year.
+                let ours =
+                    w.union_birth(c) && u.start <= w.birth(c) && w.birth(c) < u.end + 300 * DAY;
+                // ... and before any separation by their 18th year.
+                let intact = u.separation.is_none_or(|s| year_of(s) > year_of(w.birth(c)) + 18);
+                if w.father(c) == Some(u.partner)
+                    && ours
+                    && intact
+                    && year_of(w.birth(c)) + 18 >= year_of(t)
+                {
+                    later += 1;
+                    assert_eq!(w.region(c), dest, "{x}'s child {c}, under 18 at the move");
+                }
+            }
+        }
+    }
+    let share = moved as f64 / unions as f64;
+    println!("{moved} of {unions} unions move ({share:.3}); {later} children under 18 at the move");
+    assert!(
+        (0.02..0.6).contains(&share) && later > 20,
+        "{moved} of {unions} unions move ({share:.3}); {later} children under 18 at the move"
+    );
+}
+
+#[test]
+fn women_partner_in_the_area_the_ledger_counts_them_in() {
+    // Area mode (stage 4): a union's cell area is the woman's market area,
+    // so just before it she is counted there, except a migrant partnering
+    // in her move year before her move date (the ledger counts the whole
+    // year in the destination; residence forms such unions afresh there).
+    let w = world();
+    if !w.ledger().params.places.by_area {
+        return;
+    }
+    let (mut checked, mut window) = (0u64, 0u64);
+    for x in everyone(w) {
+        if w.sex(x) != Sex::Female {
+            continue;
+        }
+        let areas = w.union_areas(x);
+        for (k, (u, cell)) in w.unions(x).iter().zip(w.union_cells(x)).enumerate() {
+            let (Some(u), Some((_, kind))) = (u, cell) else { continue };
+            if kind == CellKind::Arrival || u.start <= w.birth(x) || w.is_founder(x) {
+                continue;
+            }
+            if kind.same_sex() && w.sex(u.partner) == Sex::Female && kind == CellKind::SameRight {
+                continue;
+            }
+            let before = w.area_at(x, u.start - 1);
+            let area = areas[k].expect("a union has an area");
+            checked += 1;
+            if before != area {
+                let in_window = k == 0
+                    && w.migration_class(x) == Some((area, year_of(u.start)))
+                    && w.migration(x).is_none();
+                window += 1;
+                assert!(in_window, "{x}'s union {k} in {area}, counted in {before} before");
+            }
+        }
+    }
+    println!("{checked} unions checked, {window} in a migrant's move year before the move");
+    assert!(window * 50 < checked, "{window} of {checked} unions form outside the woman's area");
 }

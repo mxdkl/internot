@@ -15,6 +15,11 @@
 //!   `[0, n)`, so growing `n` by one changes exactly one existing image.
 //! - [`SmallPerm`]: exact uniform permutation for `n ≤ 64` by sorting keyed
 //!   hashes (Black–Rogaway Method 1), on the stack.
+//! - [`SegmentedPerm`]: a keyed bijection from a dense domain onto labelled
+//!   segments of given sizes, with the inverse (the static half of a
+//!   counted flow).
+//! - [`least_cost_assignment`]: the cheapest assignment of a group of at
+//!   most three to three partners, by exhaustive search in a fixed order.
 //!
 //! See `docs/superpowers/research/2026-09-29-local-access-and-bijections.md` §2.
 
@@ -449,8 +454,160 @@ impl Bijection for SmallPerm {
     }
 }
 
+/// Every permutation of `0..k` for `k ≤ 3`, in lexicographic order
+/// (identity first).
+const SMALL_PERMS: [&[&[u8]]; 4] = [
+    &[&[]],
+    &[&[0]],
+    &[&[0, 1], &[1, 0]],
+    &[
+        &[0, 1, 2],
+        &[0, 2, 1],
+        &[1, 0, 2],
+        &[1, 2, 0],
+        &[2, 0, 1],
+        &[2, 1, 0],
+    ],
+];
+
+/// The assignment `a → π(a)` of `0..k` (`k ≤ 3`) minimizing
+/// `Σ_a cost(a, π(a))`, the first in lexicographic order among ties (so the
+/// identity whenever it is optimal). Entries past `k` stay the identity.
+pub fn least_cost_assignment(k: usize, cost: impl Fn(usize, usize) -> u32) -> [u8; 3] {
+    assert!(k <= 3, "groups of at most three");
+    let mut perm = [0u8, 1, 2];
+    let mut best = u32::MAX;
+    for cand in SMALL_PERMS[k] {
+        let c: u32 = (0..k).map(|a| cost(a, cand[a] as usize)).sum();
+        if c < best {
+            best = c;
+            perm[..k].copy_from_slice(cand);
+        }
+    }
+    perm
+}
+
+/// A keyed bijection from a dense domain `[0, n)` onto consecutive labelled
+/// segments of given sizes (`n` is their sum).
+///
+/// It is the static half of a counted flow: a count table says how many
+/// items each segment (a destination, a quota cell) receives, and a keyed
+/// permutation decides which items. Forward, [`Self::assign`] gives an
+/// item's segment and offset; inverse, [`Self::member`] gives the item
+/// holding a segment's offset. So a segment's members are enumerated in
+/// O(size), with no search.
+#[derive(Clone, Debug)]
+pub struct SegmentedPerm {
+    perm: CompactPerm,
+    /// `starts[k]` is where segment `k` begins; the last entry is `n`.
+    starts: Vec<u64>,
+}
+
+impl SegmentedPerm {
+    /// Segments of `sizes` over `[0, Σ sizes)`, shuffled by `key`.
+    pub fn new(sizes: &[u64], key: Key) -> Self {
+        let mut starts = Vec::with_capacity(sizes.len() + 1);
+        let mut at = 0u64;
+        for &s in sizes {
+            starts.push(at);
+            at += s;
+        }
+        starts.push(at);
+        Self {
+            perm: CompactPerm::new(at, key),
+            starts,
+        }
+    }
+
+    /// Domain size: the sum of the segment sizes.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        *self.starts.last().expect("starts ends with n")
+    }
+
+    /// True if every segment is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of segments.
+    #[inline]
+    pub fn segments(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    /// Size of segment `k`.
+    #[inline]
+    pub fn segment_len(&self, k: usize) -> u64 {
+        self.starts[k + 1] - self.starts[k]
+    }
+
+    /// The segment and offset that item `i` is assigned to. Panics if
+    /// `i >= len`.
+    #[inline]
+    pub fn assign(&self, i: u64) -> (usize, u64) {
+        let j = self.perm.fwd(i);
+        // The segment holding `j` is the last whose start is at most `j`
+        // (empty segments before it share its start and come first).
+        let k = self.starts.partition_point(|&s| s <= j) - 1;
+        (k, j - self.starts[k])
+    }
+
+    /// The item assigned to offset `off` of segment `k`. Panics if `off` is
+    /// outside the segment.
+    #[inline]
+    pub fn member(&self, k: usize, off: u64) -> u64 {
+        assert!(off < self.segment_len(k), "offset outside the segment");
+        self.perm.inv(self.starts[k] + off)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn segmented_perm_is_a_bijection_onto_its_segments() {
+        let sizes = [5u64, 0, 17, 1, 0, 0, 9, 40];
+        let sp = SegmentedPerm::new(&sizes, Key::from_seed(77));
+        assert_eq!(sp.len(), 72);
+        assert_eq!(sp.segments(), sizes.len());
+        let mut filled = vec![vec![false; 0]; sizes.len()];
+        for (k, &s) in sizes.iter().enumerate() {
+            filled[k] = vec![false; s as usize];
+        }
+        for i in 0..sp.len() {
+            let (k, off) = sp.assign(i);
+            assert!(off < sizes[k], "offset inside its segment");
+            assert!(!filled[k][off as usize], "each slot once");
+            filled[k][off as usize] = true;
+            assert_eq!(sp.member(k, off), i, "inverse");
+        }
+        assert!(filled.iter().flatten().all(|&f| f));
+        let empty = SegmentedPerm::new(&[0, 0], Key::from_seed(1));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn segmented_perm_golden() {
+        let sp = SegmentedPerm::new(&[3, 4, 5], Key::from_seed(2026));
+        let got: Vec<(usize, u64)> = (0..12).map(|i| sp.assign(i)).collect();
+        let want = [
+            (2, 4),
+            (1, 3),
+            (0, 0),
+            (1, 1),
+            (0, 1),
+            (2, 0),
+            (2, 3),
+            (0, 2),
+            (1, 0),
+            (2, 1),
+            (2, 2),
+            (1, 2),
+        ];
+        assert_eq!(got, want);
+    }
     use super::*;
 
     fn assert_bijection<B: Bijection>(p: &B) {
@@ -721,6 +878,28 @@ mod tests {
             for c in row {
                 assert!((9_500..10_500).contains(&c), "{c}");
             }
+        }
+    }
+
+    #[test]
+    fn least_cost_assignment_is_the_first_minimum() {
+        assert_eq!(least_cost_assignment(0, |_, _| 1), [0, 1, 2]);
+        assert_eq!(least_cost_assignment(1, |_, _| 1), [0, 1, 2]);
+        // Identity costs nothing: kept.
+        assert_eq!(least_cost_assignment(3, |a, b| (a != b) as u32), [0, 1, 2]);
+        // Diagonal forbidden: the first derangement in lexicographic order.
+        assert_eq!(least_cost_assignment(3, |a, b| (a == b) as u32), [1, 2, 0]);
+        assert_eq!(least_cost_assignment(2, |a, b| (a == b) as u32), [1, 0, 2]);
+        // Brute force over random costs.
+        for seed in 0..200u64 {
+            let key = Key::from_seed(seed);
+            let c = |a: usize, b: usize| key.with2(a as u64, b as u64).below(3) as u32;
+            let got = least_cost_assignment(3, c);
+            let total = |p: &[u8]| (0..3).map(|a| c(a, p[a] as usize)).sum::<u32>();
+            let min = SMALL_PERMS[3].iter().map(|p| total(p)).min().unwrap();
+            assert_eq!(total(&got), min);
+            let first = SMALL_PERMS[3].iter().find(|p| total(p) == min).unwrap();
+            assert_eq!(&got[..], *first);
         }
     }
 }

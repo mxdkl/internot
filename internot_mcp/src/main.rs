@@ -21,11 +21,8 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Build the server BEFORE entering the tokio runtime. When OPENAI_API_KEY
-    // is set, Services::from_env() constructs a reqwest::blocking::Client
-    // (via internot_renderer::OpenAiClient) which internally spawns its own
-    // tokio runtime — that panics with "Cannot drop a runtime in a context
-    // where blocking is not allowed" if attempted inside #[tokio::main].
+    // Build the server (and its world, which takes seconds) before
+    // entering the tokio runtime.
     let server = InternotServer::new();
     tracing::info!(
         "internot-mcp ready: {} views registered",

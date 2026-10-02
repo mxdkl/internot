@@ -4,7 +4,7 @@
 //! `(owner_mail_id, idx)` is a slot in a per-owner namespace, and the
 //! slot is "populated" iff `idx < count_of(owner)`. The bit layout for
 //! such a service is always `[idx (LSB) | owner_mail_id]` plus reserved
-//! padding for the `procedural_overlay::Session` sentinel. Enumeration
+//! padding for a mutation overlay's sentinel bit. Enumeration
 //! is direct compose, never `Space::find()` (since pinning only the
 //! owner cohort would leave > 64 free bits and panic the framework).
 //!
@@ -45,7 +45,7 @@ use crate::space::Space;
 /// Layout descriptor for a slot-based service.
 ///
 /// `idx_width + owner_width` must be ≤ 63 to leave room for the
-/// `procedural_overlay::Session` sentinel bit at position 63 of the
+/// sentinel bit of a mutation overlay at position 63 of the
 /// underlying `u64` word.
 #[derive(Debug, Clone, Copy)]
 pub struct SlotLayout {

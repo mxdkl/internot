@@ -1,0 +1,94 @@
+// Residence (L4, design A): how households move between and within places.
+// Spec: docs/superpowers/specs/2026-10-01-residence.md. Values follow
+// research/2026-10-01-residence-moves-and-basins.md §6 (cited by section)
+// and are calibrated in examples/residence_realism.rs against
+// research/2026-10-01-residence-data-and-targets.md §2.
+(
+    // Moves of a continuing household within its area, per year: a rate by
+    // the driver's age at the 2023 level (§6.2, owners and renters blended,
+    // CPS-scaled), times an era factor relative to 2023, times a gamma
+    // frailty with mean 1 drawn per household (§2e: heterogeneity, not
+    // duration, explains why long stays get longer). Formation (leaving
+    // home, unions, separations) moves people on its own, and a move that
+    // stays in its tract (about 19% of moves, §6.3) is not modelled.
+    local: (
+        by_age: (
+            steps: [(19, 0.22), (24, 0.20), (29, 0.13), (34, 0.09), (44, 0.065), (54, 0.048), (64, 0.04)],
+            above: 0.035,
+        ),
+        // §6.2: 2.5 for 1948–1970, 2.06 in 2000, 1.60 in 2010, 1.26 in 2019;
+        // held at the 1948 level before (the linked censuses show 1850–80
+        // young men at least as mobile).
+        era: [(1840, 2.5), (1970, 2.5), (1990, 2.4), (2000, 2.06), (2010, 1.6), (2019, 1.26), (2023, 1.0)],
+        frailty_variance: 0.4,
+        // Of these moves, the level redrawn (§6.3, metro column without the
+        // same-tract moves): another zone in the area (by gravity around
+        // the household's home zone), another county (or 1M part) in the
+        // zone, another cluster in the county, another tract in the cluster.
+        levels: (zone: 0.16, county: 0.24, cluster: 0.30, tract: 0.30),
+    ),
+
+    // Moves to another area (long moves), per person per year at the 2023
+    // level, counted per birth block and year; they move the household the
+    // person drives, so children and partners go along. The age shape
+    // follows the cross-zone rates of §6.3 (13.3% a year at 18–19, 9.0% at
+    // 20–24, 7.6% at 25–29, 5.3% at 30–34, 3.1% at 40–44, about 2% at 50+,
+    // ACS 2011–15); the level is calibrated on the share of natives living
+    // outside their birth state (HSUS, ACS) and CPS interstate movers.
+    long: (
+        by_age: (
+            steps: [(17, 0.0), (19, 0.018), (24, 0.013), (29, 0.011), (34, 0.0075), (44, 0.0045), (64, 0.003)],
+            above: 0.002,
+        ),
+        era: [(1840, 2.5), (1970, 2.5), (1990, 2.4), (2000, 2.06), (2010, 1.6), (2019, 1.26), (2023, 1.0)],
+        // Share landing in the mover's lineage region; the rest anywhere,
+        // both by attractiveness.
+        own_region: 0.75,
+    ),
+
+    // Distance decay of moves between zones of an area, around the
+    // household's home zone (where it formed, or where its last long move
+    // landed) (§4b, ACS 2016–2020 cross-zone flows): flat to
+    // 60 miles, then slopes −1.55 to 300 miles, −0.93 to 1000, −0.31 beyond.
+    gravity: (
+        flat_miles: 60.0,
+        segments: [(300.0, -1.55), (1000.0, -0.93)],
+        beyond: -0.31,
+    ),
+
+    // Distance decay of moves to another county (or 1M part) of the zone or
+    // another cluster of the county, around the household's home county or
+    // cluster there: flat to 3 miles, then slope −2 (provisional; calibrated
+    // on 76% of moves under 50 miles, CPS 2021, and the 16-to-26 targets).
+    local_gravity: (
+        flat_miles: 3.0,
+        segments: [],
+        beyond: -2.0,
+    ),
+
+    // New homes relative to the household they come from (§6.5): the same
+    // tract, or a fresh draw from the county, cluster or tract level within
+    // the source's zone. Moves out of the zone come from the move channels.
+    formation: (
+        // PSID: 19.4% same tract; SOEP median 9.5 km.
+        leave_home: (same: 0.20, county: 0.35, cluster: 0.25, tract: 0.20),
+        // A couple's new home near the anchor partner's (median 6–8 km).
+        union: (same: 0.0, county: 0.20, cluster: 0.40, tract: 0.40),
+        // The leaver after a separation: same tract or cluster about half,
+        // elsewhere in the zone the rest.
+        separation: (same: 0.15, county: 0.45, cluster: 0.20, tract: 0.20),
+    ),
+
+    // A couple's first home is near the woman's previous home with this
+    // probability (same-sex couples: either, evenly) (§6.5: the US tilt is
+    // slight).
+    union_source_woman: 0.5,
+    // Share of couples who move into the anchor partner's home rather than a
+    // new one (§6.5: she into his 0.25, he into hers 0.25, both new 0.50).
+    union_keep: 0.5,
+
+    // Who keeps the home after a separation (§6.5): the woman, the man, or
+    // neither (both move). Same-sex couples: either partner, evenly. A
+    // widowed survivor always keeps it.
+    stays: (woman: 0.40, man: 0.40),
+)

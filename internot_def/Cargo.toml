@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+procedural_core = { path = "../procedural_core" }
 serde = { workspace = true }
 # Pinned exactly: a pack's numbers must parse to the same bits everywhere.
 ron = "=0.12.2"

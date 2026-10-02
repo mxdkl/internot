@@ -54,11 +54,8 @@ pub struct MutationTrace {}
 /// The single shared runtime every view borrows. Transports build it
 /// once at startup.
 ///
-/// Substrate concerns are the three `world*` fields plus `sessions`
-/// and `now`. Process-wide *infrastructure* (LLM renderer Arcs and
-/// future cross-cutting integrations) lives in `services`. The split
-/// keeps Universe focused on the procedural floor and gives external
-/// integrations a named home that doesn't bloat this struct.
+/// It holds the procedural floor (the society world and the three
+/// `world*` containers), the mutable `sessions` and the simulated `now`.
 pub struct Universe {
     /// Leaked `&'static` so service Sessions (which borrow `'w` from
     /// the World) can hold `'static` borrows. One Universe per
@@ -75,11 +72,9 @@ pub struct Universe {
     pub world_u512: &'static World<U512>,
     pub sessions: Mutex<SessionState>,
     pub now: DateTime<Utc>,
-    /// External integrations (LLM renderer Arcs, etc.). Default is
-    /// empty — tests don't need it. Production transports build it
-    /// once at startup via [`Services::from_env`] and assign to this
-    /// field. See `runtime_services.rs`.
-    pub services: crate::Services,
+    /// The society world (people, kinship, households, names, residence),
+    /// shared by every Universe of the process with the same pack and seed.
+    pub society: &'static crate::society::Society,
 }
 
 impl Universe {
@@ -90,7 +85,22 @@ impl Universe {
         Universe::with_now(DEFAULT_NOW())
     }
 
+    /// A Universe at `now` on the society world of `INTERNOT_PACK` and
+    /// `INTERNOT_SEED` (default `us`, 42).
     pub fn with_now(now: DateTime<Utc>) -> Self {
+        Self::with_society(crate::society::Society::from_env(), now)
+    }
+
+    /// A Universe at `now` on embedded pack `pack` (seed 42): tests use
+    /// `us-tiny`.
+    pub fn for_pack(pack: &str, now: DateTime<Utc>) -> Self {
+        Self::with_society(
+            crate::society::Society::shared(pack, crate::society::DEFAULT_SEED),
+            now,
+        )
+    }
+
+    fn with_society(society: &'static crate::society::Society, now: DateTime<Utc>) -> Self {
         let world = build_world();
         let world_u256 = build_world_u256();
         let world_u512 = build_world_u512();
@@ -100,7 +110,7 @@ impl Universe {
             world_u512,
             sessions: Mutex::new(SessionState::new(world, world_u256)),
             now,
-            services: crate::Services::default(),
+            society,
         }
     }
 
@@ -116,17 +126,10 @@ impl Universe {
             world_u512,
             sessions: Mutex::new(SessionState::new(world, world_u256)),
             now,
-            services: crate::Services::default(),
+            society: crate::society::Society::from_env(),
         }
     }
 
-    /// Replace the `services` infrastructure bag. Builder-style helper
-    /// for transports that want to fluently chain
-    /// `Universe::new().with_services(Services::from_env())`.
-    pub fn with_services(mut self, services: crate::Services) -> Self {
-        self.services = services;
-        self
-    }
 
     /// Override `now` after construction (for tests that want to
     /// step time without rebuilding the World).

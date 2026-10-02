@@ -24,10 +24,20 @@
 //! mortality so block totals stay right.
 
 use procedural_core::key::{label, Key};
-use procedural_core::perm::{Bijection, CompactParts, CompactPerm};
+use procedural_core::life::{
+    add_conditional_deaths, invert_cumulative, invert_survival, survivorship,
+};
+use procedural_core::partition::pair_group;
+use procedural_core::perm::{least_cost_assignment, Bijection, CompactParts, CompactPerm};
+use procedural_core::pmf::{cumulative_normalized, positive_mass};
+use procedural_core::sample::{lazy_conditional, pick_linear};
+use procedural_core::table::{coarse_index, coarse_len, BucketIndex, Coarse, CoarseRow};
 use rayon::prelude::*;
 
-use crate::ledger::{cutoff, plan_key, Block, CellKind, Ledger, MotherShare, MIN_UNION_AGE};
+use crate::ledger::{
+    area_key, cutoff, move_key, plan_key, upbringing_moved, Block, CellKind, Ledger, MotherShare,
+    MIN_UNION_AGE,
+};
 use crate::params::{
     Heritage, Params, Sex, DISSOLUTION_BANDS, MAX_AGE, MAX_BIRTH_AGE, MAX_REMARRIAGE_AGE,
     MIN_BIRTH_AGE,
@@ -49,6 +59,7 @@ const TAG_DEATH: u64 = label("person/death");
 const TAG_COUPLE: u64 = label("couple");
 const TAG_ARRIVAL: u64 = label("person/arrival");
 const TAG_REMARRY: u64 = label("world/remarry");
+const TAG_MIGRATE: u64 = label("person/migrate");
 
 /// A union as seen by one partner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,34 +234,6 @@ impl Default for ManSlot {
     }
 }
 
-/// Permutations tried by kin repair, by group size, identity first.
-const PERMS: [&[&[u8]]; 4] = [
-    &[],
-    &[&[0]],
-    &[&[0, 1], &[1, 0]],
-    &[
-        &[0, 1, 2],
-        &[0, 2, 1],
-        &[1, 0, 2],
-        &[1, 2, 0],
-        &[2, 0, 1],
-        &[2, 1, 0],
-    ],
-];
-
-/// The repair group of position `q` in a cell of `n` couples, as `(first
-/// position, size)`: pairs `(2k, 2k + 1)`, the last three positions of an
-/// odd cell, or the lone position of a one-couple cell.
-fn repair_group(q: u64, n: u64) -> (u64, u64) {
-    if n <= 1 {
-        (q, 1)
-    } else if n % 2 == 1 && q >= n - 3 {
-        (n - 3, 3)
-    } else {
-        (q & !1, 2)
-    }
-}
-
 /// A couple's facts that need no death lookups.
 struct Couple {
     partner: PersonId,
@@ -388,6 +371,9 @@ struct CellLayout {
     /// years after the cell's year (0: never). Kin repair, the permutations
     /// and the plans all work within a class-cell.
     class: u8,
+    /// The couples' area (area mode; 0 otherwise). A cell and its partner
+    /// cell share it.
+    area: u8,
 }
 
 /// A cell's fertility plans, in the block's arenas. A block keeps them in
@@ -468,6 +454,121 @@ impl<'a> CellView<'a> {
     }
 }
 
+/// Hand memory freed during the build back to the system (glibc keeps
+/// freed small blocks in its arenas; the build frees gigabytes of them).
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's `malloc_trim` only releases free memory.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+/// A block's ledger detail that only its layout build reads: borrowed from
+/// the ledger, or from [`OwnedDetail`] taken out of it.
+struct Detail<'a> {
+    union_f: &'a [crate::ledger::UnionCell],
+    union_m: &'a [crate::ledger::UnionCell],
+    div_f: &'a [crate::ledger::DivSource],
+    div_m: &'a [crate::ledger::DivSource],
+    mothers: &'a [MotherShare],
+    cohort_mothers: Vec<&'a [MotherShare]>,
+}
+
+impl<'a> Detail<'a> {
+    fn of(block: &'a Block) -> Self {
+        Self {
+            union_f: &block.union_f,
+            union_m: &block.union_m,
+            div_f: &block.div_f,
+            div_m: &block.div_m,
+            mothers: &block.mothers,
+            cohort_mothers: block.cohorts.iter().map(|c| &c.mothers[..]).collect(),
+        }
+    }
+}
+
+/// A block's ledger detail, moved out of the ledger for its layout build.
+struct OwnedDetail {
+    union_f: Vec<crate::ledger::UnionCell>,
+    union_m: Vec<crate::ledger::UnionCell>,
+    div_f: Vec<crate::ledger::DivSource>,
+    div_m: Vec<crate::ledger::DivSource>,
+    mothers: Vec<MotherShare>,
+    cohort_mothers: Vec<Vec<MotherShare>>,
+}
+
+impl OwnedDetail {
+    fn take(block: &mut Block) -> Self {
+        use std::mem::take;
+        Self {
+            union_f: take(&mut block.union_f),
+            union_m: take(&mut block.union_m),
+            div_f: take(&mut block.div_f),
+            div_m: take(&mut block.div_m),
+            mothers: take(&mut block.mothers),
+            cohort_mothers: block.cohorts.iter_mut().map(|c| take(&mut c.mothers)).collect(),
+        }
+    }
+
+    fn view(&self) -> Detail<'_> {
+        Detail {
+            union_f: &self.union_f,
+            union_m: &self.union_m,
+            div_f: &self.div_f,
+            div_m: &self.div_m,
+            mothers: &self.mothers,
+            cohort_mothers: self.cohort_mothers.iter().map(|m| &m[..]).collect(),
+        }
+    }
+}
+
+impl BlockLayout {
+    /// Cohort `co`'s sub-cells on sex line `sex`, then the sentinel.
+    #[inline]
+    fn co_subs(&self, co: &CohortLayout, sex: usize) -> &[Sub] {
+        let (a, n) = co.subs[sex];
+        &self.sub_arena[a as usize..(a + n) as usize]
+    }
+
+    /// Their starts with the coarse index.
+    #[inline]
+    fn co_sub_starts(&self, co: &CohortLayout, sex: usize) -> CoarseRow<'_, u32> {
+        let (a, ni) = co.sub_starts[sex];
+        let (a, n) = (a as usize, co.subs[sex].1 as usize);
+        CoarseRow {
+            row: &self.sub_start_arena[a..a + n],
+            coarse: &self.sub_start_arena[a + n..a + n + ni as usize],
+        }
+    }
+
+    /// Cohort `co`'s non-union plan leaves.
+    #[inline]
+    fn co_nonunion(&self, co: &CohortLayout) -> &[NonUnionLeaf] {
+        let (a, n) = co.nonunion;
+        &self.nonunion_arena[a as usize..a as usize + n as usize]
+    }
+
+    /// Their starts, then the total.
+    #[inline]
+    fn co_nu_starts(&self, co: &CohortLayout) -> &[u64] {
+        let a = co.nu_starts as usize;
+        &self.nu_start_arena[a..a + co.nonunion.1 as usize + 1]
+    }
+
+    /// Cohort `co`'s parent line, for children who arrived with their
+    /// parents.
+    #[inline]
+    fn co_parents(&self, co: &CohortLayout) -> Option<&ParentLine> {
+        (co.parents != u32::MAX).then(|| &self.parent_lines[co.parents as usize])
+    }
+}
+
 /// A cell's plans with its block's arenas.
 #[derive(Clone, Copy)]
 struct PlanView<'a> {
@@ -536,6 +637,29 @@ struct BlockLayout {
     /// in ascending order, as the ledger lists them. Inline, so finding a
     /// mother's range is one index, not a search.
     parent_starts: [u64; PARENT_SLOTS + 1],
+    /// Area mode: mothers of other groups (who gave birth in this block's
+    /// area), after the age slots: `(mother block, start)` in mother-block
+    /// order; the natives' total ends the last.
+    parent_other: Vec<(u32, u64)>,
+    /// Area mode, for blocks whose women give birth in more than one area:
+    /// each mother's age's birth line cut into runs of one area, as
+    /// `(start on the line, start within the area's births, area)`, the
+    /// runs of age `a` at `area_run_starts[a - MIN_BIRTH_AGE]..[+1]`. Empty
+    /// when every birth is in the block's own area.
+    area_runs: Vec<(u32, u32, u8)>,
+    area_run_starts: Vec<u32>,
+    /// Area mode: the women's plan leaves whose couples move to another
+    /// area (stage 3), `(leaf index, move offset from the union year,
+    /// destination area)`, by leaf index.
+    leaf_moves: Vec<(u32, u8, u8)>,
+    /// The cohorts' arrays, in arenas (one allocation each per block, not
+    /// several per cohort): sub-cells, their coarse-indexed starts,
+    /// non-union plans and their starts, and parent lines.
+    sub_arena: Vec<Sub>,
+    sub_start_arena: Vec<u32>,
+    nonunion_arena: Vec<NonUnionLeaf>,
+    nu_start_arena: Vec<u64>,
+    parent_lines: Vec<ParentLine>,
     /// Births to the block's women by mother's age (rows, from
     /// [`MIN_BIRTH_AGE`]) and union cell group (columns: a `(year, kind)`,
     /// every class): row `a` holds the cumulative count of union births at
@@ -578,22 +702,29 @@ struct CohortLayout {
     females: u64,
     /// Arrival year (`None`: natives).
     arrival: Option<i32>,
+    /// Natives' migration class (area mode): `(destination area, move
+    /// year)`.
+    class: Option<(u16, i32)>,
     /// Life-line permutation over the cohort's raw ids.
     life_perm: CompactPerm,
     /// Per sex (`Sex as usize`): the cohort's sub-cells in year order, then
-    /// a sentinel (see [`Sub`]).
-    subs: [Vec<Sub>; 2],
-    /// The parts' starts on each line, coarse-indexed for the search.
-    sub_starts: [Coarse<u32>; 2],
-    /// The women's non-union plan partition and its permutation.
-    nonunion: Vec<NonUnionLeaf>,
-    nu_starts: Vec<u64>,
+    /// a sentinel (see [`Sub`]): `(start, len)` in the block's sub arena.
+    subs: [(u32, u32); 2],
+    /// Per sex: the sub-cells' starts on the line, then their coarse index
+    /// (`index len` entries), from `start` in the block's start arena.
+    sub_starts: [(u32, u16); 2],
+    /// The women's non-union plan partition, `(start, leaves)` in the
+    /// block's arena, its starts (one more entry, from `nu_starts`) and its
+    /// permutation.
+    nonunion: (u32, u16),
+    nu_starts: u32,
     nonunion_perm: CompactPerm,
     /// Women in the leading leaf without non-union births (most of them),
     /// inline, so their lookups skip the leaf arrays.
     nu_none: u64,
-    /// Children who arrived with their parents: their parent line.
-    parents: Option<Box<ParentLine>>,
+    /// Children who arrived with their parents: their parent line, an index
+    /// into the block's parent lines (`u32::MAX`: none).
+    parents: u32,
 }
 
 /// Arenas of a block's cell and plan arrays, filled while building its
@@ -604,6 +735,9 @@ struct Arenas {
     parts: Vec<(u16, u32, u32)>,
     free: Vec<u32>,
     leaves: Vec<Leaf>,
+    /// Area mode: the leaves whose couples move (stage 3), `(leaf index,
+    /// move offset from the union year, destination area)`, by leaf index.
+    leaf_moves: Vec<(u32, u8, u8)>,
     arrivals: Vec<(u8, u32)>,
     plans: Vec<PlanHead>,
 }
@@ -617,8 +751,16 @@ struct ParentLine {
 }
 
 /// Sort key of a union cell: year, then kind, then dissolution class.
-fn cell_key(year: i32, kind: CellKind, class: u8) -> i32 {
-    ((8 * year + kind as i32) << 6) | class as i32
+// A cell's layout is one cache line (R1c stage A).
+const _: () = assert!(std::mem::size_of::<CellLayout>() == 64);
+
+/// A cell's area as stored in its 64-byte layout (at most 256 areas).
+fn area8(area: u16) -> u8 {
+    u8::try_from(area).expect("at most 256 areas")
+}
+
+fn cell_key(year: i32, kind: CellKind, class: u8, area: u8) -> i32 {
+    ((((8 * year + kind as i32) << 6) | class as i32) << 8) | area as i32
 }
 
 impl CellLayout {
@@ -650,7 +792,7 @@ impl CellLayout {
 
 /// A right-role cell's free couple: `(year, kind, class, left block)` (see
 /// `World::free_marks`).
-type FreeMark = (i32, CellKind, u8, u32);
+type FreeMark = (i32, CellKind, u8, u8, u32);
 
 /// Sex and kind of the partners' cells for a cell of `sex` and `kind`.
 fn partner_cell(sex: Sex, kind: CellKind) -> (Sex, CellKind) {
@@ -742,18 +884,20 @@ struct LifePos {
 pub struct World {
     ledger: Ledger,
     key: Key,
-    /// Id → block index: bucket `id >> bucket_shift` spans blocks
-    /// `bucket_block[i]..=bucket_block[i + 1]`, so most ids resolve with
-    /// no search (see [`Self::decode`]).
-    bucket_shift: u32,
-    bucket_block: Vec<u32>,
+    /// Id → block index over the ledger's block starts, so most ids
+    /// resolve with no search (see [`Self::decode`]).
+    buckets: BucketIndex,
     layouts: Vec<BlockLayout>,
-    /// Survival tables `l[0..=MAX_AGE + 1]`, one row per (block, sex),
-    /// flat: row `2 * block + sex`.
+    /// Survival tables `l[0..=MAX_AGE + 1]`, one row per (table, sex),
+    /// flat: row `2 * table + sex`. A table depends only on the birth year
+    /// and heritage, so blocks share them (`life_of`).
     lifetables: Vec<f64>,
+    /// Each block's life table.
+    life_of: Vec<u32>,
     /// The natives' cumulative residual death tables, same rows.
     residuals: Vec<f64>,
-    /// Coarse indexes of both, [`COARSE_LEN`] entries per row.
+    /// Coarse indexes of both, [`COARSE_LEN`] entries per row
+    /// ([`coarse_index`]).
     lifetable_coarse: Vec<f64>,
     residual_coarse: Vec<f64>,
     /// Name sampling tables, built lazily (N1).
@@ -762,17 +906,32 @@ pub struct World {
 
 impl World {
     /// Build a world from parameters and a seed.
+    /// Build the world of `params` and `seed`. The ledger's per-block
+    /// detail (union cells, divorced sources, mothers), which only the
+    /// layouts read, is handed to each block's layout build and freed as it
+    /// finishes, so the world doesn't hold it twice; see
+    /// [`Self::build_keeping_ledger`] to keep it.
     pub fn build(params: Params, seed: u64) -> Self {
+        Self::build_with(params, seed, false)
+    }
+
+    /// [`Self::build`], keeping the ledger's per-block detail (for checks
+    /// and reports that read the ledger's cells, and the fingerprint).
+    pub fn build_keeping_ledger(params: Params, seed: u64) -> Self {
+        Self::build_with(params, seed, true)
+    }
+
+    fn build_with(params: Params, seed: u64, keep: bool) -> Self {
         let ledger = Ledger::build(params, seed);
         let n = ledger.blocks.len() as u32;
-        let (bucket_shift, bucket_block) = Self::build_buckets(&ledger.base);
+        let buckets = BucketIndex::new(&ledger.base);
         let mut w = Self {
             ledger,
             key: Key::from_seed(seed),
-            bucket_shift,
-            bucket_block,
+            buckets,
             layouts: Vec::new(),
             lifetables: Vec::new(),
+            life_of: Vec::new(),
             residuals: Vec::new(),
             lifetable_coarse: Vec::new(),
             residual_coarse: Vec::new(),
@@ -782,29 +941,145 @@ impl World {
         // Each block's structures are a pure function of the ledger, so
         // they are built on every core.
         let marks = Self::free_marks(&w.ledger);
-        w.layouts = (0..n)
-            .into_par_iter()
-            .map(|b| w.build_layout(b, &marks[b as usize]))
+        w.layouts = if keep {
+            (0..n)
+                .into_par_iter()
+                .map(|b| w.build_layout(b, &marks[b as usize], &Detail::of(w.block(b))))
+                .collect()
+        } else {
+            let owned: Vec<OwnedDetail> = w.ledger.blocks.iter_mut().map(OwnedDetail::take).collect();
+            let w = &w;
+            owned
+                .into_par_iter()
+                .enumerate()
+                .map(|(b, d)| w.build_layout(b as u32, &marks[b], &d.view()))
+                .collect()
+        };
+        // One life table per (birth year, heritage), built from its first
+        // block.
+        let mut first_of: std::collections::HashMap<(i32, u8), u32> = Default::default();
+        let mut reps: Vec<u32> = Vec::new();
+        w.life_of = (0..n)
+            .map(|b| {
+                let block = w.block(b);
+                *first_of
+                    .entry((block.year, block.heritage.index() as u8))
+                    .or_insert_with(|| {
+                        reps.push(b);
+                        reps.len() as u32 - 1
+                    })
+            })
             .collect();
-        let tables: Vec<[Vec<f64>; 2]> = (0..n)
+        let tables: Vec<[Vec<f64>; 2]> = reps
             .into_par_iter()
             .map(|b| w.build_lifetable(b))
             .collect();
+        let n_tables = tables.len();
         w.lifetables = tables.into_iter().flatten().flatten().collect();
         let residuals: Vec<[Vec<f64>; 2]> = (0..n)
             .into_par_iter()
             .map(|b| w.build_residual(b))
             .collect();
         w.residuals = residuals.into_iter().flatten().flatten().collect();
-        assert_eq!(
-            w.lifetables.len(),
-            2 * n as usize * TABLE,
-            "life table rows"
-        );
+        assert_eq!(w.lifetables.len(), 2 * n_tables * TABLE, "life table rows");
         assert_eq!(w.residuals.len(), 2 * n as usize * TABLE, "residual rows");
         w.lifetable_coarse = w.lifetables.chunks(TABLE).flat_map(coarse_index).collect();
         w.residual_coarse = w.residuals.chunks(TABLE).flat_map(coarse_index).collect();
+        release_freed_memory();
         w
+    }
+
+    /// Union cells, women's (left-role) side.
+    pub fn union_cell_count(&self) -> usize {
+        self.layouts.iter().map(|l| l.f_cells.len()).sum()
+    }
+
+    /// Heap bytes by component, `(name, bytes, allocations)`, for memory
+    /// work: the ledger's records and the world's layouts and tables.
+    /// Capacities are counted, not allocator overhead (about 16 bytes per
+    /// allocation with glibc, hence the allocation counts).
+    pub fn memory_report(&self) -> Vec<(&'static str, usize, usize)> {
+        use std::mem::size_of;
+        fn v<T>(x: &Vec<T>) -> (usize, usize) {
+            (x.capacity() * size_of::<T>(), (x.capacity() > 0) as usize)
+        }
+        let mut out: Vec<(&'static str, usize, usize)> = Vec::new();
+        let mut add = |name: &'static str, (b, n): (usize, usize)| match out
+            .iter_mut()
+            .find(|e| e.0 == name)
+        {
+            Some(e) => {
+                e.1 += b;
+                e.2 += n;
+            }
+            None => out.push((name, b, n)),
+        };
+        let l = &self.ledger;
+        add("ledger: blocks", v(&l.blocks));
+        for b in &l.blocks {
+            add("ledger: cohorts", v(&b.cohorts));
+            for c in &b.cohorts {
+                add("ledger: cohort mothers", v(&c.mothers));
+            }
+            add("ledger: block mothers", v(&b.mothers));
+            for cells in [&b.union_f, &b.union_m] {
+                add("ledger: union cells", v(cells));
+                for c in cells {
+                    add("ledger: cell partners", v(&c.partners));
+                    add("ledger: cell cohorts", v(&c.cohorts));
+                    add("ledger: cell sources", v(&c.sources));
+                }
+            }
+            for divs in [&b.div_f, &b.div_m] {
+                add("ledger: divorced sources", v(divs));
+                for d in divs {
+                    add("ledger: source parts", v(&d.parts));
+                    add("ledger: source part areas", v(&d.part_areas));
+                }
+            }
+        }
+        add("layouts", v(&self.layouts));
+        for lay in &self.layouts {
+            add("layout: cells", v(&lay.f_cells));
+            add("layout: cells", v(&lay.m_cells));
+            add("layout: cell keys", (lay.f_keys.heap_bytes() + lay.m_keys.heap_bytes(), 2));
+            add("layout: cohorts", v(&lay.cohorts));
+            add("layout: cohort sub-cells", v(&lay.sub_arena));
+            add("layout: cohort sub-cells", v(&lay.sub_start_arena));
+            add("layout: non-union plans", v(&lay.nonunion_arena));
+            add("layout: non-union plans", v(&lay.nu_start_arena));
+            add("layout: parent lines", v(&lay.parent_lines));
+            add("layout: cohorts", v(&lay.cohort_starts));
+            add("layout: parent lines", v(&lay.parent_other));
+            add("layout: area runs", v(&lay.area_runs));
+            add("layout: area runs", v(&lay.area_run_starts));
+            add("layout: leaf moves", v(&lay.leaf_moves));
+            add("layout: birth rows", v(&lay.birth_rows));
+            add("layout: birth rows", v(&lay.birth_coarse));
+            add("layout: birth rows", v(&lay.columns));
+            add("layout: plans", v(&lay.plans));
+            add("layout: slices", v(&lay.slice_arena));
+            add("layout: parts", v(&lay.part_arena));
+            add("layout: free couples", v(&lay.free_arena));
+            add("layout: plan leaves", v(&lay.leaf_arena));
+            add("layout: arrivals", v(&lay.arrival_arena));
+            add("layout: non-union events", v(&lay.nu_events));
+            add("layout: non-union events", v(&lay.nu_age_starts));
+            for s in &lay.sources {
+                add("layout: sources", v(s));
+            }
+            add("layout: sources", v(&lay.source_arena));
+            for s in &lay.source_of {
+                add("layout: sources", v(s));
+            }
+        }
+        add("life and residual tables", v(&self.lifetables));
+        add("life and residual tables", v(&self.life_of));
+        add("life and residual tables", v(&self.residuals));
+        add("life and residual tables", v(&self.lifetable_coarse));
+        add("life and residual tables", v(&self.residual_coarse));
+        out.sort_by_key(|e| std::cmp::Reverse(e.1));
+        out
     }
 
     /// The world's root key (for views keyed on people, such as
@@ -830,39 +1105,11 @@ impl World {
 
     // --- ids ------------------------------------------------------------------
 
-    /// Buckets of `2^shift` ids, about four per block, each mapped to the
-    /// first block it overlaps; one extra entry closes the last bucket.
-    fn build_buckets(base: &[u64]) -> (u32, Vec<u32>) {
-        let blocks = base.len() - 1;
-        let pop = base[blocks].max(1);
-        let target = (4 * blocks as u64).next_power_of_two().max(1);
-        let mut shift = 0;
-        while (pop - 1) >> shift >= target {
-            shift += 1;
-        }
-        let buckets = (((pop - 1) >> shift) + 1) as usize;
-        let block_of = |id: u64| (base.partition_point(|&s| s <= id) - 1).min(blocks - 1) as u32;
-        let mut table: Vec<u32> = (0..buckets)
-            .map(|i| block_of((i as u64) << shift))
-            .collect();
-        table.push(block_of(pop - 1));
-        (shift, table)
-    }
-
     /// `(block, raw)` for an id.
     pub(crate) fn decode(&self, id: PersonId) -> (u32, u64) {
         let id = id as u64;
         assert!(id < self.population(), "person id {id} out of range");
-        let i = (id >> self.bucket_shift) as usize;
-        let (lo, hi) = (
-            self.bucket_block[i] as usize,
-            self.bucket_block[i + 1] as usize,
-        );
-        let b = if lo == hi {
-            lo
-        } else {
-            lo + self.ledger.base[lo + 1..=hi].partition_point(|&s| s <= id)
-        };
+        let b = self.buckets.segment(&self.ledger.base, id);
         (b as u32, id - self.ledger.base[b])
     }
 
@@ -900,7 +1147,13 @@ impl World {
                     }
                     let (rs, rk) = partner_cell(sex, c.kind);
                     let rb = c.partners[0].0;
-                    marks[rb as usize][rs as usize].push((c.year, rk, c.class, wb as u32));
+                    marks[rb as usize][rs as usize].push((
+                        c.year,
+                        rk,
+                        c.class,
+                        area8(c.area),
+                        wb as u32,
+                    ));
                 }
             }
         }
@@ -910,8 +1163,9 @@ impl World {
         marks
     }
 
-    fn build_layout(&self, b: u32, free_marks: &[Vec<FreeMark>; 2]) -> BlockLayout {
+    fn build_layout(&self, b: u32, free_marks: &[Vec<FreeMark>; 2], d: &Detail<'_>) -> BlockLayout {
         let block = self.block(b);
+        let areas_on = self.ledger.params.places.by_area;
         let tables = &self.ledger.plan_tables;
         let mut ar = Arenas::default();
         let cells = |src: &[crate::ledger::UnionCell], sex: Sex, ar: &mut Arenas| {
@@ -937,7 +1191,11 @@ impl World {
                 let plan = if !with_plans {
                     NO_PLAN
                 } else {
-                    let pk = plan_key(self.ledger.plan_root, b, c.year, c.kind, c.class);
+                    let pk = area_key(
+                        plan_key(self.ledger.plan_root, b, c.year, c.kind, c.class),
+                        c.area,
+                        areas_on,
+                    );
                     let leaves = ar.leaves.len() as u32;
                     let mut at = 0u64;
                     let arrivals = if c.kind == CellKind::Arrival {
@@ -961,7 +1219,15 @@ impl World {
                             pk,
                             &mut plans,
                         );
-                        for leaf in &plans {
+                        // Area mode: each leaf splits over its couples' moves
+                        // (stage 3), as the ledger splits it.
+                        let moves = self
+                            .ledger
+                            .couple_moves
+                            .as_ref()
+                            .filter(|_| sex == Sex::Female && !c.kind.same_sex())
+                            .map(|m| (m, m.offsets(c.year, age, cutoff(c.class))));
+                        for (li, leaf) in plans.iter().enumerate() {
                             let (offs, n) = leaf_births(
                                 leaf,
                                 age,
@@ -969,8 +1235,24 @@ impl World {
                                 &self.ledger.params.fertility,
                             );
                             let mask = offs[..n].iter().fold(0u32, |m, &o| m | 1 << o);
-                            ar.leaves.push(Leaf::pack(at, mask));
-                            at += leaf.count;
+                            let mut push = |k: u8, dest: u16, count: u64| {
+                                if k > 0 {
+                                    ar.leaf_moves.push((ar.leaves.len() as u32, k, area8(dest)));
+                                }
+                                ar.leaves.push(Leaf::pack(at, mask));
+                                at += count;
+                            };
+                            match &moves {
+                                Some((m, offsets)) => m.split(
+                                    offsets,
+                                    leaf.count,
+                                    c.year,
+                                    c.area,
+                                    move_key(pk, li),
+                                    &mut push,
+                                ),
+                                None => push(0, c.area, leaf.count),
+                            }
                         }
                         u32::MAX
                     };
@@ -980,10 +1262,14 @@ impl World {
                     ar.plans.push(PlanHead {
                         perm: CompactPerm::new(
                             c.total,
-                            self.key.with3(
-                                tag(TAG_PLAN),
-                                b as u64,
-                                (c.year as i64 as u64) << 8 | c.class as u64,
+                            area_key(
+                                self.key.with3(
+                                    tag(TAG_PLAN),
+                                    b as u64,
+                                    (c.year as i64 as u64) << 8 | c.class as u64,
+                                ),
+                                c.area,
+                                areas_on,
                             ),
                         )
                         .parts(),
@@ -1006,12 +1292,12 @@ impl World {
                 let free = ar.free.len() as u32;
                 if right {
                     let marks = &free_marks[s as usize];
-                    let key = (c.year, c.kind, c.class);
-                    let from = marks.partition_point(|m| (m.0, m.1, m.2) < key);
-                    let to = from + marks[from..].partition_point(|m| (m.0, m.1, m.2) == key);
+                    let key = (c.year, c.kind, c.class, area8(c.area));
+                    let from = marks.partition_point(|m| (m.0, m.1, m.2, m.3) < key);
+                    let to = from + marks[from..].partition_point(|m| (m.0, m.1, m.2, m.3) == key);
                     let alone = &marks[from..to];
                     for (&(wb, n), sl) in c.partners.iter().zip(&ar.slices[slices as usize..]) {
-                        if alone.iter().any(|m| m.3 == wb) {
+                        if alone.iter().any(|m| m.4 == wb) {
                             debug_assert_eq!(n, 1, "a lone partner's slice holds one couple");
                             ar.free.push(sl.start);
                         }
@@ -1034,10 +1320,14 @@ impl World {
                 out.push(CellLayout {
                     perm: CompactPerm::new(
                         c.total,
-                        self.key.with3(
-                            tag(TAG_PARTNER),
-                            b as u64,
-                            (((c.year as i64 as u64) << 1) | s) << 8 | c.class as u64,
+                        area_key(
+                            self.key.with3(
+                                tag(TAG_PARTNER),
+                                b as u64,
+                                (((c.year as i64 as u64) << 1) | s) << 8 | c.class as u64,
+                            ),
+                            c.area,
+                            areas_on,
                         ),
                     )
                     .parts(),
@@ -1056,12 +1346,13 @@ impl World {
                     kind: c.kind,
                     sex,
                     class: c.class,
+                    area: area8(c.area),
                 });
             }
             out
         };
-        let mut f_cells = cells(&block.union_f, Sex::Female, &mut ar);
-        let mut m_cells = cells(&block.union_m, Sex::Male, &mut ar);
+        let mut f_cells = cells(d.union_f, Sex::Female, &mut ar);
+        let mut m_cells = cells(d.union_m, Sex::Male, &mut ar);
         // Entry cohorts: raw ranges, life lines and non-union plans. Each
         // cohort's sex line is its sub-cells in year order, then the rest.
         let n_co = block.cohorts.len();
@@ -1099,23 +1390,34 @@ impl World {
         let mut sources: [Vec<SourceLayout>; 2] = [Vec::new(), Vec::new()];
         let mut source_arena: Vec<SourcePart> = Vec::new();
         let mut source_of = [vec![u32::MAX; f_cells.len()], vec![u32::MAX; m_cells.len()]];
-        for (si, (divs, cells)) in [(&block.div_f, &f_cells), (&block.div_m, &m_cells)]
+        for (si, (divs, cells)) in [(d.div_f, &f_cells), (d.div_m, &m_cells)]
             .into_iter()
             .enumerate()
         {
-            let find = |year: i32, kind: CellKind, class: u8| -> usize {
+            let find = |year: i32, kind: CellKind, class: u8, area: u8| -> usize {
                 cells
-                    .binary_search_by_key(&(year, kind, class), |c| (c.year(), c.kind, c.class))
-                    .expect("a source's cells are recorded")
+                    .binary_search_by_key(&(year, kind, class, area), |c| {
+                        (c.year(), c.kind, c.class, c.area)
+                    })
+                    .unwrap_or_else(|_| {
+                        let near: Vec<_> = cells
+                            .iter()
+                            .filter(|c| c.year() == year)
+                            .map(|c| (c.kind, c.class, c.area))
+                            .collect();
+                        panic!(
+                            "a source's cells are recorded: block {b} sex {si} ({year}, {kind:?}, {class}, {area}); that year's cells {near:?}"
+                        )
+                    })
             };
             for (k, d) in divs.iter().enumerate() {
-                let ci = find(d.year, d.kind, d.class);
+                let ci = find(d.year, d.kind, d.class, area8(d.area));
                 source_of[si][ci] = k as u32;
                 let parts = source_arena.len() as u32;
                 let mut start = 0u32;
-                for &(y2, k2, c2, n) in &d.parts {
+                for (j, &(y2, k2, c2, n)) in d.parts.iter().enumerate() {
                     source_arena.push(SourcePart {
-                        cell: find(y2, k2, c2) as u32,
+                        cell: find(y2, k2, c2, area8(d.part_area(j))) as u32,
                         start,
                         count: n as u32,
                         at: 0,
@@ -1174,6 +1476,9 @@ impl World {
         let mut cohorts = Vec::with_capacity(n_co);
         let mut cohort_starts = Vec::with_capacity(n_co + 1);
         let mut raw = 0u64;
+        let (mut sub_arena, mut sub_start_arena) = (Vec::new(), Vec::new());
+        let (mut nonunion_arena, mut nu_start_arena) = (Vec::new(), Vec::new());
+        let mut parent_lines = Vec::new();
         for (c, (co, subs)) in block.cohorts.iter().zip(subs).enumerate() {
             let p = &self.ledger.params;
             let factor = p.heritage.fertility_factor(block.heritage, block.year + 25);
@@ -1194,31 +1499,57 @@ impl World {
                 }
             };
             cohort_starts.push(raw);
+            let mut sub_at = [(0u32, 0u32); 2];
+            let mut start_at = [(0u32, 0u16); 2];
+            for x in 0..2 {
+                sub_at[x] = (sub_arena.len() as u32, subs[x].len() as u32);
+                sub_arena.extend_from_slice(&subs[x]);
+                let a = sub_start_arena.len() as u32;
+                let starts: Vec<u32> = subs[x].iter().map(|s| s.start).collect();
+                sub_start_arena.extend_from_slice(&starts);
+                let before = sub_start_arena.len();
+                sub_start_arena.extend(coarse_index(&starts));
+                start_at[x] = (a, (sub_start_arena.len() - before) as u16);
+            }
+            let parents = if d.cohort_mothers[c].is_empty() {
+                u32::MAX
+            } else {
+                parent_lines.push(ParentLine {
+                    starts: self.parent_starts(block, d.cohort_mothers[c]),
+                    perm: CompactPerm::new(co.size, key(TAG_PARENT)),
+                });
+                parent_lines.len() as u32 - 1
+            };
+            let nu_none = nonunion
+                .first()
+                .filter(|l| l.births == 0)
+                .map_or(0, |l| l.count);
+            let nu_at = (
+                nonunion_arena.len() as u32,
+                u16::try_from(nonunion.len()).expect("non-union leaves fit u16"),
+            );
+            nonunion_arena.extend_from_slice(&nonunion);
+            let nu_starts_at = nu_start_arena.len() as u32;
+            nu_start_arena.extend_from_slice(&nu_starts);
             cohorts.push(CohortLayout {
                 raw_start: raw,
                 females: co.females,
                 arrival: co.arrival,
+                class: co.class,
                 life_perm: CompactPerm::new(co.size, key(TAG_LIFE)),
-                sub_starts: [0, 1].map(|x| Coarse::new(subs[x].iter().map(|s| s.start).collect())),
-                subs,
-                nu_none: nonunion
-                    .first()
-                    .filter(|l| l.births == 0)
-                    .map_or(0, |l| l.count),
-                nonunion,
-                nu_starts,
+                subs: sub_at,
+                sub_starts: start_at,
+                nu_none,
+                nonunion: nu_at,
+                nu_starts: nu_starts_at,
                 nonunion_perm: CompactPerm::new(co.females, key(TAG_NONUNION)),
-                parents: (!co.mothers.is_empty()).then(|| {
-                    Box::new(ParentLine {
-                        starts: self.parent_starts(block, &co.mothers),
-                        perm: CompactPerm::new(co.size, key(TAG_PARENT)),
-                    })
-                }),
+                parents,
             });
             raw += co.size;
         }
         cohort_starts.push(raw);
-        let parent_starts = self.parent_starts(block, &block.mothers);
+        let parent_starts = self.parent_starts(block, d.mothers);
+        let parent_other = self.parent_other(block, d.mothers, parent_starts[PARENT_SLOTS]);
         // Birth rows: cumulative union births per mother's age over the
         // columns, one per plan cell. (Grouping a year's class-cells into one
         // column made every birth lookup scan all their leaves: mother and
@@ -1269,8 +1600,8 @@ impl World {
         let birth_coarse: Vec<u32> = birth_rows
             .chunks(stride)
             .flat_map(|row| {
-                let mut c: Vec<u32> = row.iter().step_by(COARSE).copied().collect();
-                c.resize(stride.div_ceil(COARSE), u32::MAX);
+                let mut c: Vec<u32> = coarse_index(row).collect();
+                c.resize(coarse_len(stride), u32::MAX);
                 c
             })
             .collect();
@@ -1280,7 +1611,8 @@ impl World {
         let mut nu_events: Vec<(u8, u64, u16, u16, u8)> = Vec::new();
         for (c, co) in cohorts.iter().enumerate() {
             let first = self.first_birth_year(b, co);
-            for (li, leaf) in co.nonunion.iter().enumerate() {
+            let (a, n) = (co.nonunion.0 as usize, co.nonunion.1 as usize);
+            for (li, leaf) in nonunion_arena[a..a + n].iter().enumerate() {
                 for k in 0..leaf.births as usize {
                     if block.year + leaf.ages[k] as i32 >= first {
                         nu_events.push((leaf.ages[k], leaf.count, c as u16, li as u16, k as u8));
@@ -1292,19 +1624,144 @@ impl World {
         let nu_age_starts: Vec<u32> = (MIN_BIRTH_AGE..=MAX_BIRTH_AGE + 1)
             .map(|a| nu_events.partition_point(|e| (e.0 as i32) < a) as u32)
             .collect();
+        // Area mode: the area of each birth on the line (a union birth is in
+        // its cell's area; a non-union birth in its cohort's area that
+        // year), cut into runs where the block's women give birth in more
+        // than one area.
+        let own_area = if areas_on { area8(block.region) } else { 0 };
+        let col_area: Vec<u8> = (0..n_cols)
+            .map(|col| f_cells[ar.plans[columns[col] as usize].cell as usize].area)
+            .collect();
+        let nu_area = |c: u16, age: u8| -> u8 {
+            match block.cohorts[c as usize].class {
+                Some((dest, moves)) if block.year + age as i32 >= moves => area8(dest),
+                _ => own_area,
+            }
+        };
+        // Columns with moving couples (stage 3): their births at each age, in
+        // leaf order, by area.
+        let mut moved: std::collections::HashMap<(usize, usize), Vec<(u8, u64)>> =
+            std::collections::HashMap::new();
+        if !ar.leaf_moves.is_empty() {
+            for col in 0..n_cols {
+                for plan in &ar.plans[columns[col] as usize..columns[col + 1] as usize] {
+                    let first = plan.leaves as usize;
+                    let last = first + plan.n_leaves as usize;
+                    let lo = ar.leaf_moves.partition_point(|m| (m.0 as usize) < first);
+                    let hi = ar.leaf_moves.partition_point(|m| (m.0 as usize) < last);
+                    if lo == hi {
+                        continue;
+                    }
+                    let cell = &f_cells[plan.cell as usize];
+                    let first_ai = cell.year() - block.year - MIN_BIRTH_AGE;
+                    let mut mv = ar.leaf_moves[lo..hi].iter().peekable();
+                    for li in first..last {
+                        let (count, mut mask) =
+                            (ar.leaves[li + 1].start() - ar.leaves[li].start(), ar.leaves[li].mask());
+                        let k = match mv.peek() {
+                            Some(&&(i, k, dest)) if i as usize == li => {
+                                mv.next();
+                                Some((k as i32, dest))
+                            }
+                            _ => None,
+                        };
+                        while mask != 0 {
+                            let o = mask.trailing_zeros() as i32;
+                            mask &= mask - 1;
+                            let ai = first_ai + o;
+                            if !(0..ages as i32).contains(&ai) {
+                                continue;
+                            }
+                            // The area of upbringing (ledger stage 3).
+                            let area = match k {
+                                Some((k, dest))
+                                    if upbringing_moved(o, k as u8, cutoff(cell.class)) =>
+                                {
+                                    dest
+                                }
+                                _ => cell.area,
+                            };
+                            let chunks = moved.entry((ai as usize, col)).or_default();
+                            match chunks.last_mut() {
+                                Some(last) if last.0 == area => last.1 += count,
+                                _ => chunks.push((area, count)),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let multi = col_area.iter().any(|&a| a != own_area)
+            || !moved.is_empty()
+            || nu_events.iter().any(|e| nu_area(e.2, e.0) != own_area);
+        let (mut area_runs, mut area_run_starts): (Vec<(u32, u32, u8)>, Vec<u32>) =
+            (Vec::new(), Vec::new());
+        if multi {
+            for ai in 0..ages {
+                area_run_starts.push(area_runs.len() as u32);
+                let mut pos = 0u32;
+                let mut local = [0u32; 256];
+                let mut add = |area: u8, n: u64, runs: &mut Vec<(u32, u32, u8)>| {
+                    if n == 0 {
+                        return;
+                    }
+                    let first = runs.len() == area_run_starts[ai] as usize;
+                    if first || runs.last().unwrap().2 != area {
+                        runs.push((pos, local[area as usize], area));
+                    }
+                    local[area as usize] += n as u32;
+                    pos += n as u32;
+                };
+                for col in 0..n_cols {
+                    match moved.get(&(ai, col)) {
+                        Some(chunks) => {
+                            for &(area, n) in chunks {
+                                add(area, n, &mut area_runs);
+                            }
+                        }
+                        None => add(col_area[col], births[ai * stride + col], &mut area_runs),
+                    }
+                }
+                let (lo, hi) = (nu_age_starts[ai] as usize, nu_age_starts[ai + 1] as usize);
+                for e in &nu_events[lo..hi] {
+                    add(nu_area(e.2, e.0), e.1, &mut area_runs);
+                }
+            }
+            area_run_starts.push(area_runs.len() as u32);
+        }
         let nu_events = nu_events
             .into_iter()
             .map(|(_, count, c, li, k)| (count, c, li, k))
             .collect();
-        let natives = block.cohorts.first().map_or(0, |c| c.size);
+        // Natives: the stayers and any migration classes (area mode), first.
+        let natives = block
+            .cohorts
+            .iter()
+            .take_while(|c| c.arrival.is_none())
+            .map(|c| c.size)
+            .sum();
         let Arenas {
             slices: slice_arena,
             parts: part_arena,
             free: free_arena,
             leaves: leaf_arena,
+            leaf_moves,
             arrivals: arrival_arena,
             plans,
         } = ar;
+        // The arrays grew by doubling; the world keeps them for good.
+        fn fit<T>(mut v: Vec<T>) -> Vec<T> {
+            v.shrink_to_fit();
+            v
+        }
+        let (slice_arena, part_arena, free_arena) = (fit(slice_arena), fit(part_arena), fit(free_arena));
+        let (leaf_arena, leaf_moves, arrival_arena) = (fit(leaf_arena), fit(leaf_moves), fit(arrival_arena));
+        let (plans, sub_arena, sub_start_arena) = (fit(plans), fit(sub_arena), fit(sub_start_arena));
+        let (nonunion_arena, nu_start_arena) = (fit(nonunion_arena), fit(nu_start_arena));
+        let (parent_lines, f_cells, m_cells) = (fit(parent_lines), fit(f_cells), fit(m_cells));
+        let (source_arena, area_runs, area_run_starts) = (fit(source_arena), fit(area_runs), fit(area_run_starts));
+        let sources = sources.map(fit);
+        let source_of = source_of.map(fit);
         BlockLayout {
             birth_rows,
             birth_coarse,
@@ -1320,13 +1777,13 @@ impl World {
             f_keys: Coarse::new(
                 f_cells
                     .iter()
-                    .map(|c| cell_key(c.year(), c.kind, c.class))
+                    .map(|c| cell_key(c.year(), c.kind, c.class, c.area))
                     .collect(),
             ),
             m_keys: Coarse::new(
                 m_cells
                     .iter()
-                    .map(|c| cell_key(c.year(), c.kind, c.class))
+                    .map(|c| cell_key(c.year(), c.kind, c.class, c.area))
                     .collect(),
             ),
             f_cells,
@@ -1335,6 +1792,15 @@ impl World {
             cohort_starts,
             natives,
             parent_starts,
+            parent_other,
+            area_runs,
+            area_run_starts,
+            leaf_moves,
+            sub_arena,
+            sub_start_arena,
+            nonunion_arena,
+            nu_start_arena,
+            parent_lines,
             parent_perm: CompactPerm::new(natives, self.key.with2(TAG_PARENT, b as u64)),
             sources,
             source_arena,
@@ -1349,10 +1815,11 @@ impl World {
         let mut slot_births = [0u64; PARENT_SLOTS];
         for m in mothers {
             let mother = &self.ledger.blocks[m.mother as usize];
-            assert_eq!(
-                mother.group, block.group,
-                "a child is in its mother's lineage group"
-            );
+            if mother.group != block.group {
+                // Area mode: a mother of another group (see
+                // `Self::parent_other`).
+                continue;
+            }
             let age = block.year - mother.year;
             assert!(
                 (MIN_BIRTH_AGE..=MAX_BIRTH_AGE).contains(&age),
@@ -1365,6 +1832,21 @@ impl World {
             starts[k + 1] = starts[k] + slot_births[k];
         }
         starts
+    }
+
+    /// Area mode: the parent line's slots for mothers of other groups,
+    /// after the age slots (which end at `after`): `(mother block, start)`
+    /// in mother-block order.
+    fn parent_other(&self, block: &Block, mothers: &[MotherShare], after: u64) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        let mut at = after;
+        for m in mothers {
+            if self.ledger.blocks[m.mother as usize].group != block.group {
+                out.push((m.mother, at));
+                at += m.union_births + m.nonunion_births;
+            }
+        }
+        out
     }
 
     /// First calendar year a cohort's women can give birth in-world: after
@@ -1407,8 +1889,8 @@ impl World {
     fn life_pos(&self, id: PersonId) -> LifePos {
         let (block, raw) = self.decode(id);
         let layout = self.layout(block);
-        // Natives first: most ids need no cohort search.
-        let cohort = if raw < Self::natives(layout) {
+        // The stayers first: most ids need no cohort search.
+        let cohort = if layout.cohorts.len() == 1 || raw < layout.cohort_starts[1] {
             0
         } else {
             layout.cohort_starts.partition_point(|&s| s <= raw) - 1
@@ -1441,11 +1923,11 @@ impl World {
     /// A partnered person's sub-cell and in-cell index.
     fn sub_of(layout: &BlockLayout, p: &LifePos) -> Option<(Sub, u64)> {
         let co = &layout.cohorts[p.cohort as usize];
-        let starts = &co.sub_starts[p.sex as usize];
-        if p.offset >= *starts.values.last()? as u64 {
+        let starts = layout.co_sub_starts(co, p.sex as usize);
+        if p.offset >= *starts.row.last()? as u64 {
             return None;
         }
-        let s = co.subs[p.sex as usize][starts.count_le(p.offset as u32) - 1];
+        let s = layout.co_subs(co, p.sex as usize)[starts.count_le(p.offset as u32) - 1];
         Some((s, s.in_cell as u64 + (p.offset - s.start as u64)))
     }
 
@@ -1507,16 +1989,17 @@ impl World {
         self.id_of(block, self.raw_of(block, cohort, sex, offset))
     }
 
-    /// Index of the union cell of `year`, `kind` and `class`, if the block
-    /// has one.
+    /// Index of the union cell of `year`, `kind`, `class` and `area`, if
+    /// the block has one.
     fn cell_of(
         layout: &BlockLayout,
         sex: Sex,
         year: i32,
         kind: CellKind,
         class: u8,
+        area: u8,
     ) -> Option<usize> {
-        Self::keys(layout, sex).find(cell_key(year, kind, class))
+        Self::keys(layout, sex).find(cell_key(year, kind, class, area))
     }
 
     /// Indices of the union cells of `year` and `kind`, every class.
@@ -1527,8 +2010,8 @@ impl World {
         kind: CellKind,
     ) -> std::ops::Range<usize> {
         let keys = Self::keys(layout, sex);
-        let lo = cell_key(year, kind, 0);
-        keys.count_lt(lo)..keys.count_lt(lo + 64)
+        let lo = cell_key(year, kind, 0, 0);
+        keys.count_lt(lo)..keys.count_lt(lo + (64 << 8))
     }
 
     fn keys(layout: &BlockLayout, sex: Sex) -> &Coarse<i32> {
@@ -1607,12 +2090,37 @@ impl World {
     /// date, and an arriving couple the wife's. The date is keyed on the
     /// family and falls after the birth of any child born abroad in the
     /// arrival year. `None` for people born in-world and founders.
+    /// Area mode: a native's migration class, `(destination area, move
+    /// year)`: the ledger counts them in the destination from that year if
+    /// still single (whether or not [`Self::migration`] then happens).
+    pub fn migration_class(&self, id: PersonId) -> Option<(u16, i32)> {
+        let p = self.life_pos(id);
+        self.layout(p.block).cohorts[p.cohort as usize].class
+    }
+
+    /// Area mode: the long move of a native in a migration class, `(destination
+    /// area, time)` (ledger spec §6, stage 2c): at a keyed time in the class's
+    /// move year, if they are alive then and still in their first single
+    /// spell (no union begun before it; a union begun earlier that year is
+    /// already in the destination, the year's market area). `None` for
+    /// stayers, immigrants and outside area mode.
+    pub fn migration(&self, id: PersonId) -> Option<(u16, i64)> {
+        let (dest, year) = self.migration_class(id)?;
+        let start = year_start(year);
+        let span = (year_start(year + 1) - start) as u64;
+        let t = start + self.key.with2(TAG_MIGRATE, id as u64).below(span) as i64;
+        if self.death(id) <= t || self.union(id).is_some_and(|u| u.start <= t) {
+            return None;
+        }
+        Some((dest, t))
+    }
+
     pub fn arrival(&self, id: PersonId) -> Option<i64> {
         let p = self.life_pos(id);
         let layout = self.layout(p.block);
         let co = &layout.cohorts[p.cohort as usize];
         let t = co.arrival?;
-        let woman = if co.parents.is_some() {
+        let woman = if co.parents != u32::MAX {
             Some(self.mother(id).expect("a child arrives with the parents"))
         } else {
             match self.first_seat(&p) {
@@ -1651,12 +2159,12 @@ impl World {
         &self,
         block: u32,
         sex: Sex,
-        (year, kind, class): (i32, CellKind, u8),
+        (year, kind, class, area): (i32, CellKind, u8, u8),
         partner_block: u32,
         slot: u64,
     ) -> Option<PersonId> {
         let layout = self.layout(block);
-        let ci = Self::cell_of(layout, sex, year, kind, class)?;
+        let ci = Self::cell_of(layout, sex, year, kind, class, area)?;
         let cell = Self::cell(layout, sex, ci);
         let (start, len) = cell.slice_of(partner_block)?;
         if slot >= len {
@@ -1670,7 +2178,13 @@ impl World {
         let cell = Self::cell(self.layout(seat.block), seat.sex, seat.ci);
         let (pb, slot) = cell.slice_at(cell.perm().fwd(seat.i));
         let (psex, pkind) = cell.partner_cell();
-        self.slot_person(pb, psex, (cell.year(), pkind, cell.class), seat.block, slot)
+        self.slot_person(
+            pb,
+            psex,
+            (cell.year(), pkind, cell.class, cell.area),
+            seat.block,
+            slot,
+        )
     }
 
     /// The default (unrepaired) fathers a child can have: for a union birth
@@ -1715,26 +2229,89 @@ impl World {
         } else {
             let c = layout.cohort_starts.partition_point(|&s| s <= raw) - 1;
             let co = &layout.cohorts[c];
-            let pl = co.parents.as_ref()?;
+            let pl = layout.co_parents(co)?;
             (&pl.starts, pl.perm.fwd(raw - co.raw_start), co.arrival)
         };
-        let k = starts.partition_point(|&s| s <= q) - 1;
         let block = self.block(b);
+        if arrival.is_none() && q >= layout.parent_starts[PARENT_SLOTS] {
+            // Area mode: a mother of another group, who gave birth here.
+            let other = &layout.parent_other;
+            let (mb, start) = other[other.partition_point(|o| o.1 <= q) - 1];
+            let age = block.year - self.block(mb).year;
+            let e = self.from_area(mb, age, self.own_area(b), q - start);
+            return Some((mb, e, None));
+        }
+        let k = starts.partition_point(|&s| s <= q) - 1;
         let age = MAX_BIRTH_AGE - k as i32;
         let mb = self
             .ledger
             .block_of(block.year - age, block.group)
             .expect("the mother's block");
-        Some((mb, q - starts[k], arrival))
+        let e = match arrival {
+            Some(_) => q - starts[k],
+            None => self.from_area(mb, age, self.own_area(b), q - starts[k]),
+        };
+        Some((mb, e, arrival))
+    }
+
+    /// Area mode: a mother block's own area (its region; 0 otherwise).
+    fn own_area(&self, b: u32) -> u8 {
+        if self.ledger.params.places.by_area {
+            area8(self.block(b).region)
+        } else {
+            0
+        }
+    }
+
+    /// The area of position `e` on mother block `mb`'s birth line at
+    /// mother's age `age`, and its position among that area's births.
+    fn to_area(&self, mb: u32, age: i32, e: u64) -> (u8, u64) {
+        let layout = self.layout(mb);
+        if layout.area_runs.is_empty() {
+            return (self.own_area(mb), e);
+        }
+        let ai = (age - MIN_BIRTH_AGE) as usize;
+        let runs = &layout.area_runs
+            [layout.area_run_starts[ai] as usize..layout.area_run_starts[ai + 1] as usize];
+        let r = runs[runs.partition_point(|r| r.0 as u64 <= e) - 1];
+        (r.2, r.1 as u64 + e - r.0 as u64)
+    }
+
+    /// The inverse of [`Self::to_area`]: the position on the line of the
+    /// `local`-th birth in `area`.
+    fn from_area(&self, mb: u32, age: i32, area: u8, local: u64) -> u64 {
+        let layout = self.layout(mb);
+        if layout.area_runs.is_empty() {
+            return local;
+        }
+        let ai = (age - MIN_BIRTH_AGE) as usize;
+        let runs = &layout.area_runs
+            [layout.area_run_starts[ai] as usize..layout.area_run_starts[ai + 1] as usize];
+        for (i, r) in runs.iter().enumerate() {
+            let end = runs
+                .get(i + 1)
+                .map_or(u64::MAX, |n| r.1 as u64 + (n.0 - r.0) as u64);
+            if r.2 == area && local < end {
+                return r.0 as u64 + local - r.1 as u64;
+            }
+        }
+        unreachable!("the birth is on the mother's line")
     }
 
     /// The arrival cohort of a block for arrival year `t`, if any (cohorts
     /// after the natives are in arrival-year order).
     fn cohort_by_arrival(layout: &BlockLayout, t: i32) -> Option<usize> {
-        layout.cohorts[1..]
+        let n = Self::native_cohorts(layout);
+        layout.cohorts[n..]
             .binary_search_by_key(&Some(t), |c| c.arrival)
             .ok()
-            .map(|i| i + 1)
+            .map(|i| i + n)
+    }
+
+    /// Number of native cohorts (the stayers, then migration classes),
+    /// which come first.
+    fn native_cohorts(layout: &BlockLayout) -> usize {
+        layout.cohorts.partition_point(|c| c.arrival.is_none())
     }
 
     /// True if two people may not partner: siblings (shared mother), or
@@ -1871,7 +2448,7 @@ impl World {
         let (mb, slot) = cell.slice_at(q);
         let (msex, mkind) = cell.partner_cell();
         let ml = self.layout(mb);
-        let mci = Self::cell_of(ml, msex, cell.year(), mkind, cell.class)
+        let mci = Self::cell_of(ml, msex, cell.year(), mkind, cell.class, cell.area)
             .expect("the ledger records every slice on both sides");
         let mc = Self::cell(ml, msex, mci);
         let (start, _) = mc
@@ -1889,7 +2466,7 @@ impl World {
 
     /// Kin repair for position `q` of a woman's union cell (R1 plan D-R1.7).
     ///
-    /// Positions are repaired in small groups ([`repair_group`]): pairs
+    /// Positions are repaired in small groups ([`pair_group`]): pairs
     /// `(2k, 2k + 1)`, and in a cell with an odd count the last three
     /// positions together, so no position is left alone unless the cell has
     /// a single couple. Within a group the default men are permuted among
@@ -1910,7 +2487,7 @@ impl World {
         woman: Option<PersonId>,
         man: Option<(PersonId, ManSlot)>,
     ) -> Repair {
-        let (start, len) = repair_group(q, cell.total());
+        let (start, len) = pair_group(q, cell.total());
         let at = (q - start) as usize;
         let mut women = [0 as PersonId; 3];
         let mut men = [0 as PersonId; 3];
@@ -1940,12 +2517,11 @@ impl World {
 
     /// The permutation of `k` men among `k` women (woman `a` takes man
     /// `perm[a]`) with the fewest related couples; ties keep the earliest in
-    /// [`PERMS`], identity first.
+    /// [`least_cost_assignment`], identity first.
     fn least_related(&self, women: &[PersonId; 3], men: &[PersonId; 3], k: usize) -> [u8; 3] {
-        let mut perm = [0u8, 1, 2];
         // Common case: the default couples are all unrelated.
         if (0..k).all(|g| !self.related(women[g], men[g])) {
-            return perm;
+            return [0, 1, 2];
         }
         let mut rel = [[false; 3]; 3];
         for (a, row) in rel.iter_mut().enumerate().take(k) {
@@ -1953,19 +2529,11 @@ impl World {
                 *r = self.related(women[a], men[b]);
             }
         }
-        let mut best = usize::MAX;
-        for cand in PERMS[k] {
-            let cost = (0..k).filter(|&a| rel[a][cand[a] as usize]).count();
-            if cost < best {
-                best = cost;
-                perm[..k].copy_from_slice(cand);
-            }
-        }
-        perm
+        least_cost_assignment(k, |a, b| rel[a][b] as u32)
     }
 
     /// Men's-side kin repair, stage two: for the group of man-cell
-    /// position `ms` ([`repair_group`] over the man's cell), if the group
+    /// position `ms` ([`pair_group`] over the man's cell), if the group
     /// holds a free couple (a woman alone in her cell, whom the women's side
     /// could not repair). The group's women after the women's side are
     /// permuted among its men by [`Self::least_related`]. The men share a
@@ -1979,7 +2547,7 @@ impl World {
         (woman, wslot): (PersonId, ManSlot),
     ) -> Option<Repair> {
         let mc = Self::cell(self.layout(ms.block), ms.sex, ms.ci);
-        let (start, len) = repair_group(ms.pos, mc.total());
+        let (start, len) = pair_group(ms.pos, mc.total());
         let free = mc.free();
         let first_free = free.partition_point(|&f| (f as u64) < start);
         if free
@@ -2021,7 +2589,8 @@ impl World {
         let (wb, slot) = mc.slice_at(ms.pos);
         let (wsex, wkind) = mc.partner_cell();
         let wl = self.layout(wb);
-        let wci = Self::cell_of(wl, wsex, mc.year(), wkind, mc.class).expect("the woman's cell");
+        let wci =
+            Self::cell_of(wl, wsex, mc.year(), wkind, mc.class, mc.area).expect("the woman's cell");
         let wc = Self::cell(wl, wsex, wci);
         let (start, _) = wc
             .slice_of(ms.block)
@@ -2051,7 +2620,7 @@ impl World {
         let (wb, slot) = cell.slice_at(pos);
         let (wsex, wkind) = cell.partner_cell();
         let wl = self.layout(wb);
-        let wci = Self::cell_of(wl, wsex, cell.year(), wkind, cell.class)?;
+        let wci = Self::cell_of(wl, wsex, cell.year(), wkind, cell.class, cell.area)?;
         let wc = Self::cell(wl, wsex, wci);
         let (start, _) = wc.slice_of(p.block)?;
         let ms = ManSlot {
@@ -2156,15 +2725,7 @@ impl World {
             let year = cell.year();
             let start = year_start(year) + key.below(360) as i64 * DAY;
             let pmf = self.ledger.params.dissolution.pmf(year);
-            let u = key.with(3).unit() * pmf.iter().sum::<f64>();
-            let mut acc = 0.0;
-            let band = pmf
-                .iter()
-                .position(|&w| {
-                    acc += w;
-                    u < acc
-                })
-                .unwrap_or(0);
+            let band = pick_linear(&pmf, key.with(3).unit());
             let separation = DISSOLUTION_BANDS[band].map(|(lo, hi)| {
                 let years = lo as i32 + key.with(1).below((hi - lo) as u64) as i32;
                 year_start(year + years) + key.with(2).below(360) as i64 * DAY
@@ -2285,6 +2846,202 @@ impl World {
         Some((pl.leaves()[li], year, union_year))
     }
 
+    /// Area mode: the move of the woman's union at `seat` (stage 3), as her
+    /// plan leaf records it: `(offset from the union year, destination)`.
+    fn leaf_move_at(&self, seat: Seat) -> Option<(i32, u8)> {
+        if seat.sex != Sex::Female {
+            return None;
+        }
+        let layout = self.layout(seat.block);
+        if layout.leaf_moves.is_empty() {
+            return None;
+        }
+        let pl = Self::plan(layout, layout.f_cells[seat.ci].plan)?;
+        let li = pl.leaves as usize + pl.leaf_at(pl.perm().fwd(seat.i));
+        let i = layout
+            .leaf_moves
+            .binary_search_by_key(&(li as u32), |m| m.0)
+            .ok()?;
+        let (_, k, dest) = layout.leaf_moves[i];
+        Some((k as i32, dest))
+    }
+
+    /// Area mode: the area the ledger counts `x` in at `t`, with moves at
+    /// their exact times (ledger spec §9):
+    /// - single before a first union: the block's area (of upbringing),
+    ///   then the migration class's destination from its move;
+    /// - in a union: its cell area, then the couple's destination from its
+    ///   move;
+    /// - from a planned separation on (even after a partner's death): the
+    ///   union's cell area, where the divorced pool is (v1);
+    /// - widowed otherwise: as in the union (a widowed partner still makes
+    ///   the couple's move).
+    ///
+    /// Outside area mode, always 0.
+    pub fn area_at(&self, x: PersonId, t: i64) -> u16 {
+        let p = self.life_pos(x);
+        let seats = self.seats(&p);
+        let unions = self.unions(x);
+        let last = (0..MAX_UNIONS)
+            .rev()
+            .find(|&k| unions[k].is_some_and(|u| u.start <= t));
+        let Some(k) = last else {
+            return match self.migration(x) {
+                Some((dest, tm)) if tm <= t => dest,
+                _ => self.own_area(p.block) as u16,
+            };
+        };
+        let (u, seat) = (unions[k].unwrap(), seats[k].expect("a union has a seat"));
+        let cell_area = Self::cells(self.layout(seat.block), seat.sex)[seat.ci].area as u16;
+        // From the planned separation on, the ledger counts the divorced in
+        // the formation area (even if the partner died first).
+        if u.separation.is_some_and(|sep| t >= sep) {
+            return cell_area;
+        }
+        match self.couple_move_of(x, seat, &u) {
+            Some((dest, tm)) if tm <= t => dest,
+            _ => cell_area,
+        }
+    }
+
+    /// Area mode: every union that formed in `area`, as `(left partner,
+    /// union)`: the woman, or the left side of a same-sex union. Read from
+    /// the cells, block by block (for residence's closures).
+    pub fn unions_formed_in(&self, area: u16) -> Vec<(PersonId, Union)> {
+        let a8 = area8(area);
+        let mut out = Vec::new();
+        for b in 0..self.layouts.len() as u32 {
+            let layout = self.layout(b);
+            for sex in [Sex::Female, Sex::Male] {
+                for (ci, c) in Self::cells(layout, sex).iter().enumerate() {
+                    let left = match c.kind {
+                        CellKind::SameLeft => true,
+                        CellKind::SameRight => false,
+                        _ => sex == Sex::Female,
+                    };
+                    if !left || c.area != a8 {
+                        continue;
+                    }
+                    for i in 0..c.size as u64 {
+                        let x = self.person_in_cell(b, sex, ci, i);
+                        let seat = Seat { block: b, sex, ci, i };
+                        if let Some(u) = self.union_at(seat, x) {
+                            out.push((x, u));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Area mode: every woman whose union's plan leaf moves the couple to
+    /// `area` (stage 3), as `(woman, union start)`. Whether and when the
+    /// move happens is [`Self::couple_moves`].
+    pub fn couple_movers_into(&self, area: u16) -> Vec<(PersonId, i64)> {
+        let a8 = area8(area);
+        let mut out = Vec::new();
+        for b in 0..self.layouts.len() as u32 {
+            let layout = self.layout(b);
+            for &(li, _, dest) in &layout.leaf_moves {
+                if dest != a8 {
+                    continue;
+                }
+                // The plan holding leaf `li` (plans are in leaf order).
+                let pi = layout.plans.partition_point(|p| p.leaves <= li) - 1;
+                let head = &layout.plans[pi];
+                let pl = PlanView { p: head, l: layout };
+                let (lo, hi) = {
+                    let k = (li - head.leaves) as usize;
+                    let leaves = pl.leaves();
+                    (leaves[k].start(), leaves[k + 1].start())
+                };
+                let perm = pl.perm();
+                for pos in lo..hi {
+                    let i = perm.inv(pos);
+                    let ci = head.cell as usize;
+                    let x = self.person_in_cell(b, Sex::Female, ci, i);
+                    let seat = Seat { block: b, sex: Sex::Female, ci, i };
+                    if let Some(u) = self.union_at(seat, x) {
+                        out.push((x, u.start));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Area mode: each union's cell area (where it formed), aligned with
+    /// [`Self::unions`].
+    pub fn union_areas(&self, x: PersonId) -> [Option<u16>; MAX_UNIONS] {
+        self.seats(&self.life_pos(x)).map(|s| {
+            s.map(|s| Self::cells(self.layout(s.block), s.sex)[s.ci].area as u16)
+        })
+    }
+
+    /// True if `id` was born of their mother's union plan, false for a
+    /// non-union birth, a founder or a child born abroad.
+    pub fn union_birth(&self, id: PersonId) -> bool {
+        self.parent_line_pos(id)
+            .is_some_and(|pos| self.birth_cell(id, pos).is_some())
+    }
+
+    /// Area mode: each union's move to another area (stage 3), aligned with
+    /// [`Self::unions`]: `(destination area, time)`, at a keyed time in the
+    /// move year that the woman's plan leaf gives (always before any
+    /// separation), if `id` is alive then: the family moves, a widowed
+    /// partner too. `None` for unions that stay, same-sex unions and outside
+    /// area mode.
+    pub fn couple_moves(&self, id: PersonId) -> [Option<(u16, i64)>; MAX_UNIONS] {
+        let unions = self.unions(id);
+        let seats = self.seats(&self.life_pos(id));
+        let mut out = [None; MAX_UNIONS];
+        for (k, (u, seat)) in unions.iter().zip(seats).enumerate() {
+            if let (Some(u), Some(seat)) = (u, seat) {
+                out[k] = self.couple_move_of(id, seat, u);
+            }
+        }
+        out
+    }
+
+    /// The move of `id`'s union `u` at `seat` (see [`Self::couple_moves`]).
+    fn couple_move_of(&self, id: PersonId, seat: Seat, u: &Union) -> Option<(u16, i64)> {
+        let layout = self.layout(seat.block);
+        let cell = &Self::cells(layout, seat.sex)[seat.ci];
+        // The woman's seat: hers, or among her partner's seats the cell of
+        // this union (same year, class and area, the partner's kind).
+        let woman_seat = match (self.sex(id), self.sex(u.partner)) {
+            (Sex::Female, Sex::Male) => seat,
+            (Sex::Male, Sex::Female) => {
+                let wb = self.decode(u.partner).0;
+                let wl = self.layout(wb);
+                if wl.leaf_moves.is_empty() {
+                    return None;
+                }
+                self.seats(&self.life_pos(u.partner))
+                    .into_iter()
+                    .flatten()
+                    .find(|s| {
+                        let c = &wl.f_cells[s.ci];
+                        c.year() == cell.year()
+                            && c.kind == cell.kind.partner()
+                            && c.class == cell.class
+                            && c.area == cell.area
+                    })?
+            }
+            _ => return None,
+        };
+        let (off, dest) = self.leaf_move_at(woman_seat)?;
+        let year = cell.year() + off;
+        let span = (year_start(year + 1) - year_start(year)) as u64;
+        let t = year_start(year) + u.key.with(TAG_MIGRATE).below(span) as i64;
+        // The family moves, whoever of the couple is alive then (a widowed
+        // partner moves with the children, whose blocks are by area of
+        // upbringing).
+        let together = u.separation.is_none_or(|s| t < s);
+        (together && self.death(id) > t).then_some((dest as u16, t))
+    }
+
     /// Calendar year of the last planned in-world birth of a woman's union
     /// at `seat`, if any.
     fn plan_end_at(&self, seat: Seat) -> Option<i32> {
@@ -2295,23 +3052,26 @@ impl World {
     /// A woman's non-union births, if any: `None` (without reading the leaf
     /// arrays) for the many in the leading leaf without births.
     fn nonunion_births(&self, p: &LifePos) -> Option<NonUnionLeaf> {
-        let co = &self.layout(p.block).cohorts[p.cohort as usize];
+        let layout = self.layout(p.block);
+        let co = &layout.cohorts[p.cohort as usize];
         if co.nonunion_perm.fwd(p.offset) < co.nu_none {
             return None;
         }
-        let leaf = co.nonunion[self.nonunion_slot(p).0];
+        let leaf = layout.co_nonunion(co)[self.nonunion_slot(p).0];
         (leaf.births > 0).then_some(leaf)
     }
 
     /// A woman's non-union leaf index and her offset within it.
     fn nonunion_slot(&self, p: &LifePos) -> (usize, u64) {
-        let co = &self.layout(p.block).cohorts[p.cohort as usize];
+        let layout = self.layout(p.block);
+        let co = &layout.cohorts[p.cohort as usize];
         let pos = co.nonunion_perm.fwd(p.offset);
         if pos < co.nu_none {
             return (0, pos);
         }
-        let li = co.nu_starts.partition_point(|&s| s <= pos) - 1;
-        (li, pos - co.nu_starts[li])
+        let starts = layout.co_nu_starts(co);
+        let li = starts.partition_point(|&s| s <= pos) - 1;
+        (li, pos - starts[li])
     }
 
     // --- parents and children -----------------------------------------------------
@@ -2331,15 +3091,13 @@ impl World {
     /// index.
     fn column_of(layout: &BlockLayout, age: i32, e: u64) -> usize {
         let stride = layout.columns.len();
-        let cst = stride.div_ceil(COARSE);
+        let cst = coarse_len(stride);
         let ai = (age - MIN_BIRTH_AGE) as usize;
-        let row = &layout.birth_rows[ai * stride..(ai + 1) * stride];
-        let coarse = &layout.birth_coarse[ai * cst..(ai + 1) * cst];
-        let e = e as u32;
-        let c = coarse.partition_point(|&v| v <= e);
-        let lo = (c - 1) * COARSE;
-        let hi = (lo + COARSE).min(stride);
-        lo + row[lo..hi].partition_point(|&v| v <= e) - 1
+        let row = CoarseRow {
+            row: &layout.birth_rows[ai * stride..(ai + 1) * stride],
+            coarse: &layout.birth_coarse[ai * cst..(ai + 1) * cst],
+        };
+        row.count_le(e as u32) - 1
     }
 
     /// Non-union births of a block at mother's age `age`.
@@ -2511,7 +3269,7 @@ impl World {
             }
             EventKind::NonUnion { cohort, leaf, .. } => {
                 let co = &mlayout.cohorts[cohort as usize];
-                let pos = co.nu_starts[leaf as usize] + offset_in_cell;
+                let pos = mlayout.co_nu_starts(co)[leaf as usize] + offset_in_cell;
                 let offset = co.nonunion_perm.inv(pos);
                 (
                     self.id_of(mb, self.raw_of(mb, cohort, Sex::Female, offset)),
@@ -2584,7 +3342,7 @@ impl World {
                 + kids_before(cell as usize, leaf as usize);
             let clayout = self.layout(cb);
             let co = &clayout.cohorts[Self::cohort_by_arrival(clayout, c.year())?];
-            let pl = co.parents.as_ref()?;
+            let pl = clayout.co_parents(co)?;
             let q = pl.starts[k] + before + offset_in_cell;
             return Some(self.id_of(cb, co.raw_start + pl.perm.inv(q)));
         }
@@ -2593,8 +3351,26 @@ impl World {
         } else {
             start
         };
-        let q = self.layout(cb).parent_starts[k] + e + offset_in_cell;
-        Some(self.id_of(cb, self.parent_perm(cb).inv(q)))
+        // Area mode: the child is born into the area of the birth, in that
+        // area's block of the mother's heritage.
+        let (area, local) = self.to_area(mb, age, e + offset_in_cell);
+        let cb = if area == self.own_area(mb) {
+            cb
+        } else {
+            let heritages = self.ledger.params.heritage_count();
+            self.ledger.block_of(
+                year,
+                (area as usize * heritages + mother.heritage.index()) as u16,
+            )?
+        };
+        let cl = self.layout(cb);
+        let slot = if self.block(cb).group == mother.group {
+            cl.parent_starts[k]
+        } else {
+            let i = cl.parent_other.binary_search_by_key(&mb, |o| o.0).ok()?;
+            cl.parent_other[i].1
+        };
+        Some(self.id_of(cb, self.parent_perm(cb).inv(slot + local)))
     }
 
     /// A woman's births, in year order: her unions' planned births (both
@@ -2688,7 +3464,7 @@ impl World {
         let block_year = self.block(p.block).year;
         let (li, off) = self.nonunion_slot(p);
         let co = &layout.cohorts[p.cohort as usize];
-        let leaf = co.nonunion[li];
+        let leaf = layout.co_nonunion(co)[li];
         let first_birth_year = self.first_birth_year(p.block, co);
         for k in 0..leaf.births as usize {
             let year = block_year + leaf.ages[k] as i32;
@@ -2811,13 +3587,13 @@ impl World {
     // --- death ---------------------------------------------------------------------
 
     fn lifetable(&self, b: u32, sex: Sex) -> &[f64] {
-        let row = (2 * b as usize + sex as usize) * TABLE;
+        let row = (2 * self.life_of[b as usize] as usize + sex as usize) * TABLE;
         &self.lifetables[row..row + TABLE]
     }
 
-    fn lifetable_indexed(&self, b: u32, sex: Sex) -> Indexed<'_> {
-        let r = 2 * b as usize + sex as usize;
-        Indexed {
+    fn lifetable_indexed(&self, b: u32, sex: Sex) -> CoarseRow<'_, f64> {
+        let r = 2 * self.life_of[b as usize] as usize + sex as usize;
+        CoarseRow {
             row: &self.lifetables[r * TABLE..(r + 1) * TABLE],
             coarse: &self.lifetable_coarse[r * COARSE_LEN..(r + 1) * COARSE_LEN],
         }
@@ -2829,14 +3605,15 @@ impl World {
         let p = &self.ledger.params;
         let table = |sex| {
             let mut l = Vec::with_capacity(MAX_AGE as usize + 2);
-            let mut s = 1.0;
-            for a in 0..=MAX_AGE {
-                l.push(s);
-                let t = year + a as i32;
-                let f = p.heritage.mortality_factor(block.heritage, t);
-                s *= 1.0 - p.mortality.death_prob_scaled(sex, a, t, f);
-            }
-            l.push(0.0);
+            survivorship(
+                MAX_AGE,
+                |a| {
+                    let t = year + a as i32;
+                    let f = p.heritage.mortality_factor(block.heritage, t);
+                    p.mortality.death_prob_scaled(sex, a, t, f)
+                },
+                &mut l,
+            );
             l
         };
         [table(Sex::Female), table(Sex::Male)]
@@ -2858,9 +3635,9 @@ impl World {
     /// their partnered members carry. (Never-partnered immigrants draw from
     /// the life table conditioned on arrival: mixing them in would dilute
     /// the natives' childhood deaths.)
-    fn residual_indexed(&self, b: u32, sex: Sex) -> Indexed<'_> {
+    fn residual_indexed(&self, b: u32, sex: Sex) -> CoarseRow<'_, f64> {
         let r = 2 * b as usize + sex as usize;
-        Indexed {
+        CoarseRow {
             row: &self.residuals[r * TABLE..(r + 1) * TABLE],
             coarse: &self.residual_coarse[r * COARSE_LEN..(r + 1) * COARSE_LEN],
         }
@@ -2872,23 +3649,35 @@ impl World {
         let make = |sex: Sex| {
             let l = self.lifetable(b, sex);
             let cells = Self::cells(layout, sex);
-            // The natives' expected deaths by age from their entry age on.
-            let natives = &block.cohorts[0];
-            let n = match sex {
-                Sex::Female => natives.females,
-                Sex::Male => natives.size - natives.females,
-            };
+            // The natives' expected deaths by age from their entry age on
+            // (every native cohort: the stayers and migration classes).
+            let n_native = Self::native_cohorts(layout);
+            let n: u64 = block.cohorts[..n_native]
+                .iter()
+                .map(|c| match sex {
+                    Sex::Female => c.females,
+                    Sex::Male => c.size - c.females,
+                })
+                .sum();
             let a0 = (self.entry_age(b, 0) as usize).min(MAX_AGE as usize);
             let mut dens = vec![0.0; MAX_AGE as usize + 1];
-            if l[a0] > 0.0 {
-                for (a, d) in dens.iter_mut().enumerate().skip(a0) {
-                    *d = n as f64 * (l[a] - l[a + 1]) / l[a0];
-                }
-            }
+            add_conditional_deaths(l, a0, n as f64, &mut dens);
             for c in cells.iter() {
-                // The natives' share of the cell (cohort 0 comes first).
-                let share = if c.first_cohort == 0 {
-                    c.first_end as f64 / c.total() as f64
+                // Each partnered native is taken once, at their first
+                // union: a second union's members (parts by divorced source,
+                // not by cohort) already were.
+                if c.kind.second() {
+                    continue;
+                }
+                // The natives' share of the cell (native cohorts come first).
+                let share = if (c.first_cohort as usize) < n_native {
+                    let view = CellView { c, l: layout };
+                    let natives_end = view
+                        .parts()
+                        .iter()
+                        .find(|p| p.0 as usize >= n_native)
+                        .map_or(c.total(), |p| p.1 as u64);
+                    natives_end as f64 / c.total() as f64
                 } else {
                     0.0
                 };
@@ -2896,13 +3685,7 @@ impl World {
                 // is after any cohort's entry).
                 let req = |extra: i32| ((c.year() - block.year + 1 + extra).max(0)) as usize;
                 let mut take = |count: u64, a_req: usize| {
-                    if a_req > MAX_AGE as usize || l[a_req] <= 0.0 {
-                        return;
-                    }
-                    let count = count as f64 * share;
-                    for (a, d) in dens.iter_mut().enumerate().skip(a_req) {
-                        *d -= count * (l[a] - l[a + 1]) / l[a_req];
-                    }
+                    add_conditional_deaths(l, a_req, -(count as f64 * share), &mut dens);
                 };
                 // Women with plans survive them; everyone else partnered
                 // reaches the year after the union.
@@ -2915,7 +3698,7 @@ impl World {
                     None => take(c.total(), req(0)),
                 }
             }
-            let mut total: f64 = dens.iter().map(|d| d.max(0.0)).sum();
+            let mut total = positive_mass(&dens);
             if total <= 0.0 {
                 // Degenerate: fall back to the plain cohort table.
                 dens = (0..=MAX_AGE as usize)
@@ -2924,14 +3707,7 @@ impl World {
                 total = dens.iter().sum();
             }
             // Cumulative: `cum[a]` is the mass below age `a`.
-            let mut cum = Vec::with_capacity(dens.len() + 1);
-            let mut acc = 0.0;
-            cum.push(acc);
-            for d in dens {
-                acc += d.max(0.0) / total;
-                cum.push(acc);
-            }
-            cum
+            cumulative_normalized(&dens, total)
         };
         [make(Sex::Female), make(Sex::Male)]
     }
@@ -3005,10 +3781,10 @@ impl World {
         }
         let max = MAX_AGE as usize;
         let u = self.key.with2(TAG_DEATH, id as u64);
-        let draw = |req: i32, key: Key| -> usize {
+        let draw = |req: i32, key: Key| -> i32 {
             let req = (req.max(0) as usize).min(max);
-            match union_year {
-                None if p.cohort == 0 => {
+            (match union_year {
+                None if (p.cohort as usize) < Self::native_cohorts(self.layout(p.block)) => {
                     invert_cumulative(self.residual_indexed(p.block, p.sex), req, key.unit())
                 }
                 _ => invert_survival(
@@ -3016,19 +3792,15 @@ impl World {
                     req,
                     key.unit_open0(),
                 ),
-            }
+            }) as i32
         };
-        let a0 = draw(own, u);
-        let age = if a0 as i32 >= bound {
-            a0
-        } else {
-            let req = self.required_age(p) as i32;
-            if a0 as i32 >= req {
-                a0
-            } else {
-                draw(req, u.with(3))
-            }
-        };
+        let age = lazy_conditional(
+            own,
+            bound,
+            || self.required_age(p) as i32,
+            draw,
+            (u, u.with(3)),
+        ) as usize;
         // Death falls in calendar year `birth year + age`, after the birth
         // itself in the first year. A required age r therefore guarantees
         // survival through all of calendar year `birth year + r - 1`.
@@ -3052,110 +3824,8 @@ impl World {
     }
 }
 
-/// A table row with a coarse index: `coarse[k] = row[COARSE * k]`, one cache
-/// line, so a search reads it and one 16-entry segment instead of a binary
-/// search's scattered lines.
-#[derive(Clone, Copy)]
-struct Indexed<'a> {
-    row: &'a [f64],
-    coarse: &'a [f64],
-}
-
-/// Coarse index spacing and length for a [`TABLE`]-long row.
-const COARSE: usize = 16;
-const COARSE_LEN: usize = TABLE.div_ceil(COARSE);
-
-/// A sorted array with a coarse index (every [`COARSE`]th value), so a
-/// search reads the index (a line or two) and one segment of [`COARSE`]
-/// values instead of a binary search's scattered lines: R1c's class-cells
-/// made cell keys and cohort lines several times longer.
-#[derive(Clone, Debug, Default)]
-struct Coarse<T> {
-    values: Box<[T]>,
-    index: Box<[T]>,
-}
-
-impl<T: Copy + Ord> Coarse<T> {
-    fn new(values: Vec<T>) -> Self {
-        let index = values.iter().step_by(COARSE).copied().collect();
-        Self {
-            values: values.into_boxed_slice(),
-            index,
-        }
-    }
-
-    /// Number of values at most `x`.
-    fn count_le(&self, x: T) -> usize {
-        let c = self.index.partition_point(|&v| v <= x);
-        if c == 0 {
-            return 0;
-        }
-        let lo = (c - 1) * COARSE;
-        let hi = (lo + COARSE).min(self.values.len());
-        lo + self.values[lo..hi].partition_point(|&v| v <= x)
-    }
-
-    /// Number of values below `x`.
-    fn count_lt(&self, x: T) -> usize {
-        let c = self.index.partition_point(|&v| v < x);
-        if c == 0 {
-            return 0;
-        }
-        let lo = (c - 1) * COARSE;
-        let hi = (lo + COARSE).min(self.values.len());
-        lo + self.values[lo..hi].partition_point(|&v| v < x)
-    }
-
-    /// Index of `x`, if present.
-    fn find(&self, x: T) -> Option<usize> {
-        let i = self.count_lt(x);
-        (self.values.get(i) == Some(&x)).then_some(i)
-    }
-}
-
-/// Every [`COARSE`]th entry of a row.
-fn coarse_index(row: &[f64]) -> impl Iterator<Item = f64> + '_ {
-    row.iter().step_by(COARSE).copied()
-}
-
-impl Indexed<'_> {
-    /// The first index `>= from` where `pred` fails, for `pred` true on a
-    /// prefix of the row and false after (monotone). Equal to
-    /// `from + row[from..].partition_point(pred)`.
-    fn first_fail(&self, from: usize, pred: impl Fn(f64) -> bool) -> usize {
-        let k = self.coarse.partition_point(|&c| pred(c));
-        let first = if k == 0 {
-            0
-        } else {
-            let lo = COARSE * (k - 1) + 1;
-            let hi = (COARSE * k).min(self.row.len());
-            lo + self.row[lo..hi].partition_point(|&x| pred(x))
-        };
-        first.max(from)
-    }
-}
-
-/// Age at death from a survival table `l` (`l[a]`: share alive at age `a`,
-/// non-increasing, `l[MAX_AGE + 1] = 0`) conditioned on reaching `req`, by
-/// inversion of `u` in `(0, 1]`: the first age whose survivors fall below
-/// `u * l[req]`.
-fn invert_survival(l: Indexed, req: usize, u: f64) -> usize {
-    let target = u * l.row[req];
-    (l.first_fail(req + 1, |s| s >= target) - 1).min(MAX_AGE as usize)
-}
-
-/// Age at death from a cumulative table (`cum[a]`: mass below age `a`,
-/// non-decreasing) conditioned on reaching `req`, by inversion of `u` in
-/// `[0, 1)`: the first age whose cumulative mass passes the target.
-fn invert_cumulative(cum: Indexed, req: usize, u: f64) -> usize {
-    let max = MAX_AGE as usize;
-    let tail = cum.row[max + 1] - cum.row[req];
-    if tail <= 0.0 {
-        return req;
-    }
-    let threshold = cum.row[req] + u * tail;
-    (cum.first_fail(req + 1, |c| c <= threshold) - 1).min(max)
-}
+/// Coarse index length for a [`TABLE`]-long row.
+const COARSE_LEN: usize = coarse_len(TABLE);
 
 fn opposite(s: Sex) -> Sex {
     match s {
@@ -3198,27 +3868,6 @@ mod tests {
             tv += (h as f64 / n as f64 - exact).abs();
         }
         assert!(tv / 2.0 < 0.01, "total variation {:.4}", tv / 2.0);
-    }
-
-    #[test]
-    fn coarse_sorted_search_matches_a_plain_search() {
-        for n in [0usize, 1, 15, 16, 17, 100, 1000] {
-            let values: Vec<i32> = (0..n as i32).map(|i| 3 * i + (i % 3)).collect();
-            let c = Coarse::new(values.clone());
-            for x in -2..(3 * n as i32 + 8) {
-                assert_eq!(
-                    c.count_le(x),
-                    values.partition_point(|&v| v <= x),
-                    "n {n} x {x}"
-                );
-                assert_eq!(
-                    c.count_lt(x),
-                    values.partition_point(|&v| v < x),
-                    "n {n} x {x}"
-                );
-                assert_eq!(c.find(x), values.binary_search(&x).ok(), "n {n} x {x}");
-            }
-        }
     }
 
     #[test]
@@ -3352,12 +4001,12 @@ mod footprint {
         let cohort_bytes: usize = w
             .layouts
             .iter()
-            .flat_map(|l| &l.cohorts)
-            .map(|c| {
+            .flat_map(|l| l.cohorts.iter().map(move |c| (l, c)))
+            .map(|(l, c)| {
                 std::mem::size_of::<CohortLayout>()
-                    + (c.subs[0].len() + c.subs[1].len()) * std::mem::size_of::<Sub>()
-                    + c.nonunion.len() * std::mem::size_of::<NonUnionLeaf>()
-                    + c.nu_starts.len() * 8
+                    + (c.subs[0].1 + c.subs[1].1) as usize * std::mem::size_of::<Sub>()
+                    + l.co_nonunion(c).len() * std::mem::size_of::<NonUnionLeaf>()
+                    + l.co_nu_starts(c).len() * 8
             })
             .sum();
         println!(

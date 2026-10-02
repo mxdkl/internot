@@ -12,6 +12,10 @@
 //!   before t" and "last event before t" in `O(levels)` draws.
 //! - Recipe C, [`renewal_walk`] and [`hazard_time`]: life-course processes as
 //!   a walk from a fixed anchor, one keyed step per event, any duration law.
+//! - Regeneration: [`regen_state`] (a state redrawn at a stream's events is
+//!   the draw at the last one) and its nested form, [`nested_regen`] and
+//!   [`nested_regen_state`] (a move at level `j` redraws levels `≥ j`), each
+//!   one `last_before` per level, with no replay.
 //!
 //! Time is `i64` seconds since 1800-01-01T00:00:00Z ([`EPOCH_1800_UNIX`]).
 //!
@@ -302,6 +306,160 @@ pub fn regen_state<S>(
     }
 }
 
+/// Where a level's state was last regenerated: the event, and the level of
+/// the move that caused it (at most the level itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Regen {
+    pub event: Event,
+    pub from: usize,
+}
+
+/// Nested regeneration times (hierarchical "hold or redraw").
+///
+/// Levels `0..levels` are nested, 0 the coarsest (region ⊃ county ⊃ tract).
+/// A move at level `j` redraws every level `≥ j` and keeps the coarser ones.
+/// `last_before(j, t)` is the last move of level `j` strictly before `t`
+/// (for example [`PoissonTree::last_before`] on level `j`'s stream).
+/// Writes to `out[k]` the last regeneration of level `k`: the latest move of
+/// any level `≤ k`, so `out` is nondecreasing in time. Moves at the same
+/// instant count the finer level as the later one. Costs one `last_before`
+/// per level, whatever the number of moves: no replay.
+///
+/// Panics if `out.len() < levels`.
+pub fn nested_regen(
+    levels: usize,
+    t: i64,
+    mut last_before: impl FnMut(usize, i64) -> Option<Event>,
+    out: &mut [Option<Regen>],
+) {
+    assert!(out.len() >= levels, "one output per level");
+    let mut best: Option<Regen> = None;
+    for (k, o) in out.iter_mut().enumerate().take(levels) {
+        if let Some(e) = last_before(k, t) {
+            if best.map_or(true, |b| e.t >= b.event.t) {
+                best = Some(Regen { event: e, from: k });
+            }
+        }
+        *o = best;
+    }
+}
+
+/// The nested state at `t`: level `k`'s state is the draw made at its last
+/// regeneration ([`nested_regen`]), under the level-`(k−1)` state.
+///
+/// That parent is the one in force at `t`, since no coarser move happened
+/// after level `k`'s regeneration: the regeneration lemma ([`regen_state`])
+/// applied level by level. `initial(k, parent)` gives a level's state before
+/// any regeneration; `draw(k, regen, key, parent)` draws it at a
+/// regeneration, with `key = regen.event.key.with(k)` so the levels redrawn
+/// by one move draw independently. `parent` is `None` at level 0. Writes the
+/// states, coarsest first, to `out` (cleared first).
+pub fn nested_regen_state<S>(
+    levels: usize,
+    t: i64,
+    mut last_before: impl FnMut(usize, i64) -> Option<Event>,
+    mut initial: impl FnMut(usize, Option<&S>) -> S,
+    mut draw: impl FnMut(usize, Regen, Key, Option<&S>) -> S,
+    out: &mut Vec<S>,
+) {
+    out.clear();
+    let mut best: Option<Regen> = None;
+    for k in 0..levels {
+        if let Some(e) = last_before(k, t) {
+            if best.map_or(true, |b| e.t >= b.event.t) {
+                best = Some(Regen { event: e, from: k });
+            }
+        }
+        let parent = out.last();
+        let s = match best {
+            Some(r) => draw(k, r, r.event.key.with(k as u64), parent),
+            None => initial(k, parent),
+        };
+        out.push(s);
+    }
+}
+
+/// The nested state at `t` when a level's own moves are drawn relative to
+/// an **anchor**: the state that level took at the last regeneration from a
+/// coarser level (its "home" there), or its initial state.
+///
+/// A move that redraws from level `j` sets level `j` by
+/// `draw_move(j, regen, key, parent, anchor_j)` (for example, a destination
+/// drawn by distance from home rather than from the current place), and
+/// every finer level `k > j` by `draw_fresh(k, regen, key, parent)`, which
+/// also becomes `k`'s new anchor. Anchors depend only on coarser
+/// regenerations, so the regeneration lemma still holds: one `last_before`
+/// per level, no replay. It matches a full replay exactly (tests). Keys are
+/// `regen.event.key.with(k)` as in [`nested_regen_state`].
+#[allow(clippy::type_complexity)]
+pub fn nested_regen_anchored<S: Clone>(
+    levels: usize,
+    t: i64,
+    mut last_before: impl FnMut(usize, i64) -> Option<Event>,
+    mut initial: impl FnMut(usize, Option<&S>) -> S,
+    mut draw_fresh: impl FnMut(usize, Regen, Key, Option<&S>) -> S,
+    mut draw_move: impl FnMut(usize, Regen, Key, Option<&S>, &S) -> S,
+    out: &mut Vec<S>,
+) {
+    out.clear();
+    // The latest regeneration from any level coarser than k (`coarser`),
+    // and from any level up to k (`best`).
+    let mut coarser: Option<Regen> = None;
+    for k in 0..levels {
+        let own = last_before(k, t);
+        let parent = out.last();
+        let anchor = match coarser {
+            Some(r) => draw_fresh(k, r, r.event.key.with(k as u64), parent),
+            None => initial(k, parent),
+        };
+        let state = match own {
+            // Its own move is the latest (ties go to the finer level).
+            Some(e) if coarser.map_or(true, |c| e.t >= c.event.t) => {
+                let r = Regen { event: e, from: k };
+                let s = draw_move(k, r, e.key.with(k as u64), parent, &anchor);
+                coarser = Some(r);
+                s
+            }
+            _ => anchor,
+        };
+        out.push(state);
+    }
+}
+
+/// Fixed-length epochs over absolute time with a keyed phase: epoch `e`
+/// is `[origin + e·span, origin + (e + 1)·span)`. Keying the phase per
+/// group keeps groups from all turning over on the same day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epochs {
+    pub origin: i64,
+    pub span: i64,
+}
+
+impl Epochs {
+    /// Epochs of `span` seconds whose first starts `key.below(span)` after
+    /// `start`.
+    #[inline]
+    pub fn keyed(start: i64, span: i64, key: Key) -> Self {
+        assert!(span > 0, "epochs need a positive length");
+        Self {
+            origin: start + key.below(span as u64) as i64,
+            span,
+        }
+    }
+
+    /// The epoch containing `t` (negative before the origin).
+    #[inline]
+    pub fn index(&self, t: i64) -> i64 {
+        (t - self.origin).div_euclid(self.span)
+    }
+
+    /// The start of epoch `e`.
+    #[inline]
+    pub fn start(&self, e: i64) -> i64 {
+        self.origin + e * self.span
+    }
+}
+
 /// Recipe C helper: time at which a piecewise-constant hazard, starting at
 /// `t0`, accumulates `e` units of integrated hazard (an Exponential(1)
 /// draw). `rate(t)` returns `(rate per second, end of this constant piece)`.
@@ -522,5 +680,274 @@ mod tests {
             times_short.push(t)
         });
         assert_eq!(&times_full[..times_short.len()], &times_short[..]);
+    }
+
+    /// Three nested levels, coarse moves rare and fine moves frequent.
+    fn level_trees(seed: u64) -> Vec<PoissonTree> {
+        [400.0, 120.0, 30.0]
+            .iter()
+            .enumerate()
+            .map(|(j, &days)| {
+                PoissonTree::new(
+                    Key::from_seed(seed).with(j as u64),
+                    0,
+                    DAY,
+                    15,
+                    move |a: i64, b: i64| (b - a) as f64 / (days * DAY as f64),
+                )
+            })
+            .collect()
+    }
+
+    fn mix(h: u64, v: u64) -> u64 {
+        (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+    }
+
+    /// The nested state by replaying every move in time order (finer level
+    /// later at equal times).
+    fn replay(trees: &[PoissonTree], t: i64) -> Vec<u64> {
+        let levels = trees.len();
+        let mut moves: Vec<(i64, usize, usize, Event)> = Vec::new();
+        for (j, tree) in trees.iter().enumerate() {
+            let mut evs = Vec::new();
+            tree.events(0, t.max(0), &mut evs);
+            moves.extend(evs.into_iter().enumerate().map(|(i, e)| (e.t, j, i, e)));
+        }
+        moves.sort_by_key(|m| (m.0, m.1, m.2));
+        let mut state: Vec<u64> = Vec::new();
+        for k in 0..levels {
+            let parent = state.last().copied().unwrap_or(0);
+            state.push(mix(parent, 1000 + k as u64));
+        }
+        for (_, j, _, e) in moves {
+            for k in j..levels {
+                let parent = if k == 0 { 0 } else { state[k - 1] };
+                state[k] = mix(parent, e.key.with(k as u64).bits());
+            }
+        }
+        state
+    }
+
+    fn nested(trees: &[PoissonTree], t: i64) -> Vec<u64> {
+        let mut out = Vec::new();
+        nested_regen_state(
+            trees.len(),
+            t,
+            |j, t| trees[j].last_before(t),
+            |k, parent: Option<&u64>| mix(parent.copied().unwrap_or(0), 1000 + k as u64),
+            |_, _, key, parent| mix(parent.copied().unwrap_or(0), key.bits()),
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn nested_regeneration_matches_a_full_replay() {
+        for seed in 0..6 {
+            let trees = level_trees(seed);
+            let span = (1i64 << 15) * DAY;
+            let mut fine = Vec::new();
+            trees[2].events(0, span, &mut fine);
+            assert!(fine.len() > 500);
+            let mut times: Vec<i64> = vec![-5, 0, 1, span - 1, span, span + 99];
+            times.extend((0..60).map(|i| Key::from_seed(seed).with(i).below(span as u64) as i64));
+            // At and just after moves of every level.
+            for tree in &trees {
+                let mut evs = Vec::new();
+                tree.events(0, span, &mut evs);
+                for e in evs.iter().step_by(7) {
+                    times.extend([e.t, e.t + 1]);
+                }
+            }
+            for &t in &times {
+                assert_eq!(nested(&trees, t), replay(&trees, t), "seed {seed}, t {t}");
+            }
+        }
+    }
+
+    /// The anchored nested state by replaying every move in time order: a
+    /// move at level j draws j around its anchor and refreshes (and
+    /// re-anchors) every finer level.
+    fn replay_anchored(trees: &[PoissonTree], t: i64) -> Vec<u64> {
+        let levels = trees.len();
+        let mut moves: Vec<(i64, usize, usize, Event)> = Vec::new();
+        for (j, tree) in trees.iter().enumerate() {
+            let mut evs = Vec::new();
+            tree.events(0, t.max(0), &mut evs);
+            moves.extend(evs.into_iter().enumerate().map(|(i, e)| (e.t, j, i, e)));
+        }
+        moves.sort_by_key(|m| (m.0, m.1, m.2));
+        let mut state: Vec<u64> = Vec::new();
+        for k in 0..levels {
+            let parent = state.last().copied().unwrap_or(0);
+            state.push(mix(parent, 1000 + k as u64));
+        }
+        let mut anchor = state.clone();
+        for (_, j, _, e) in moves {
+            for k in j..levels {
+                let parent = if k == 0 { 0 } else { state[k - 1] };
+                let key = e.key.with(k as u64).bits();
+                if k == j {
+                    state[k] = mix(mix(parent, key), anchor[k]);
+                } else {
+                    state[k] = mix(parent, key);
+                    anchor[k] = state[k];
+                }
+            }
+        }
+        state
+    }
+
+    fn nested_anchored(trees: &[PoissonTree], t: i64) -> Vec<u64> {
+        let mut out = Vec::new();
+        nested_regen_anchored(
+            trees.len(),
+            t,
+            |j, t| trees[j].last_before(t),
+            |k, parent: Option<&u64>| mix(parent.copied().unwrap_or(0), 1000 + k as u64),
+            |_, _, key, parent| mix(parent.copied().unwrap_or(0), key.bits()),
+            |_, _, key, parent, anchor: &u64| {
+                mix(mix(parent.copied().unwrap_or(0), key.bits()), *anchor)
+            },
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn anchored_regeneration_matches_a_full_replay() {
+        for seed in 0..6 {
+            let trees = level_trees(seed);
+            let span = (1i64 << 15) * DAY;
+            let mut times: Vec<i64> = vec![-5, 0, 1, span - 1, span, span + 99];
+            times.extend((0..60).map(|i| Key::from_seed(seed).with(i).below(span as u64) as i64));
+            for tree in &trees {
+                let mut evs = Vec::new();
+                tree.events(0, span, &mut evs);
+                for e in evs.iter().step_by(7) {
+                    times.extend([e.t, e.t + 1]);
+                }
+            }
+            for &t in &times {
+                assert_eq!(
+                    nested_anchored(&trees, t),
+                    replay_anchored(&trees, t),
+                    "seed {seed}, t {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_ties_go_to_the_finer_level() {
+        // Levels 0 and 1 move at the same instant: level 1's own move wins
+        // (drawn around its anchor, refreshed by level 0's move).
+        let e = |t: i64, s: u64| Event {
+            t,
+            key: Key::from_seed(s),
+        };
+        let moves = [Some(e(50, 1)), Some(e(50, 2))];
+        let mut out = Vec::new();
+        nested_regen_anchored(
+            2,
+            100,
+            |j, _| moves[j],
+            |k, _| 100 + k as u64,
+            |k, r, _, _| 10 * (k as u64) + r.from as u64,
+            |k, r, _, _, a: &u64| 1000 * (k as u64 + 1) + 100 * r.from as u64 + a,
+            &mut out,
+        );
+        // Level 0: its own move around its initial anchor (100).
+        // Level 1: its own move (from 1) around the anchor drawn fresh at
+        // level 0's move (10·1 + 0 = 10).
+        assert_eq!(out, vec![1100, 2110]);
+    }
+
+    #[test]
+    fn nested_regeneration_times_are_nested() {
+        let trees = level_trees(9);
+        let mut out = [None; 3];
+        for i in 0..200 {
+            let t = i * 160 * DAY + 12_345;
+            nested_regen(3, t, |j, t| trees[j].last_before(t), &mut out);
+            for k in 0..3 {
+                let own = trees[k].last_before(t);
+                // The level's regeneration is at least as recent as its own
+                // moves and as the coarser level's regeneration.
+                if let Some(e) = own {
+                    assert!(out[k].unwrap().event.t >= e.t);
+                }
+                if k > 0 {
+                    assert!(out[k].map(|r| r.event.t) >= out[k - 1].map(|r| r.event.t));
+                }
+                if let Some(r) = out[k] {
+                    assert!(r.from <= k && r.event.t < t);
+                    assert_eq!(trees[r.from].last_before(t), Some(r.event));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_ties_go_to_the_finer_level() {
+        let e = |t: i64, s: u64| Event {
+            t,
+            key: Key::from_seed(s),
+        };
+        let moves = [Some(e(50, 1)), Some(e(50, 2)), Some(e(40, 3))];
+        let mut out = [None; 3];
+        nested_regen(3, 100, |j, _| moves[j], &mut out);
+        assert_eq!(
+            out.map(|r| r.map(|r| (r.event.t, r.from))),
+            [Some((50, 0)), Some((50, 1)), Some((50, 1))]
+        );
+        nested_regen(
+            3,
+            100,
+            |j, _| if j == 2 { moves[2] } else { None },
+            &mut out,
+        );
+        assert_eq!(out.map(|r| r.map(|r| r.from)), [None, None, Some(2)]);
+    }
+
+    #[test]
+    fn nested_regeneration_golden() {
+        let trees = level_trees(77);
+        let t = 20_000 * DAY;
+        let mut out = [None; 3];
+        nested_regen(3, t, |j, t| trees[j].last_before(t), &mut out);
+        let got = out.map(|r| r.map(|r| (r.event.t, r.from)));
+        assert_eq!(got, GOLDEN_NESTED);
+        assert_eq!(nested(&trees, t), GOLDEN_NESTED_STATE);
+    }
+
+    const GOLDEN_NESTED: [Option<(i64, usize)>; 3] = [
+        Some((1_707_161_077, 0)),
+        Some((1_709_302_508, 1)),
+        Some((1_720_574_874, 2)),
+    ];
+    const GOLDEN_NESTED_STATE: [u64; 3] = [
+        12_910_264_497_775_185_185,
+        7_323_164_947_375_710_727,
+        5_422_628_283_462_481_694,
+    ];
+
+    #[test]
+    fn epochs_tile_time() {
+        let e = Epochs::keyed(1000, 7 * DAY, Key::from_seed(4));
+        assert!((1000..1000 + 7 * DAY).contains(&e.origin));
+        for t in [
+            -50 * DAY,
+            0,
+            e.origin - 1,
+            e.origin,
+            e.origin + 3 * DAY,
+            400 * DAY,
+        ] {
+            let i = e.index(t);
+            assert!(e.start(i) <= t && t < e.start(i + 1), "{t}");
+        }
+        assert_eq!(e.index(e.origin), 0);
+        assert_eq!(e.index(e.origin - 1), -1);
     }
 }
