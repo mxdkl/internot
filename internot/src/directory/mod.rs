@@ -1,5 +1,5 @@
 //! `directory` — people of the society world through MCP: who someone is,
-//! their family, their household and where they live, at any time.
+//! when they lived, their partner and their family, at any time.
 //!
 //! Read-only. Every answer is a pure function of the world's pack and seed,
 //! the person id and the time asked about (`at`, default the Universe's

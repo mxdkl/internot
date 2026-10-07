@@ -22,7 +22,9 @@
         ],
         // Men partner this many years later than women.
         male_delay: 2.2,
-        // Share of a cohort that ever enters a union by 50, by year.
+        // Share of a cohort's survivors to 50 who ever entered a union by
+        // then, by year (the census convention: it counts the living).
+        // Worlds apply it to adults and correct for deaths themselves.
         ever_partnered: [
             (1840, 0.92),
             (1970, 0.93),

@@ -1,0 +1,153 @@
+// Education (L5): the highest level each person completes, how it runs in
+// families and couples, and when schooling happens. Data and sources:
+// research/2026-10-01-education-data-and-targets.md (sections cited as §).
+(
+    // Final attainment of the reference population (natives, the groups
+    // pooled before their shifts below), by birth cohort and sex: shares in
+    // percent of [less than high school, high school (diploma or GED), some
+    // college (incl. associate), bachelor's, graduate degree], interpolated
+    // linearly between cohorts and held beyond the ends.
+    // - ≤ 1921: 1940 census and CPS April 1947 by sex (§2b), HS+ and BA+
+    //   split into the five levels with the 1940s ratios;
+    // - 1935–1995: ACS 2023 by cohort and sex (§2f) with natives' lower
+    //   "less than high school" (CPS ASEC 2023 nativity, §2g), the youngest
+    //   cohorts' graduate degrees completed (they still accrue at 30–39,
+    //   §2e);
+    // - after 2000: held at the cohorts born in the 1990s (WIC SSP2 keeps US
+    //   attainment rising slowly; held here).
+    attainment: (
+        female: [
+            (1840, [86.0, 9.5, 3.0, 1.2, 0.3]),
+            (1875, [81.7, 11.5, 4.5, 1.8, 0.5]),
+            (1887, [77.7, 13.5, 5.7, 2.4, 0.7]),
+            (1897, [72.1, 16.0, 7.7, 3.2, 1.0]),
+            (1907, [61.2, 21.0, 11.7, 4.6, 1.5]),
+            (1914, [53.3, 27.0, 14.1, 4.1, 1.5]),
+            (1925, [33.0, 40.0, 15.0, 8.5, 3.5]),
+            (1935, [15.5, 41.5, 22.0, 12.6, 8.4]),
+            (1945, [9.5, 33.5, 28.0, 15.4, 13.6]),
+            (1955, [7.0, 28.5, 32.0, 19.0, 13.5]),
+            (1965, [7.0, 26.5, 31.0, 21.5, 14.0]),
+            (1975, [6.0, 21.0, 28.5, 24.5, 20.0]),
+            (1985, [5.0, 19.0, 28.0, 27.0, 21.0]),
+            (1995, [4.5, 19.0, 26.5, 30.0, 20.0]),
+        ],
+        male: [
+            (1840, [86.5, 8.0, 3.0, 1.8, 0.7]),
+            (1875, [83.9, 9.0, 3.9, 2.5, 0.7]),
+            (1887, [79.4, 10.5, 5.0, 3.6, 1.5]),
+            (1897, [76.0, 11.5, 6.8, 4.0, 1.7]),
+            (1907, [65.3, 16.0, 10.5, 5.7, 2.5]),
+            (1914, [55.4, 23.0, 13.7, 5.4, 2.5]),
+            (1925, [36.0, 33.0, 13.0, 11.0, 7.0]),
+            (1935, [14.5, 31.0, 20.5, 17.0, 17.0]),
+            (1945, [8.5, 26.0, 25.5, 19.5, 20.5]),
+            (1955, [8.5, 29.0, 29.0, 19.0, 14.5]),
+            (1965, [9.0, 30.5, 27.0, 20.0, 13.5]),
+            (1975, [8.5, 26.5, 27.5, 22.0, 15.5]),
+            (1985, [7.0, 26.0, 27.5, 24.5, 15.0]),
+            (1995, [6.0, 28.0, 27.0, 26.5, 12.5]),
+        ],
+    ),
+
+    // Of "some college", the share holding an associate degree (CPS Table
+    // 1: 6.3 of 21.9 for 1934–43, 10.9 of 26.9 for 1964–73, 10.6 of 24.1 for
+    // 1984–93, §2e; few before community colleges spread).
+    associate: [(1900, 0.05), (1935, 0.29), (1950, 0.33), (1970, 0.41), (1990, 0.44)],
+    // Graduate degrees: master's, professional (MD, JD, …) and doctorate
+    // shares (CPS 2024 25+: 9.6, 1.5 and 2.1 of all adults; professional
+    // degrees a larger share before master's degrees spread).
+    graduate: [
+        (1880, [0.45, 0.40, 0.15]),
+        (1930, [0.60, 0.25, 0.15]),
+        (1950, [0.68, 0.17, 0.15]),
+        (1980, [0.73, 0.11, 0.16]),
+    ],
+
+    // Each heritage group's shift of the latent (proportional odds: every
+    // threshold moves by the same log-odds; positive is more education), by
+    // birth cohort, fitted on BA+ and less-than-high-school against the
+    // reference (§2b, §2d, §2f; ACS 2023 BA+ by heritage for 1943–92
+    // cohorts: White 35/34/44/47, Black 20/21/29/29, Hispanic 15/17/21/25,
+    // Asian 41/43/60/70, AIAN 16/15/16/16 percent). Black before 1950: 1940
+    // HS+ 7.3% against 28.8% for native whites. Hispanic and Asian shifts are
+    // for natives (immigrants bring a bimodal draw of their own, §2g: once
+    // migration exists).
+    group_shift: [
+        (group: "white", shift: [(1840, 0.10), (1950, 0.15), (1990, 0.20)]),
+        (group: "black", shift: [(1840, -2.0), (1900, -1.6), (1930, -1.2), (1950, -0.8), (1970, -0.6), (1990, -0.75)]),
+        (group: "aian", shift: [(1840, -1.8), (1950, -0.9), (1990, -1.2)]),
+        (group: "asian", shift: [(1840, 0.0), (1950, 0.4), (1975, 0.65), (1990, 0.95)]),
+        (group: "hispanic", shift: [(1840, -1.2), (1950, -1.0), (1990, -0.8)]),
+    ],
+
+    // The latent's variance split (weights squared, summing to 1), a key
+    // each (`thinking`: research note §3–§4): the person's own, their
+    // parents' union (siblings share it), each grandparents' union, and
+    // their own first union (partners share it: educational assortative
+    // mating). Parent–child latent correlation √(union)·√(parents) +
+    // √(parents)·√(grandparents) ≈ 0.53 (target 0.55, §3b), siblings
+    // parents + 2·grandparents = 0.45 (0.6, §3e), partners `union` = 0.45
+    // (0.65–0.73 latent, §4a), grandparent–grandchild 0.15. A world that
+    // pairs partners by age only can't reach all three targets with keys a
+    // lookup can reach in O(1); this split balances them.
+    latent: (own: 0.10, parents: 0.35, grandparents: 0.05, union: 0.45),
+
+    // Institutions (§5–§7): schools and colleges distilled by
+    // internot_society/data/distill_schools.py from CCD 2024–25, the Private
+    // School Survey 2023–24 and IPEDS (public domain). Today's institutions
+    // serve every era (debt: schools by era).
+    data: "data/schools.bin",
+    // Children attend the nearest public school offering their grade (§0.5:
+    // zones are close to nearest-school partitions), or with this share a
+    // private one near home (about 9–13% of K–12 students since 1900).
+    private_share: [(1890, 0.08), (1930, 0.10), (1960, 0.13), (1990, 0.11), (2020, 0.09)],
+    // Colleges by enrollment times a distance decay from home at entry,
+    // `(1 + miles / miles_scale)^-decay`, in the home state with this
+    // share (§0.7: median 17 miles, 10 for community college; 78% in the
+    // home state). Those leaving with some college or an associate degree
+    // attend a two-year college with the share `two_year`, by entry year.
+    college: (
+        in_state: 0.78,
+        miles_scale: 15.0,
+        decay: 1.8,
+        two_year: [(1940, 0.10), (1965, 0.40), (1980, 0.60), (2000, 0.65)],
+        graduate_in_state: 0.50,
+        graduate_decay: 0.8,
+    ),
+
+    // Timing (§2i, §5).
+    timing: (
+        // Age entering first grade (§5a: 6 since the entry laws; older and
+        // over-age before 1930, Ayres 1909), by birth cohort.
+        first_grade_age: [(1840, 7.5), (1900, 7.0), (1930, 6.0)],
+        // Kindergarten: the share of a cohort attending at 5 (§1g: 16 per
+        // 100 in 1910, 82% of 5-year-olds in 1980).
+        kindergarten: [(1880, 0.02), (1905, 0.16), (1950, 0.55), (1975, 0.82), (2000, 0.90)],
+        // Leaving school without a diploma: the typical age, by birth cohort,
+        // give or take `dropout_spread` years (§1c, §5c–§5d: in 1910, 89%
+        // of 13-year-olds were enrolled, 81% at 14, 68% at 15, 51% at 16 and
+        // 35% at 17, though most of those cohorts never finished high school;
+        // 16–17 once compulsory schooling reached 16).
+        dropout_age: [(1840, 14.5), (1880, 15.8), (1900, 16.4), (1930, 16.9), (1960, 17.3), (1990, 17.5)],
+        dropout_spread: 1.5,
+        // High school ends in June of the year the student turns 18.
+        hs_end_age: 18,
+        // Of those who go to college, the share starting in the fall after
+        // high school; the rest start later, an exponential delay of mean
+        // `late_start_years` (§2i: 15% of BAs at 30+).
+        college_on_time: 0.70,
+        late_start_years: 8.0,
+        // Years to finish: some college (left without a degree), an
+        // associate, a bachelor's (§2i: median 52 months, 44% in four years),
+        // then after a bachelor's: the gap before graduate school and each
+        // program's length.
+        some_college_years: (min: 0.5, max: 3.0),
+        associate_years: (min: 2.0, max: 3.5),
+        bachelor_years: (min: 4.0, max: 6.0),
+        graduate_gap_years: 2.5,
+        master_years: (min: 1.5, max: 3.0),
+        professional_years: (min: 3.0, max: 4.5),
+        doctorate_years: (min: 4.5, max: 7.0),
+    ),
+)

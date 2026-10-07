@@ -1,231 +1,74 @@
-//! L3 pass criteria on a tiny world, checked exhaustively over every person
-//! at many times: households partition everyone present, `members` agrees
-//! with `household` both ways, and the structure makes sense. See
-//! `docs/superpowers/plans/2026-09-30-l3-households.md` §9.
+//! Households on the monotone world, exhaustively over people at several
+//! dates on a small world: `household` and `members` agree both ways, every
+//! dependent chain ends at an independent adult, and minors don't head
+//! homes while a parent, grandparent or adult sibling lives.
+//! `MONO_MULT` (default 0.003), `MONO_SEEDS` (default 42).
+use internot_society::mono::{Household, Mono, Pid};
+use internot_society::Params;
+use procedural_core::stream::year_start;
+use rayon::prelude::*;
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-use internot_society::world::{year_start, DAY};
-use internot_society::{Household, Members, Params, PersonId, World};
-
-const SECS_PER_YEAR: f64 = 365.2425 * 86_400.0;
-
-/// The tiny test pack, or the pack named by `TEST_PACK` (in `worlds/`), so
-/// the suite also checks other configurations (the area mode:
-/// `TEST_PACK=us-areas-tiny`).
-fn params() -> Params {
-    match std::env::var("TEST_PACK") {
-        Ok(name) => {
-            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../worlds");
-            Params::load(&root, &name).expect("TEST_PACK names a pack in worlds/")
-        }
-        Err(_) => Params::tiny(),
-    }
+fn seeds() -> Vec<u64> {
+    std::env::var("MONO_SEEDS").ok().map(|v| v.split(',').map(|s| s.trim().parse().unwrap()).collect()).unwrap_or(vec![42])
 }
 
-fn world() -> &'static World {
-    static W: OnceLock<World> = OnceLock::new();
-    W.get_or_init(|| World::build(params(), 7))
+fn mult() -> f64 {
+    std::env::var("MONO_MULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.003)
 }
 
-fn age_at(w: &World, id: PersonId, t: i64) -> f64 {
-    (t - w.birth(id)) as f64 / SECS_PER_YEAR
-}
-
-/// Times to check: every sixth year of the tiny world, at a different day
-/// of the year each time, so epoch and birthday boundaries vary.
-fn times() -> impl Iterator<Item = i64> {
-    (1902..=1990)
-        .step_by(6)
-        .enumerate()
-        .map(|(k, y)| year_start(y) + (37 + 53 * k as i64) % 365 * DAY + 12_345)
-}
-
-/// Every household at `t` with its members, after checking that each
-/// person present is listed in their own household's members exactly once
-/// and that nobody else is listed.
-fn partition(w: &World, t: i64) -> HashMap<Household, Members> {
-    let mut found: HashMap<Household, (Members, usize)> = HashMap::new();
-    for x in 0..w.population() as PersonId {
-        match w.household(x, t) {
-            None => assert!(!w.present_at(x, t), "{x} present but homeless at {t}"),
-            Some(h) => {
-                assert!(w.present_at(x, t), "{x} housed but absent");
-                let (members, count) = found.entry(h).or_insert_with(|| (w.members(h, t), 0));
-                assert!(
-                    members.contains(&x),
-                    "{x} not among the members of its household {h:?}: {members:?}"
-                );
-                *count += 1;
-            }
+fn alive(m: &Mono, t: i64) -> Vec<Pid> {
+    let mut v = Vec::new();
+    for cell in 0..m.cells() {
+        for y in m.first_year()..=m.last_year() {
+            m.alive_in_cohort(cell, y, t, &mut |x| v.push(x));
         }
     }
-    // Each member lists back (members hold no duplicates, and every person
-    // whose household is `h` is among them), so equal counts mean equal
-    // sets.
-    found
-        .into_iter()
-        .map(|(h, (members, count))| {
-            assert_eq!(
-                members.len(),
-                count,
-                "{h:?} lists {members:?} but {count} people live there"
-            );
-            (h, members)
-        })
-        .collect()
-}
-
-/// True if minor `x` has no living parent or grandparent and no adult
-/// sibling on their own at `t`: nobody the guardian rule could pick.
-fn kinless(w: &World, x: PersonId, t: i64) -> bool {
-    let parents: Vec<PersonId> = [w.mother(x), w.father(x)].into_iter().flatten().collect();
-    let grandparents = parents
-        .iter()
-        .flat_map(|&p| [w.mother(p), w.father(p)])
-        .flatten();
-    parents
-        .iter()
-        .copied()
-        .chain(grandparents)
-        .all(|p| !w.present_at(p, t))
-        && w.siblings(x).iter().all(|&s| {
-            // A guardian sibling is an adult on their own (L3 rule 1): not a
-            // paternal half-sibling still living with their own mother.
-            !w.present_at(s, t) || age_at(w, s, t) < 18.0 || w.dependent_of(s, t).is_some()
-        })
+    v
 }
 
 #[test]
-fn households_partition_everyone_present_and_members_agree() {
-    let w = world();
-    let mut kinds = [0usize; 3];
-    for t in times() {
-        for (h, members) in partition(w, t) {
-            kinds[match h {
-                Household::Union { .. } => 0,
-                Household::Solo { .. } => 1,
-                Household::Roommates { .. } => 2,
-            }] += 1;
-            assert!(!members.is_empty());
-        }
-    }
-    assert!(kinds.iter().all(|&k| k > 0), "every kind occurs: {kinds:?}");
-}
-
-#[test]
-fn households_make_sense() {
-    let w = world();
-    let (mut founder_minors, mut kinless_orphans) = (0, 0);
-    let (mut orphans_with_kin, mut elders_with_child) = (0, 0);
-    for t in times() {
-        for (h, members) in partition(w, t) {
-            match h {
-                Household::Union { a, b, start } => {
-                    // Both partners live there, in an active union.
-                    assert!(members.contains(&a) && members.contains(&b));
-                    let u = w
-                        .unions(a)
-                        .into_iter()
-                        .flatten()
-                        .find(|u| u.partner == b && u.start == start)
-                        .expect("the household's union exists");
-                    assert!(u.start <= t && t < u.end, "{h:?} is not active at {t}");
-                }
-                Household::Solo { person, .. } => {
-                    assert!(members.contains(&person));
-                    let alone_minor = members.len() == 1 && age_at(w, person, t) < 18.0;
-                    if alone_minor {
-                        // Only founders (no in-world parents) and orphans
-                        // with no living kin to take them in can be minors
-                        // living alone (the plan's measured residual).
-                        if w.is_founder(person) {
-                            founder_minors += 1;
-                        } else {
-                            assert!(kinless(w, person, t), "minor {person} lives alone at {t}");
-                            kinless_orphans += 1;
+fn households_and_members_agree() {
+    let p = Params::embedded("us").unwrap();
+    for seed in seeds() {
+        for m in [Mono::new(&p, seed, mult()), Mono::blind(&p, seed, mult())] {
+            for year in [1900, 1950, 1990, 2023] {
+                let t = year_start(year) + 123 * 86_400;
+                let people = alive(&m, t);
+                let bad: Vec<String> = people
+                    .par_iter()
+                    .flat_map_iter(|&x| {
+                        let mut e = Vec::new();
+                        let Some(h) = m.household(x, t) else {
+                            return vec![format!("{x:?}: alive with no household at {year}")].into_iter();
+                        };
+                        let members = m.members(h, t);
+                        if !members.contains(&x) {
+                            e.push(format!("{x:?}: not among the members of its household {h:?} at {year}"));
                         }
-                    }
+                        for &y in members.iter() {
+                            if m.household(y, t) != Some(h) {
+                                e.push(format!("{x:?}: member {y:?} of {h:?} resolves to {:?} at {year}", m.household(y, t)));
+                            }
+                        }
+                        // A home is headed by an adult or a couple; a minor
+                        // heads one only without any living guardian.
+                        if let Household::Solo { person, .. } = h {
+                            if m.age_at(person, t) < 18.0 && person == x && m.dependent_of(x, t).is_some() {
+                                e.push(format!("{x:?}: a minor alone with a guardian at {year}"));
+                            }
+                        }
+                        let end = m.chain_end(x, t);
+                        if m.dependent_of(end, t).is_some() {
+                            e.push(format!("{x:?}: chain end {end:?} is a dependent"));
+                        }
+                        e.into_iter()
+                    })
+                    .collect();
+                for b in bad.iter().take(20) {
+                    eprintln!("{b}");
                 }
-                Household::Roommates { .. } => {
-                    // Roommates are single adults with no child under 18, at
-                    // least two of them (plus any kin they took in).
-                    let adults: Vec<_> = members
-                        .iter()
-                        .filter(|&&m| w.partner_at(m, t).is_none() && age_at(w, m, t) >= 18.0)
-                        .collect();
-                    assert!(adults.len() >= 2, "{h:?}: {members:?}");
-                }
-            }
-            for &m in members.iter() {
-                // A minor lives with a parent, or with kin if orphaned.
-                if age_at(w, m, t) < 18.0 && !w.is_founder(m) {
-                    let parents = [w.mother(m), w.father(m)];
-                    let with_parent = parents.iter().flatten().any(|p| members.contains(p));
-                    if !with_parent {
-                        assert!(
-                            parents
-                                .iter()
-                                .flatten()
-                                .all(|&p| !w.present_at(p, t) || w.household(p, t) != Some(h)),
-                            "{m}"
-                        );
-                        orphans_with_kin += 1;
-                    }
-                }
-                if age_at(w, m, t) >= 65.0
-                    && w.children(m)
-                        .iter()
-                        .any(|c| members.contains(c) && age_at(w, *c, t) >= 18.0)
-                {
-                    elders_with_child += 1;
-                }
+                assert!(bad.is_empty(), "seed {seed}, {} cells, {year}: {} problems among {} people", m.cells(), bad.len(), people.len());
             }
         }
     }
-    eprintln!(
-        "minors alone: founders {founder_minors}, kinless orphans {kinless_orphans}; \
-         minors with kin but no parent {orphans_with_kin}; elders with an adult child {elders_with_child}"
-    );
-    assert!(elders_with_child > 0);
-}
-
-#[test]
-fn households_change_only_now_and_then() {
-    // Over a lifetime, a household changes at events (leaving home, unions,
-    // deaths, moving in with kin, roommate epochs): a few dozen at most, and
-    // never back and forth from one day to the next. (Two different events
-    // can fall on consecutive days, e.g. a roommate group thinning out just
-    // before a union starts.)
-    let w = world();
-    let mut longest = 0;
-    for x in (0..w.population() as PersonId).step_by(97) {
-        let (from, to) = (
-            w.birth(x).max(year_start(1900)),
-            w.death(x).min(year_start(1990)),
-        );
-        let mut last = None;
-        let mut changes = 0;
-        let mut t = from;
-        while t < to {
-            let h = w.household(x, t);
-            if h.is_some() && last.is_some() && h != last {
-                changes += 1;
-                // A change doesn't revert the next day.
-                let next = w.household(x, t + DAY);
-                assert!(
-                    next.is_none() || next != last,
-                    "{x} flickers back to {last:?} at {t}"
-                );
-            }
-            if h.is_some() {
-                last = h;
-            }
-            t += 30 * DAY;
-        }
-        longest = longest.max(changes);
-    }
-    eprintln!("most household changes in one life: {longest}");
-    assert!(longest < 60, "too many household changes: {longest}");
 }

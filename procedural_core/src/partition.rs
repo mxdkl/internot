@@ -226,6 +226,24 @@ fn cumulative_shares(weights: &[f64], mut f: impl FnMut(usize, u128)) {
     }
 }
 
+/// `⌊a·b/c⌋` exactly, in 64-bit arithmetic when `a·b` fits (else 128-bit).
+#[inline]
+pub fn mul_div(a: u64, b: u64, c: u64) -> u64 {
+    match a.checked_mul(b) {
+        Some(p) => p / c,
+        None => (a as u128 * b as u128 / c as u128) as u64,
+    }
+}
+
+/// `⌈a·b/c⌉` exactly, in 64-bit arithmetic when `a·b` fits (else 128-bit).
+#[inline]
+pub fn mul_div_ceil(a: u64, b: u64, c: u64) -> u64 {
+    match a.checked_mul(b) {
+        Some(p) => p.div_ceil(c),
+        None => (a as u128 * b as u128).div_ceil(c as u128) as u64,
+    }
+}
+
 /// [`apportion_systematic`] with the cumulative shares computed once, for
 /// many splits over the same weights. Gives exactly the same parts, densely
 /// ([`Self::apportion`]) or as the nonzero parts only
@@ -268,6 +286,47 @@ impl SystematicShares {
             *o = (cur - prev) as u64;
             prev = cur;
         }
+    }
+
+    /// The part holding position `v` (`< n`) of the split of `n` that
+    /// [`Self::apportion`] gives: the first part whose cumulative end
+    /// `⌊(n·F + u)/ONE⌋` passes `v`. One binary search, no allocation.
+    #[inline]
+    pub fn part_of(&self, n: u64, key: Key, v: u64) -> usize {
+        self.part_of_offset(n, Self::offset(key), v)
+    }
+
+    /// The systematic offset a split under `key` uses: store it where the
+    /// same key repeats ([`Self::part_of_offset`], [`Self::end_of_offset`]).
+    #[inline]
+    pub fn offset(key: Key) -> u64 {
+        key.below(SHARE_ONE as u64)
+    }
+
+    /// [`Self::part_of`] given the key's [`Self::offset`]: the same part.
+    #[inline]
+    pub fn part_of_offset(&self, n: u64, u: u64, v: u64) -> usize {
+        debug_assert!(v < n, "position {v} of {n}");
+        let u = u as u128;
+        let target = (v as u128 + 1) * SHARE_ONE;
+        let n128 = n as u128;
+        self.cum.partition_point(|&c| n128 * c as u128 + u < target)
+    }
+
+    /// The cumulative end of parts `0..=i` of the split of `n`: positions
+    /// below it lie in those parts.
+    #[inline]
+    pub fn end_of(&self, n: u64, key: Key, i: usize) -> u64 {
+        self.end_of_offset(n, Self::offset(key), i)
+    }
+
+    /// [`Self::end_of`] given the key's [`Self::offset`]: the same end.
+    #[inline]
+    pub fn end_of_offset(&self, n: u64, u: u64, i: usize) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        ((n as u128 * self.cum[i] as u128 + u as u128) / SHARE_ONE) as u64
     }
 
     /// Calls `f(part, count)` for each nonzero part of `n`, in part order:
@@ -785,9 +844,126 @@ pub fn trim_largest_first(cells: &mut [u64], cap: u64) {
     }
 }
 
+/// Items choose owners (Lemma B, Lean `CellWorld.mother_iff`): item `j` of
+/// `c` goes to owner `⌊j·m/c⌋` of `m`. Nondecreasing in `j`, and onto when
+/// `c ≥ m`.
+#[inline]
+pub fn proportional_owner(j: u64, c: u64, m: u64) -> u64 {
+    (j as u128 * m as u128 / c as u128) as u64
+}
+
+/// The items owner `i` gets under [`proportional_owner`]:
+/// `[⌈i·c/m⌉, ⌈(i+1)·c/m⌉)`.
+#[inline]
+pub fn proportional_range(i: u64, c: u64, m: u64) -> Range<u64> {
+    let (c, m) = (c as u128, m as u128);
+    ((i as u128 * c).div_ceil(m) as u64)..(((i as u128 + 1) * c).div_ceil(m) as u64)
+}
+
+/// Members `j < p` of the residue class mod `k` whose smallest member is
+/// `r < k`.
+#[inline]
+pub fn residue_count(r: u64, p: u64, k: u64) -> u64 {
+    if p > r { (p - r - 1) / k + 1 } else { 0 }
+}
+
+/// The `m`-th member of the residue class mod `k` starting at `r`.
+#[inline]
+pub fn residue_select(r: u64, m: u64, k: u64) -> u64 {
+    r + m * k
+}
+
+/// The first value at or after `a` in the cyclic range `lo..=hi` where
+/// `nonempty` holds, if any.
+pub fn cyclic_next(lo: i32, hi: i32, a: i32, nonempty: impl Fn(i32) -> bool) -> Option<i32> {
+    let next = |x: i32| if x == hi { lo } else { x + 1 };
+    let mut b = a;
+    loop {
+        if nonempty(b) {
+            return Some(b);
+        }
+        b = next(b);
+        if b == a {
+            return None;
+        }
+    }
+}
+
+/// The values whose [`cyclic_next`] is `a` other than `a` itself: the run
+/// just before `a` (cyclically) where `nonempty` fails, nearest first.
+pub fn cyclic_run_before(lo: i32, hi: i32, a: i32, nonempty: impl Fn(i32) -> bool) -> impl Iterator<Item = i32> {
+    let prev = move |x: i32| if x == lo { hi } else { x - 1 };
+    let mut b = prev(a);
+    std::iter::from_fn(move || {
+        if b == a || nonempty(b) {
+            return None;
+        }
+        let out = b;
+        b = prev(b);
+        Some(out)
+    })
+}
+
+/// Of `n` members placed at the quantiles `(r + ½)/n`, those below the
+/// fraction `f`: `#{r < n : r + ½ < n·f}` with `n·f` in floating point, so
+/// `⌈n·f − ½⌉` clamped to `0..=n`.
+#[inline]
+pub fn quantile_rank_count(n: u32, f: f64) -> u32 {
+    ((n as f64 * f - 0.5).ceil().max(0.0) as u32).min(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mul_div_matches_128_bit() {
+        for seed in 0..2000u64 {
+            let k = Key::from_seed(seed);
+            let bits = |i: u64| 1 + k.with(i).below(63);
+            let (a, b) = (k.with(10).below(1 << bits(1)), k.with(11).below(1 << bits(2)));
+            let c = 1 + k.with(12).below(1 << bits(3));
+            let (f, cc) = (a as u128 * b as u128 / c as u128, (a as u128 * b as u128).div_ceil(c as u128));
+            if f <= u64::MAX as u128 {
+                assert_eq!(mul_div(a, b, c) as u128, f);
+            }
+            if cc <= u64::MAX as u128 {
+                assert_eq!(mul_div_ceil(a, b, c) as u128, cc);
+            }
+        }
+    }
+
+    #[test]
+    fn shares_part_of_and_end_of_match_apportion() {
+        for seed in 0..60u64 {
+            let k = Key::from_seed(seed);
+            let len = 1 + k.with(1).below(45) as usize;
+            let w: Vec<f64> = (0..len).map(|i| if k.with2(2, i as u64).below(4) == 0 { 0.0 } else { k.with2(3, i as u64).unit() }).collect();
+            if w.iter().all(|&x| x <= 0.0) {
+                continue;
+            }
+            let sh = SystematicShares::new(&w);
+            for n in [1u64, 2, 7, 100, 999, 123_457] {
+                let key = k.with2(4, n);
+                let mut parts = vec![0u64; len];
+                sh.apportion(n, key, &mut parts);
+                let mut end = 0u64;
+                for i in 0..len {
+                    end += parts[i];
+                    assert_eq!(sh.end_of(n, key, i), end, "end of part {i}");
+                }
+                let mut at = 0u64;
+                for (i, &c) in parts.iter().enumerate() {
+                    for v in [at, at + c / 2, at + c.saturating_sub(1)] {
+                        if c > 0 {
+                            assert_eq!(sh.part_of(n, key, v), i, "position {v} of {n}");
+                        }
+                    }
+                    at += c;
+                }
+            }
+        }
+    }
     use crate::perm::{Bijection, FeistelPerm};
 
     fn systematic(n: u64, w: &[f64], key: Key) -> Vec<u64> {
@@ -1320,5 +1496,90 @@ mod tests {
         assert_eq!(locate_in_segments(segs, 3), Some((9, 0)));
         assert_eq!(locate_in_segments(segs, 8), Some((4, 0)));
         assert_eq!(locate_in_segments(segs, 9), None);
+    }
+}
+
+#[cfg(test)]
+mod cell_tests {
+    use super::*;
+
+    #[test]
+    fn proportional_owners_and_ranges_are_dual() {
+        for c in 1..40u64 {
+            for m in 1..40u64 {
+                for j in 0..c {
+                    let i = proportional_owner(j, c, m);
+                    assert!(i < m && proportional_range(i, c, m).contains(&j), "{c} {m} {j}");
+                }
+                let total: u64 = (0..m).map(|i| proportional_range(i, c, m).count() as u64).sum();
+                assert_eq!(total, c);
+            }
+        }
+    }
+
+    #[test]
+    fn residue_classes_match_brute_force() {
+        for k in 1..9u64 {
+            for r in 0..k {
+                for p in 0..50u64 {
+                    assert_eq!(residue_count(r, p, k), (0..p).filter(|j| j % k == r).count() as u64);
+                    if residue_count(r, p, k) > 0 {
+                        let m = residue_count(r, p, k) - 1;
+                        let j = residue_select(r, m, k);
+                        assert!(j < p && j % k == r && residue_count(r, j, k) == m);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lemma S: every value lands on exactly one nonempty value, and the run
+    /// before a nonempty value is exactly what lands on it.
+    #[test]
+    fn cyclic_spill_fibers_are_runs() {
+        for mask in 1u32..(1 << 9) {
+            let ne = |x: i32| mask >> (x - 10) & 1 == 1;
+            for a in 10..=18 {
+                let t = cyclic_next(10, 18, a, ne).unwrap();
+                assert!(ne(t));
+                if ne(a) {
+                    let run: Vec<i32> = cyclic_run_before(10, 18, a, ne).collect();
+                    let fiber: Vec<i32> = (10..=18).filter(|&b| !ne(b) && cyclic_next(10, 18, b, ne) == Some(a)).collect();
+                    let mut sorted = run.clone();
+                    sorted.sort();
+                    assert_eq!(sorted, fiber, "{mask:b} {a}");
+                }
+            }
+        }
+        assert_eq!(cyclic_next(10, 18, 12, |_| false), None);
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!((proportional_owner(7, 10, 3), proportional_range(1, 10, 3)), (2, 4..7));
+        assert_eq!((residue_count(3, 20, 8), residue_select(3, 2, 8)), (3, 19));
+        assert_eq!(cyclic_next(15, 45, 44, |x| x == 16), Some(16));
+        assert_eq!(cyclic_run_before(15, 45, 16, |x| x == 16 || x == 43).collect::<Vec<_>>(), vec![15, 45, 44]);
+    }
+}
+
+#[cfg(test)]
+mod quantile_rank_tests {
+    use super::*;
+
+    #[test]
+    fn counts_the_quantile_points_below() {
+        for n in 0..40u32 {
+            for i in 0..=100 {
+                let f = i as f64 / 100.0;
+                let brute = (0..n).filter(|&r| r as f64 + 0.5 < n as f64 * f).count() as u32;
+                assert_eq!(quantile_rank_count(n, f), brute, "{n} {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!((quantile_rank_count(10, 0.26), quantile_rank_count(10, 0.25), quantile_rank_count(3, 2.0)), (3, 2, 3));
     }
 }

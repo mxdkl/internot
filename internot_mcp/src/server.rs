@@ -45,9 +45,10 @@ impl ServerHandler for InternotServer {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::from_build_env();
         info.instructions = Some(
-            "Procedural world of people (internot society): read_person and read_household \
-             give names, family, unions, households and addresses at any time (`at`, ISO \
-             8601). Follow person ids to relatives. Time is 2025-06-30 09:00 UTC by default."
+            "Procedural world of people (internot society): read_person gives a person's \
+             sex, birth and death dates, age, partner, union, parents, children and siblings \
+             at any time (`at`, ISO 8601). Follow person ids to relatives. Time is 2025-06-30 \
+             09:00 UTC by default."
                 .to_string(),
         );
         info

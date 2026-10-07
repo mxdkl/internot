@@ -1,7 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-assertion_line: 173
-expression: snapshot
----
-Space<u64>.attribute_value(locale_name, 0xab) = L171
-Space<u64>.attribute_value(score,       0xab) = 0.8271101403647062

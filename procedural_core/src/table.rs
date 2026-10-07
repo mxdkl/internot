@@ -245,6 +245,11 @@ impl BucketIndex {
         Self { shift, table }
     }
 
+    /// Heap bytes held by the index.
+    pub fn heap_bytes(&self) -> usize {
+        self.table.capacity() * 4
+    }
+
     /// The segment of `starts` (the same as indexed) holding `x < total`.
     #[inline]
     pub fn segment(&self, starts: &[u64], x: u64) -> usize {

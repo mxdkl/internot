@@ -1,14 +1,14 @@
 //! `internot` — the procedural world.
 //!
-//! Services: `directory` (people of the society world: names, family,
-//! households, addresses; `docs/superpowers/specs/2026-10-01-directory.md`)
-//! and `trace` (the cross-cutting verdict view). The old `people` service
-//! was cut over to `directory` on 2026-10-01 (D6).
+//! Services: `directory` (people of the society world: life dates,
+//! partners and family; `docs/superpowers/specs/2026-10-01-directory.md`)
+//! and `trace` (the cross-cutting verdict view). The society world is the
+//! monotone world (`internot_society::mono`) since 2026-10-03.
 //!
 //! Services plug into the substrate by implementing the [`Service`]
-//! trait and being listed in [`SERVICES`]. `Universe::build_world*()`
-//! and [`registry()`] both walk that list — they do not name services
-//! individually. Adding a service is a one-line edit here.
+//! trait and being listed in [`SERVICES`]. [`registry()`] walks that
+//! list; it does not name services individually. Adding a service is a
+//! one-line edit here.
 //!
 //! Transports (`internot_mcp`, …) live in separate crates. They build
 //! a `Universe` and a `ViewRegistry` at startup and bind every view
@@ -27,7 +27,7 @@ pub use universe::{MutationTrace, SessionState, Universe, DEFAULT_NOW};
 pub use views::{DynView, View, ViewError, ViewRegistry};
 
 /// The canonical list of services in this build. Single source of
-/// truth — `Universe::build_world*()` and [`registry()`] both walk it.
+/// truth — [`registry()`] walks it.
 /// Adding a service: implement `Service` on a unit tag struct, then
 /// add `&YourService` to this list.
 pub const SERVICES: &[&dyn Service] = &[&directory::DirectoryService, &trace::TraceService];

@@ -14,7 +14,15 @@ Inputs (git-ignored, in `datasets/geo/` at the repository root):
   `..._partIV_county_dates_fips.csv`: county populations at every census
   1800–1990 (Forstall 1996, Census Bureau), joined to FIPS by name.
 
-All are US government works (public domain).
+- `zcta/tab20_zcta520_tract20_natl.txt`: 2020 ZCTA to tract relationship
+  (land area of each ZCTA–tract part).
+- `geonames/US_postal.zip`: US postal codes with their place names and
+  states (GeoNames, CC BY 4.0: credit www.geonames.org).
+- `tiger2025/street_fullname_counts_tiger2025.csv`: street names with the
+  number of TIGER/Line 2025 linear features carrying each (the most common
+  `STREETS` of them are kept).
+
+All but GeoNames are US government works (public domain).
 
 Run from the repository root (Python 3, standard library only):
     python3 internot_society/data/distill_places.py [area cap]
@@ -47,7 +55,7 @@ Weights by decade, 1840 to 2100 (27 decades), are populations:
 - a county with no population in a decade (not yet organized) weighs 0.
 
 Binary format (little-endian; `v` = unsigned LEB128):
-    b"INTPLACE", u8 version (2)
+    b"INTPLACE", u8 version (3)
     u16 first decade, u8 decades
     areas:    v n; n x (u8 len, UTF-8 name, e.g. "CA 2")
     zones:    v n; n x (v commuting zone, v area, u8 len, UTF-8 zone name)
@@ -55,6 +63,13 @@ Binary format (little-endian; `v` = unsigned LEB128):
     clusters: v n; n x (v county)
     tracts:   v n; n x (v GEOID, f32 latitude, f32 longitude, v cluster,
                         decades x v weight)
+    postal (version 3):
+      cities: v m; m x (u8 len, UTF-8 postal place name)
+      zips:   v z; z x (v ZIP code, u8 state FIPS, v city)
+      per tract, in tract order: u8 k; k x (v zip, u16 share of 65535)
+      (a tract's ZIPs by land area shared, at most 4, shares summing to
+      65535; none if the tract has no ZCTA part)
+      streets: v s; s x (u8 len, UTF-8 name, v features)
 Every level is listed in tree order: a node's children are contiguous.
 States are the first two FIPS digits of a county (or of a tract's GEOID);
 a world pack maps them to its lineage regions (`places.ron`).
@@ -75,6 +90,7 @@ DECADES = 27  # 1840 ... 2100
 CLUSTER_MAX = 16
 COUNTY_SPLIT = 2_000_000
 COUNTY_PART = 1_000_000
+STREETS = 20_000
 STATE_POSTAL = dict(zip(
     "01 02 04 05 06 08 09 10 11 12 13 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 44 45 46 47 48 49 50 51 53 54 55 56".split(),
     "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY".split(),
@@ -213,6 +229,50 @@ def bisect(items, key_lat, key_lon, cap, weight):
     return bisect(items[:cut], key_lat, key_lon, cap, weight) + bisect(items[cut:], key_lat, key_lon, cap, weight)
 
 
+def load_postal(tract_rows, county_names):
+    """ZIP codes per tract by land area, and each ZIP's postal place."""
+    import io
+    import zipfile
+    z = zipfile.ZipFile(os.path.join(GEO, "geonames", "US_postal.zip"))
+    place = {}
+    for line in io.TextIOWrapper(z.open("US.txt"), encoding="utf-8"):
+        f = line.rstrip("\n").split("\t")
+        if len(f) > 6 and f[1].isdigit():
+            place[int(f[1])] = f[2]
+    parts = defaultdict(list)  # tract GEOID -> [(land, zip)]
+    with open(os.path.join(GEO, "zcta", "tab20_zcta520_tract20_natl.txt"), encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f, delimiter="|"):
+            zc, tr, land = r["GEOID_ZCTA5_20"], r["GEOID_TRACT_20"], r["AREALAND_PART"]
+            if zc and tr and land and int(land) > 0:
+                parts[int(tr)].append((int(land), int(zc)))
+    cities, city_index, zips, zip_index, per_tract = [], {}, [], {}, []
+    unnamed = set()
+    for geoid, _, _, _, _ in tract_rows:
+        ps = sorted(parts.get(geoid, []), reverse=True)[:4]
+        total = sum(p[0] for p in ps)
+        row = []
+        acc = 0
+        for k, (land, zc) in enumerate(ps):
+            if zc not in zip_index:
+                st = geoid // 10**9
+                name = place.get(zc)
+                if name is None:
+                    unnamed.add(zc)
+                    name = county_names.get("%05d" % (geoid // 10**6), "").replace(" County", "").replace(" Parish", "") or "Unknown"
+                if name not in city_index:
+                    city_index[name] = len(cities)
+                    cities.append(name)
+                zip_index[zc] = len(zips)
+                zips.append((zc, st, city_index[name]))
+            share = 65535 - acc if k == len(ps) - 1 else round(65535 * land / total)
+            acc += share
+            row.append((zip_index[zc], share))
+        per_tract.append(row)
+    print(f"postal: {len(zips)} ZIPs ({len(unnamed)} without a GeoNames place), {len(cities)} place names, "
+          f"{sum(1 for r in per_tract if not r)} tracts without a ZIP", file=sys.stderr)
+    return cities, zips, per_tract
+
+
 def main():
     cap = int(sys.argv[1]) if len(sys.argv) > 1 else 12_000_000
     tracts = load_tracts()
@@ -286,7 +346,7 @@ def main():
             areas.append((st, sorted(p)))
 
     out = bytearray(b"INTPLACE")
-    out.append(2)
+    out.append(3)
     out += struct.pack("<HB", FIRST_DECADE, DECADES)
     out += leb(len(areas))
     per_state = defaultdict(int)
@@ -323,6 +383,37 @@ def main():
         out += leb(geoid) + struct.pack("<ff", lat, lon) + leb(li)
         for x in w:
             out += leb(x)
+    cities, zips, per_tract = load_postal(tract_rows, county_names)
+    out += leb(len(cities))
+    for c in cities:
+        out += text(c)
+    out += leb(len(zips))
+    for zc, st, ci in zips:
+        out += leb(zc) + bytes([st]) + leb(ci)
+    for row in per_tract:
+        out.append(len(row))
+        for zi, share in row:
+            out += leb(zi) + struct.pack("<H", share)
+    streets = []
+    with open(os.path.join(GEO, "tiger2025", "street_fullname_counts_tiger2025.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            name, n = r["name_with_type"].strip(), int(r["linear_features"])
+            # Streets with a name a mail address can carry: a name and a
+            # type ("Oak St", "3rd Ave"), not numbered highways, ramps or
+            # bare route numbers.
+            words = name.split()
+            if (
+                len(words) >= 2
+                and any(c.isalpha() for c in words[0])
+                and not any(w in name for w in ("Hwy", "Interstate", "I-", "US Hwy", "State Rte", "Co Rd", "Ramp", "Rte ", "Unnamed", "Private"))
+            ):
+                streets.append((n, name))
+    streets.sort(key=lambda x: (-x[0], x[1]))
+    streets = streets[:STREETS]
+    out += leb(len(streets))
+    for n, name in streets:
+        out += text(name) + leb(n)
+    print(f"streets: {len(streets)} names, from {streets[0]} to {streets[-1]}", file=sys.stderr)
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "wb") as f:
         f.write(out)

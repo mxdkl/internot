@@ -149,6 +149,309 @@ pub fn invert_cumulative(cum: CoarseRow<f64>, req: usize, u: f64) -> usize {
     (cum.first_fail(req + 1, |c| c <= threshold) - 1).min(max)
 }
 
+impl Siler {
+    /// The hazard integrated over ages `[0, x]`, in closed form.
+    #[inline]
+    pub fn cumulative_hazard(&self, x: f64) -> f64 {
+        self.infant / self.decay * (1.0 - exp(-self.decay * x)) + self.background * x + self.old / self.slope * (exp(self.slope * x) - 1.0)
+    }
+
+    /// The age, from `lo` up (at most 150), at which the cumulative hazard
+    /// reaches `target`: Newton steps from a Gompertz guess, safeguarded by
+    /// bisection.
+    pub fn age_at_cumulative_hazard(&self, target: f64, lo: f64) -> f64 {
+        let (mut a, mut b) = (lo, 150.0);
+        if self.cumulative_hazard(b) <= target {
+            return b;
+        }
+        let mut x = (crate::dmath::ln(1.0 + (target * self.slope / self.old).max(0.0)) / self.slope).clamp(a, b);
+        for _ in 0..40 {
+            // The cumulative hazard and the hazard share their two
+            // exponentials (the same operations as `cumulative_hazard` and
+            // `hazard`, so the same bits).
+            let (e1, e2) = (exp(-self.decay * x), exp(self.slope * x));
+            let f = self.infant / self.decay * (1.0 - e1) + self.background * x + self.old / self.slope * (e2 - 1.0) - target;
+            if f.abs() < 1e-10 {
+                break;
+            }
+            if f > 0.0 {
+                b = x
+            } else {
+                a = x
+            }
+            let n = x - f / (self.infant * e1 + self.background + self.old * e2);
+            x = if n > a && n < b { n } else { 0.5 * (a + b) };
+        }
+        x
+    }
+
+    /// An age at death by inversion of `u ∈ [0, 1)`, conditioned on reaching
+    /// `from` and, when given, dying before `to`.
+    pub fn conditional_death_age(&self, from: f64, to: Option<f64>, u: f64) -> f64 {
+        let h0 = self.cumulative_hazard(from);
+        let span = to.map_or(1.0, |t| 1.0 - exp(h0 - self.cumulative_hazard(t)));
+        self.age_at_cumulative_hazard(h0 - crate::dmath::ln(1.0 - u * span), from)
+    }
+}
+
+/// Of a population whose share `ever` has the event at ages with CDF value
+/// `cdf` by now, the share still to have it among those without it yet:
+/// `(ever − ever·cdf)/(1 − ever·cdf)`, clamped to `[0, 1]`.
+#[inline]
+pub fn remaining_share(ever: f64, cdf: f64) -> f64 {
+    let f = ever * cdf;
+    ((ever - f) / (1.0 - f)).clamp(0.0, 1.0)
+}
+
+impl Siler {
+    /// Survival to exact age `x`: `exp(−H(x))`.
+    #[inline]
+    pub fn survival(&self, x: f64) -> f64 {
+        exp(-self.cumulative_hazard(x))
+    }
+}
+
+/// A cumulative hazard tabulated at ages `0, step, 2·step, …` and linear
+/// between them (beyond the last age, the last slope continues): a survival
+/// law whose inverse is exact and cheap. Built from a [`Siler`] it agrees
+/// with it at every knot; between knots the hazard is constant (the
+/// piecewise-exponential law). [`HazardTable::age_at`] inverts
+/// [`HazardTable::cumulative`] exactly (up to float rounding) with one
+/// binary search over the knots, so a world can draw ages at death without
+/// Newton steps and count them consistently.
+#[derive(Clone, Debug)]
+pub struct HazardTable {
+    step: f64,
+    h: Vec<f64>,
+    /// For bucket `b` of `g = H/(1 + H)` (in `[0, 1)`, [`BUCKETS`] buckets):
+    /// the last knot whose `H` is at or below the bucket's start. The
+    /// segment holding a target lies between `index[b]` and `index[b + 1]`,
+    /// so [`Self::age_at`] searches a few knots instead of all of them.
+    index: Vec<u16>,
+}
+
+/// Buckets of [`HazardTable`]'s index.
+const BUCKETS: usize = 1024;
+
+impl HazardTable {
+    /// `s`'s cumulative hazard at every `step` from 0 to `max_age`.
+    pub fn from_siler(s: &Siler, max_age: f64, step: f64) -> Self {
+        let n = (max_age / step).ceil() as usize + 1;
+        let mut h: Vec<f64> = (0..n).map(|i| s.cumulative_hazard(i as f64 * step)).collect();
+        // Strictly increasing, so the inverse is a function.
+        for i in 1..n {
+            if h[i] <= h[i - 1] {
+                h[i] = h[i - 1] + 1e-12;
+            }
+        }
+        let index = (0..=BUCKETS)
+            .map(|b| {
+                // The start of bucket `b` in H: g = b/B ⟺ H = g/(1 − g).
+                let g = b as f64 / BUCKETS as f64;
+                let hb = if b == BUCKETS { f64::INFINITY } else { g / (1.0 - g) };
+                (h.partition_point(|&v| v <= hb).max(1) - 1).min(n - 2) as u16
+            })
+            .collect();
+        Self { step, h, index }
+    }
+
+    /// The cumulative hazard at `age` (≥ 0).
+    #[inline]
+    pub fn cumulative(&self, age: f64) -> f64 {
+        let x = (age / self.step).max(0.0);
+        let last = self.h.len() - 1;
+        let i = (x.floor() as usize).min(last - 1);
+        let f = x - i as f64;
+        self.h[i] + f * (self.h[i + 1] - self.h[i])
+    }
+
+    /// Survival to `age`.
+    #[inline]
+    pub fn survival(&self, age: f64) -> f64 {
+        exp(-self.cumulative(age))
+    }
+
+    /// The age where the cumulative hazard reaches `target` (≥ 0).
+    #[inline]
+    pub fn age_at(&self, target: f64) -> f64 {
+        let last = self.h.len() - 1;
+        // The segment holding `target`: h[i] ≤ target < h[i+1] (the last
+        // segment extends beyond the table). The bucket of `target` bounds
+        // it: knots in [index[b], index[b + 1] + 1] (the same `i` as a search
+        // over all knots).
+        let g = target / (1.0 + target);
+        let b = ((g.max(0.0) * BUCKETS as f64) as usize).min(BUCKETS - 1);
+        let (lo, hi) = (self.index[b] as usize, (self.index[b + 1] as usize + 1).min(last));
+        let i = (lo + self.h[lo..=hi].partition_point(|&v| v <= target)).max(1) - 1;
+        let i = i.min(last - 1);
+        let (a, b) = (self.h[i], self.h[i + 1]);
+        (i as f64 + (target - a) / (b - a)) * self.step
+    }
+
+    /// An age at death conditioned on reaching `from` (and dying before
+    /// `to`, when given), at quantile `u`: as [`Siler::conditional_death_age`].
+    #[inline]
+    pub fn conditional_death_age(&self, from: f64, to: Option<f64>, u: f64) -> f64 {
+        let h0 = self.cumulative(from);
+        let span = to.map_or(1.0, |t| 1.0 - exp(h0 - self.cumulative(t)));
+        let a = self.age_at(h0 - crate::dmath::ln(1.0 - u * span));
+        match to {
+            Some(t) => a.clamp(from, t),
+            None => a.max(from),
+        }
+    }
+
+    /// [`Self::conditional_death_age`] with no upper bound, given
+    /// `h0 = cumulative(from)` (store it when `from` repeats): the same
+    /// result.
+    #[inline]
+    pub fn death_age_given(&self, from: f64, h0: f64, u: f64) -> f64 {
+        self.age_at(h0 - crate::dmath::ln(1.0 - u)).max(from)
+    }
+
+    /// Remaining life expectancy at `from`: `∫ S(x)/S(from) dx` over
+    /// `x ≥ from`, exact for the piecewise-exponential law (each segment's
+    /// constant hazard integrated in closed form; the last segment's hazard
+    /// continues beyond the table).
+    pub fn remaining_life(&self, from: f64) -> f64 {
+        let last = self.h.len() - 1;
+        let h0 = self.cumulative(from);
+        // ∫ over [0, d] of e^{−(ha − h0) − m·x}: (1 − e^{−m d})/m, or d for
+        // a negligible m·d (the series' error is below 1e-16 relative).
+        let seg = |ha: f64, m: f64, d: f64| {
+            let s0 = exp(h0 - ha);
+            if m * d < 1e-8 { s0 * d * (1.0 - 0.5 * m * d) } else { s0 * (1.0 - exp(-m * d)) / m }
+        };
+        let slope = |i: usize| (self.h[i + 1] - self.h[i]) / self.step;
+        let from = from.max(0.0);
+        let end = last as f64 * self.step;
+        let mut total = 0.0;
+        if from < end {
+            let i = ((from / self.step).floor() as usize).min(last - 1);
+            total += seg(h0, slope(i), (i + 1) as f64 * self.step - from);
+            for j in i + 1..last {
+                total += seg(self.h[j], slope(j), self.step);
+            }
+        }
+        // Beyond the table: the last hazard forever.
+        let m = slope(last - 1);
+        total + exp(h0 - self.cumulative(from.max(end))) / m
+    }
+
+    /// Heap bytes.
+    pub fn heap_bytes(&self) -> usize {
+        self.h.capacity() * 8 + self.index.capacity() * 2
+    }
+}
+
+#[cfg(test)]
+mod hazard_table_tests {
+    use super::*;
+
+    fn siler() -> Siler {
+        Siler { infant: 0.05, decay: 1.5, background: 0.002, old: 3e-5, slope: 0.095 }
+    }
+
+    #[test]
+    fn agrees_with_siler_at_knots_and_inverts() {
+        let s = siler();
+        let t = HazardTable::from_siler(&s, 130.0, 0.25);
+        for i in 0..520 {
+            let a = i as f64 * 0.25;
+            assert!((t.cumulative(a) - s.cumulative_hazard(a)).abs() < 1e-9 * (1.0 + s.cumulative_hazard(a)));
+        }
+        for k in 0..2000 {
+            let a = k as f64 * 0.0617;
+            let h = t.cumulative(a);
+            assert!((t.age_at(h) - a).abs() < 1e-6, "{a}");
+        }
+    }
+
+    #[test]
+    fn indexed_inverse_equals_the_full_search() {
+        let t = HazardTable::from_siler(&siler(), 130.0, 0.25);
+        let full = |target: f64| {
+            let last = t.h.len() - 1;
+            let i = (t.h.partition_point(|&v| v <= target).max(1) - 1).min(last - 1);
+            let (a, b) = (t.h[i], t.h[i + 1]);
+            (i as f64 + (target - a) / (b - a)) * t.step
+        };
+        let mut k = 0u64;
+        for target in (0..200_000).map(|j| j as f64 * 0.00025).chain((0..2000).map(|j| j as f64 * 0.05)).chain(t.h.iter().copied()) {
+            k += 1;
+            assert_eq!(t.age_at(target).to_bits(), full(target).to_bits(), "{target}");
+        }
+        assert!(k > 200_000);
+    }
+
+    #[test]
+    fn conditional_ages_are_monotone_and_close_to_siler() {
+        let s = siler();
+        let t = HazardTable::from_siler(&s, 130.0, 0.25);
+        let mut prev = 0.0;
+        for k in 0..10_000 {
+            let u = (k as f64 + 0.5) / 10_000.0;
+            let a = t.conditional_death_age(16.0, None, u);
+            assert!(a >= prev && a >= 16.0);
+            prev = a;
+            assert!((a - s.conditional_death_age(16.0, None, u)).abs() < 0.05, "{u}: {a}");
+        }
+        for k in 0..1000 {
+            let u = (k as f64 + 0.5) / 1000.0;
+            let a = t.conditional_death_age(0.0, Some(16.0), u);
+            assert!((0.0..=16.0).contains(&a));
+        }
+    }
+
+    #[test]
+    fn death_age_given_equals_the_conditional_age() {
+        let t = HazardTable::from_siler(&siler(), 130.0, 0.25);
+        for from in [0.0, 16.0, 16.37, 45.0, 90.0] {
+            let h0 = t.cumulative(from);
+            for k in 0..5000 {
+                let u = (k as f64 + 0.5) / 5000.0;
+                assert_eq!(t.death_age_given(from, h0, u).to_bits(), t.conditional_death_age(from, None, u).to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_life_is_the_survival_integral() {
+        // A constant hazard: exactly 1/λ from any age, inside or beyond the table.
+        let flat = Siler { infant: 0.0, decay: 1.0, background: 0.02, old: 0.0, slope: 1.0 };
+        let t = HazardTable::from_siler(&flat, 130.0, 0.25);
+        for from in [0.0, 16.0, 16.37, 129.9, 140.0] {
+            assert!((t.remaining_life(from) - 50.0).abs() < 1e-9, "{from}: {}", t.remaining_life(from));
+        }
+        // The Siler law: against a fine midpoint rule on the table's own survival.
+        let t = HazardTable::from_siler(&siler(), 130.0, 0.25);
+        for from in [0.0, 16.0, 16.37, 60.0, 100.0] {
+            let (steps, top) = (400_000, 200.0);
+            let dx = (top - from) / steps as f64;
+            let s0 = t.survival(from);
+            let num: f64 = (0..steps).map(|k| t.survival(from + (k as f64 + 0.5) * dx) / s0 * dx).sum();
+            assert!((t.remaining_life(from) - num).abs() < 1e-6 * num, "{from}: {} vs {num}", t.remaining_life(from));
+        }
+        // Remaining life falls with age (for this law, past infancy).
+        assert!(t.remaining_life(16.0) > t.remaining_life(60.0));
+    }
+
+    #[test]
+    fn remaining_life_golden() {
+        let t = HazardTable::from_siler(&siler(), 130.0, 0.25);
+        assert_eq!(format!("{:.9}", t.remaining_life(16.0)), "58.928043761");
+        assert_eq!(format!("{:.9}", t.remaining_life(0.0)), "70.384835881");
+    }
+
+    #[test]
+    fn golden() {
+        let t = HazardTable::from_siler(&siler(), 130.0, 0.25);
+        let a = t.conditional_death_age(16.0, None, 0.5);
+        assert!((a - siler().conditional_death_age(16.0, None, 0.5)).abs() < 0.05);
+        assert_eq!(format!("{a:.6}"), format!("{:.6}", t.conditional_death_age(16.0, None, 0.5)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,4 +606,70 @@ mod tests {
         4594498308068683518,
         4602266540126521155,
     ];
+}
+
+#[cfg(test)]
+mod siler_tests {
+    use super::*;
+
+    const S: Siler = Siler { infant: 0.05, decay: 1.2, background: 0.004, old: 0.00004, slope: 0.095 };
+
+    #[test]
+    fn cumulative_hazard_integrates_the_hazard() {
+        for x in [0.0, 0.5, 3.0, 20.0, 60.0, 95.0] {
+            let n = 20_000;
+            let dx = x / n as f64;
+            let num: f64 = (0..n).map(|i| S.hazard((i as f64 + 0.5) * dx) * dx).sum();
+            assert!((S.cumulative_hazard(x) - num).abs() < 1e-6 * (1.0 + num), "{x}");
+        }
+    }
+
+    #[test]
+    fn inversion_round_trips_and_respects_bounds() {
+        for lo in [0.0, 16.0, 40.0] {
+            for h in [0.01, 0.3, 1.0, 3.0] {
+                let target = S.cumulative_hazard(lo) + h;
+                let a = S.age_at_cumulative_hazard(target, lo);
+                assert!(a >= lo && (S.cumulative_hazard(a) - target).abs() < 1e-8, "{lo} {h}");
+            }
+        }
+        for i in 0..200 {
+            let u = i as f64 / 200.0;
+            let a = S.conditional_death_age(14.3, Some(16.0), u);
+            assert!((14.3..=16.0).contains(&a), "{u}: {a}");
+            assert!(S.conditional_death_age(30.0, None, u) >= 30.0);
+        }
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!(S.cumulative_hazard(50.0), 0.05 / 1.2 * (1.0 - exp(-60.0)) + 0.2 + 0.00004 / 0.095 * (exp(4.75) - 1.0));
+        assert_eq!(format!("{:.6}", S.conditional_death_age(0.0, None, 0.5)), "71.262663");
+        assert_eq!(format!("{:.6}", S.conditional_death_age(10.0, Some(16.0), 0.25)), "11.496268");
+    }
+}
+
+#[cfg(test)]
+mod remaining_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_share_matches_the_conditional() {
+        for ever in [0.0, 0.5, 0.9, 1.0] {
+            for i in 0..20 {
+                let cdf = i as f64 / 20.0;
+                let r = remaining_share(ever, cdf);
+                // Those still to have it over those without it yet.
+                let expect = if ever * cdf >= 1.0 { 0.0 } else { (ever * (1.0 - cdf)) / (1.0 - ever * cdf) };
+                assert!((r - expect.clamp(0.0, 1.0)).abs() < 1e-12, "{ever} {cdf}");
+            }
+        }
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!(remaining_share(0.9, 0.5), (0.9 - 0.45) / 0.55);
+        let s = Siler { infant: 0.05, decay: 1.2, background: 0.004, old: 0.00004, slope: 0.095 };
+        assert_eq!(s.survival(16.0), exp(-s.cumulative_hazard(16.0)));
+    }
 }

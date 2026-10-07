@@ -62,8 +62,8 @@ pub fn hash_gaussian<W: BitWord>(id: W, key: &str) -> f64 {
 
 /// Streamed sub-hash for `hash_gaussian`. The separator chain
 /// `[id_bytes][0][key_bytes][0 __gauss 0][sub_le_bytes]` is unique to
-/// this call site — `raw_hash` and `hash_with_index` use different
-/// separator schemas, so outputs cannot alias across helpers.
+/// this call site — `raw_hash` uses a different
+/// separator schema, so outputs cannot alias across helpers.
 fn hash_gauss_sub<W: BitWord>(id: W, key: &str, sub: u8) -> u64 {
     let mut hasher = Xxh3::new();
     hasher.update(id.to_le_bytes().as_ref());
@@ -79,24 +79,6 @@ pub(crate) fn raw_hash<W: BitWord>(id: W, key: &str) -> u64 {
     hasher.update(id.to_le_bytes().as_ref());
     hasher.update(&[0u8]); // separator, prevents aliasing between numeric suffixes and key prefixes
     hasher.update(key.as_bytes());
-    hasher.digest()
-}
-
-/// Fast path for `raw_hash(id, &format!("{label}_{index}"))` without
-/// heap-allocating the key per call. Used by streaming candidate
-/// generators that need an independent hash per integer index.
-///
-/// Separators (`0u8` between fields) match `raw_hash` byte-for-byte so
-/// output domain overlaps with arbitrary string keys are impossible —
-/// `hash_with_index(id, "candidate", 5)` and any `raw_hash(id, key)`
-/// produce distinct byte sequences regardless of `key`.
-pub(crate) fn hash_with_index<W: BitWord>(id: W, label: &str, index: u64) -> u64 {
-    let mut hasher = Xxh3::new();
-    hasher.update(id.to_le_bytes().as_ref());
-    hasher.update(&[0u8]);
-    hasher.update(label.as_bytes());
-    hasher.update(&[0u8]);
-    hasher.update(&index.to_le_bytes());
     hasher.digest()
 }
 

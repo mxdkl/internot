@@ -4,7 +4,9 @@
 //! Every number the population model uses comes from a pack (`worlds/us/`
 //! and the packs that extend it), next to a comment naming its source. This
 //! module defines the sections, checks them, and gives each the methods the
-//! ledger and the world call (`params.mortality.death_prob(...)`). Each
+//! world calls (`params.mortality.siler(...)`). Sections no world reads yet
+//! (households, residence, places, repartnering, immigration) are kept for
+//! the features being rebuilt on the monotone world. Each
 //! method keeps a fixed arithmetic, so worlds are bit-identical across
 //! machines; all transcendental math goes through `procedural_core::dmath`.
 //!
@@ -77,7 +79,8 @@ pub const DISSOLUTION_BANDS: [Option<(u32, u32)>; 6] = [
 /// calendar year after the union year (after arrival, for couples who
 /// arrive together).
 pub const MAX_CLASS: usize = 40;
-/// People per roommate frame (the chunk table in `household.rs`).
+/// People per roommate frame (the removed ledger world's households; kept
+/// with the pack's `households.ron` for their rebuild).
 pub const ROOMMATE_FRAME: usize = 12;
 
 // --- the world ----------------------------------------------------------------------
@@ -128,6 +131,12 @@ pub struct Params {
     /// The pack's name tables (`names.data`), shared by every world built
     /// from the same bytes.
     pub name_data: std::sync::Arc<crate::names::NameData>,
+    pub education: Education,
+    /// The schools and colleges data (`education.data`).
+    pub school_data: std::sync::Arc<[u8]>,
+    pub work: Work,
+    /// The occupations data (`work.data`).
+    pub work_data: std::sync::Arc<[u8]>,
 }
 
 /// One lineage region.
@@ -236,9 +245,15 @@ impl Params {
             place_data: std::sync::Arc::from(&[][..]),
             names: pack.section("names")?,
             name_data: std::sync::Arc::new(crate::names::NameData::empty()),
+            education: pack.section("education")?,
+            school_data: std::sync::Arc::from(&[][..]),
+            work: pack.section("work")?,
+            work_data: std::sync::Arc::from(&[][..]),
         };
         let mut p = p;
         p.place_data = std::sync::Arc::from(pack.data(&p.places.data)?);
+        p.school_data = std::sync::Arc::from(pack.data(&p.education.data)?);
+        p.work_data = std::sync::Arc::from(pack.data(&p.work.data)?);
         p.name_data = crate::names::NameData::cached(pack.data(&p.names.data)?)
             .map_err(|m| DefError::invalid(pack.name(), &p.names.data, "", m))?;
         p.validate(pack.name())?;
@@ -747,6 +762,8 @@ impl Params {
                 format!("state {s} is listed twice"),
             ));
         }
+        self.work.validate().map_err(|(at, m)| err("work.ron", &at, m))?;
+        self.education.validate(&self.heritage).map_err(|(at, m)| err("education.ron", &at, m))?;
         Ok(())
     }
 }
@@ -1016,12 +1033,33 @@ impl Repartnering {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fertility {
+    /// Births a year (millions), the world's own series before scaling:
+    /// the monotone world's births are this, scaled so the year before the
+    /// first one is the founders' births.
+    pub births: Series,
+    /// Mothers' ages at birth (monotone world).
+    pub mother_age: MotherAge,
+    /// Births a woman has in her unions, against which the single share of
+    /// births is set (monotone world): a non-union birth per woman `e` gives
+    /// a single share `e / (e + union_births)`.
+    pub union_births: f64,
     pub union_parity: VecSeries,
     pub second_union_fertile: f64,
     pub first_birth: FirstBirth,
     pub spacing: Vec<Spacing>,
     pub gestation_days: i64,
     pub nonunion: NonUnion,
+}
+
+/// Mothers' ages at birth: an algebraic sigmoid CDF over the fertile window,
+/// centred at `peak` (by year), with `scale`; single mothers' centre is
+/// `single_offset` years from married mothers'.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotherAge {
+    pub peak: Series,
+    pub single_offset: f64,
+    pub scale: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1564,6 +1602,326 @@ impl Names {
             .expect("validated")
             .column;
         data.columns.iter().position(|d| d == c).expect("validated")
+    }
+}
+
+// --- education (L5) -----------------------------------------------------------------
+
+/// Education: final attainment by cohort, sex and group, how it runs in
+/// families and couples, and when schooling happens (`education.ron`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Education {
+    /// Percent shares of [less than HS, HS, some college, BA, graduate] by
+    /// birth cohort, per sex.
+    pub attainment: BySex<VecSeries>,
+    /// Of some college, the share with an associate degree, by cohort.
+    pub associate: Series,
+    /// Of graduate degrees, [master's, professional, doctorate] by cohort.
+    pub graduate: VecSeries,
+    /// Each group's latent shift (log-odds of every threshold), by cohort.
+    pub group_shift: Vec<GroupShift>,
+    /// The latent's variance split.
+    pub latent: EducationLatent,
+    /// Schools and colleges (`data`), and how people choose them.
+    pub data: String,
+    pub private_share: Series,
+    pub college: CollegeChoice,
+    pub timing: EducationTiming,
+}
+
+/// How students choose colleges.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollegeChoice {
+    pub in_state: f64,
+    pub miles_scale: f64,
+    pub decay: f64,
+    pub two_year: Series,
+    pub graduate_in_state: f64,
+    pub graduate_decay: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupShift {
+    pub group: String,
+    pub shift: Series,
+}
+
+/// Weights squared of the latent's keys (they sum to 1).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EducationLatent {
+    pub own: f64,
+    pub parents: f64,
+    pub grandparents: f64,
+    pub union: f64,
+}
+
+/// A span of years, drawn uniformly.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Span {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Span {
+    /// The span at `u ∈ [0, 1)`.
+    pub fn at(&self, u: f64) -> f64 {
+        self.min + u * (self.max - self.min)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EducationTiming {
+    pub first_grade_age: Series,
+    pub kindergarten: Series,
+    pub dropout_age: Series,
+    pub dropout_spread: f64,
+    pub hs_end_age: i32,
+    pub college_on_time: f64,
+    pub late_start_years: f64,
+    pub some_college_years: Span,
+    pub associate_years: Span,
+    pub bachelor_years: Span,
+    pub graduate_gap_years: f64,
+    pub master_years: Span,
+    pub professional_years: Span,
+    pub doctorate_years: Span,
+}
+
+impl Education {
+    /// Group `h`'s shift in `cohort` (0 for a group without one).
+    pub fn shift(&self, her: &Heritages, h: Heritage, cohort: i32) -> f64 {
+        self.group_shift.iter().find(|g| her.find(&g.group) == Some(h)).map_or(0.0, |g| g.shift.at(cohort))
+    }
+
+    fn validate(&self, her: &Heritages) -> Result<(), (String, String)> {
+        let e = |f: &str, m: String| (f.to_string(), m);
+        for (name, v) in [("attainment.female", &self.attainment.female), ("attainment.male", &self.attainment.male)] {
+            v.validate(5).map_err(|m| e(name, m))?;
+            if let Some(a) = v.0.iter().find(|a| (a.1.iter().sum::<f64>() - 100.0).abs() > 0.5 || a.1.iter().any(|&x| x < 0.0)) {
+                return Err(e(name, format!("cohort {}'s shares don't sum to 100", a.0)));
+            }
+        }
+        self.associate.validate_within(0.0, 1.0).map_err(|m| e("associate", m))?;
+        self.graduate.validate_pmf(3).map_err(|m| e("graduate", m))?;
+        for g in &self.group_shift {
+            if her.find(&g.group).is_none() {
+                return Err(e("group_shift", format!("no heritage group `{}`", g.group)));
+            }
+            g.shift.validate().map_err(|m| e("group_shift", m))?;
+        }
+        let l = self.latent;
+        if [l.own, l.parents, l.grandparents, l.union].iter().any(|&x| x < 0.0) || (l.own + l.parents + 2.0 * l.grandparents + l.union - 1.0).abs() > 1e-9 {
+            return Err(e("latent", "the weights must be nonnegative with own + parents + 2·grandparents + union = 1".into()));
+        }
+        Ok(())
+    }
+}
+
+// --- work (L6) ----------------------------------------------------------------------
+
+/// Careers, occupations, pay and employers (`work.ron`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Work {
+    pub data: String,
+    /// `(age at the job's start, log-mean, log-sd)` of job lengths in years.
+    pub job_years: Vec<(i32, f64, f64)>,
+    pub direct: f64,
+    pub unemployment_weeks: LogNormal,
+    pub break_share: f64,
+    pub break_years: LogNormal,
+    pub homemaker: Series,
+    pub homemaker_returns: Series,
+    pub return_child_age: f64,
+    pub homemaker_single: Series,
+    pub students: Students,
+    pub disability: Disability,
+    pub retirement: BySex<Vec<RetirementCurve>>,
+    pub era_factors: Vec<EraFactor>,
+    pub switch_occupation: f64,
+    pub experience: Experience,
+    pub real_wage: Series,
+    pub cpi: Series,
+    pub size_classes: Vec<SizeClass>,
+    pub other_county: f64,
+    pub names: EmployerNames,
+}
+
+/// How employers are named: patterns with `{s}` (a surname), `{t}` (a
+/// second surname), `{p}` (the county's name), `{l}` (the line of business)
+/// and `{x}` (a corporate suffix).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmployerNames {
+    /// For a line of business that names a place ("Pizza Parlor"), the
+    /// share named after it, and the patterns.
+    pub place_share: f64,
+    pub place: Vec<String>,
+    /// Place nouns of institutions (the last word of a line, lower case)
+    /// and their patterns.
+    pub civic_nouns: Vec<String>,
+    pub civic: Vec<String>,
+    /// Size classes from which an establishment takes its sector's `large`
+    /// patterns.
+    pub large_from: u8,
+    pub suffixes: Vec<String>,
+    /// By NAICS recode prefix (the longest listed prefix of an industry's
+    /// code applies; `""` matches every industry).
+    pub sectors: Vec<SectorNames>,
+}
+
+/// Name patterns of a sector.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SectorNames {
+    pub naics: String,
+    pub small: Vec<String>,
+    #[serde(default)]
+    pub large: Vec<String>,
+}
+
+impl EmployerNames {
+    /// The patterns for an industry's NAICS recode `code`.
+    pub fn sector(&self, code: &str) -> &SectorNames {
+        self.sectors.iter().filter(|s| code.starts_with(s.naics.as_str())).max_by_key(|s| s.naics.len()).expect("a sector matches every code")
+    }
+}
+
+/// A lognormal by its median and log-sd.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogNormal {
+    pub median: f64,
+    pub sigma: f64,
+}
+
+/// A birth cohort's curve of working: `(cohort, [(age, share still
+/// working of those working at 50)])`.
+pub type RetirementCurve = (i32, Vec<(f64, f64)>);
+
+/// Students' jobs: the share of students working at a time by year, the
+/// lengths of their jobs, and their hours as a share of full time.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Students {
+    pub share: Series,
+    pub job_years: LogNormal,
+    pub hours: f64,
+}
+
+/// Leaving the labour force for disability or ill health: a yearly hazard
+/// by age, its scale by year, the share who return and the spell's length.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Disability {
+    pub hazard: Steps,
+    pub era: Series,
+    pub returns: f64,
+    pub years: LogNormal,
+}
+
+/// A SOC major group's weight relative to 2023, by year.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EraFactor {
+    pub group: u8,
+    pub factor: Series,
+}
+
+/// Log points of pay per year of experience, up to a peak, from a start.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Experience {
+    pub per_year: f64,
+    pub peak_years: f64,
+    pub start: f64,
+}
+
+/// An establishment size class: its share of employment and mean size.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeClass {
+    pub share: f64,
+    pub mean: f64,
+}
+
+impl Work {
+    /// Job length's (log-mean, log-sd) for a job started at `age`.
+    pub fn job_law(&self, age: f64) -> (f64, f64) {
+        let a = &self.job_years;
+        let f = |i: usize| a[i].0 as f64;
+        let mu = procedural_core::interp::piecewise_linear(a.len(), f, |i| a[i].1, age);
+        let sd = procedural_core::interp::piecewise_linear(a.len(), f, |i| a[i].2, age);
+        (mu, sd)
+    }
+
+    /// The age at which someone of `cohort` leaves work for good, at
+    /// quantile `u`: each listed cohort's curve inverted at `u`, the ages
+    /// interpolated between cohorts.
+    pub fn retirement_age(&self, female: bool, cohort: i32, u: f64) -> f64 {
+        let rows = self.retirement.get(female);
+        let age = |r: &[(f64, f64)]| procedural_core::interp::inverse_decreasing(r.len(), |i| r[i].0, |i| r[i].1, u);
+        let b = procedural_core::interp::bracket(rows.len(), |i| rows[i].0 as f64, cohort as f64);
+        procedural_core::interp::lerp(age(&rows[b.lo].1), age(&rows[b.hi].1), b.f)
+    }
+
+    /// Era factor of SOC major group `group` in `year` (1 if not listed).
+    pub fn era_factor(&self, group: u8, year: i32) -> f64 {
+        self.era_factors.iter().find(|e| e.group == group).map_or(1.0, |e| e.factor.at(year))
+    }
+
+    fn validate(&self) -> Result<(), (String, String)> {
+        let e = |f: &str, m: String| (f.to_string(), m);
+        if self.job_years.is_empty() || self.job_years.windows(2).any(|w| w[1].0 <= w[0].0) {
+            return Err(e("job_years", "ages must increase".into()));
+        }
+        for (name, v) in [("direct", self.direct), ("break_share", self.break_share), ("switch_occupation", self.switch_occupation), ("other_county", self.other_county)] {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(e(name, format!("{v} is not a share")));
+            }
+        }
+        self.homemaker.validate_within(0.0, 1.0).map_err(|m| e("homemaker", m))?;
+        self.homemaker_returns.validate_within(0.0, 1.0).map_err(|m| e("homemaker_returns", m))?;
+        self.homemaker_single.validate_within(0.0, 1.0).map_err(|m| e("homemaker_single", m))?;
+        self.students.share.validate_within(0.0, 1.0).map_err(|m| e("students.share", m))?;
+        if !(0.0..=1.0).contains(&self.students.hours) || !(0.0..=1.0).contains(&self.disability.returns) {
+            return Err(e("students.hours", "hours and returns are shares".into()));
+        }
+        self.disability.hazard.validate().map_err(|m| e("disability.hazard", m))?;
+        self.disability.era.validate().map_err(|m| e("disability.era", m))?;
+        for (sex, rows) in [("female", &self.retirement.female), ("male", &self.retirement.male)] {
+            let f = format!("retirement.{sex}");
+            if rows.is_empty() || rows.windows(2).any(|w| w[1].0 <= w[0].0) {
+                return Err(e(&f, "cohorts must increase".into()));
+            }
+            for (c, r) in rows {
+                if r.len() < 2 || r.windows(2).any(|w| w[1].0 <= w[0].0 || w[1].1 > w[0].1) || r[0].1 != 1.0 || r[r.len() - 1].1 != 0.0 {
+                    return Err(e(&f, format!("cohort {c}: ages must increase and shares fall from 1 to 0")));
+                }
+            }
+        }
+        self.real_wage.validate().map_err(|m| e("real_wage", m))?;
+        self.cpi.validate().map_err(|m| e("cpi", m))?;
+        if self.size_classes.is_empty() || (self.size_classes.iter().map(|c| c.share).sum::<f64>() - 1.0).abs() > 0.01 {
+            return Err(e("size_classes", "shares must sum to 1".into()));
+        }
+        let n = &self.names;
+        if n.place.is_empty() || n.civic.is_empty() || n.suffixes.is_empty() || !(0.0..=1.0).contains(&n.place_share) {
+            return Err(e("names", "place patterns and suffixes must not be empty".into()));
+        }
+        if !n.sectors.iter().any(|s| s.naics.is_empty()) {
+            return Err(e("names.sectors", "one sector must have naics \"\" (every industry)".into()));
+        }
+        if let Some(s) = n.sectors.iter().find(|s| s.small.is_empty()) {
+            return Err(e("names.sectors", format!("sector {:?} has no small patterns", s.naics)));
+        }
+        Ok(())
     }
 }
 

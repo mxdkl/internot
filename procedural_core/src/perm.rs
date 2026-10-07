@@ -85,10 +85,36 @@ fn divmod(x: u64, a: u64, a_inv: u64) -> (u64, u64) {
     (q, r)
 }
 
+/// `x mod n` for `n ≥ 1`, given `n_inv = ⌊(2⁶⁴ − 1)/n⌋`: a multiply
+/// and one correction ([`divmod`]) instead of a divide instruction. Store
+/// `n_inv` where `n` repeats.
+#[inline(always)]
+pub fn rem_by_inverse(x: u64, n: u64, n_inv: u64) -> u64 {
+    divmod(x, n, n_inv).1
+}
+
+/// `(x / n, x mod n)` likewise: compute `n_inv` early (off a dependency
+/// chain) and the division itself becomes two multiplies.
+#[inline(always)]
+pub fn divmod_by_inverse(x: u64, n: u64, n_inv: u64) -> (u64, u64) {
+    divmod(x, n, n_inv)
+}
+
 /// Round function `F(r)` for round key `k`, reduced to `[0, modulus)`.
 #[inline(always)]
 fn round(k: u64, r: u64, modulus: u64) -> u64 {
     ((mix64(r ^ k) as u128 * modulus as u128) >> 64) as u64
+}
+
+/// [`round`] for `r < 2³⁰`, given `kk = k ^ (k >> 30)`: then
+/// `(r ^ k) >> 30 = k >> 30`, so mix64's first xorshift is the key's alone
+/// and is folded into `kk`. The same value, a shift and an xor shorter.
+#[inline(always)]
+fn round_small(kk: u64, r: u64, modulus: u64) -> u64 {
+    debug_assert!(r < 1 << 30);
+    let mut z = (r ^ kk).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (((z ^ (z >> 31)) as u128 * modulus as u128) >> 64) as u64
 }
 
 /// One pass of the generalized Feistel network over `[0, a·b)` with
@@ -98,9 +124,13 @@ fn round(k: u64, r: u64, modulus: u64) -> u64 {
 #[inline(always)]
 fn encrypt(m: u64, a: u64, b: u64, a_inv: u64, rounds: usize, key: impl Fn(usize) -> u64) -> u64 {
     let (mut r, mut l) = divmod(m, a, a_inv);
+    // Halves below 2³⁰ (n ≤ 2⁶⁰): the shorter round, same values.
+    let small = a <= 1 << 30 && b <= 1 << 30;
     for j in 0..rounds {
         let modulus = if j % 2 == 0 { a } else { b };
-        let mut next = l + round(key(j), r, modulus);
+        let k = key(j);
+        let f = if small { round_small(k ^ (k >> 30), r, modulus) } else { round(k, r, modulus) };
+        let mut next = l + f;
         if next >= modulus {
             next -= modulus;
         }
@@ -119,10 +149,12 @@ fn encrypt(m: u64, a: u64, b: u64, a_inv: u64, rounds: usize, key: impl Fn(usize
 fn decrypt(y: u64, a: u64, b: u64, a_inv: u64, rounds: usize, key: impl Fn(usize) -> u64) -> u64 {
     let (q, rem) = divmod(y, a, a_inv);
     let (mut l, mut r) = if rounds % 2 == 1 { (q, rem) } else { (rem, q) };
+    let small = a <= 1 << 30 && b <= 1 << 30;
     for j in (0..rounds).rev() {
         let modulus = if j % 2 == 0 { a } else { b };
         let prev_r = l;
-        let f = round(key(j), l, modulus);
+        let k = key(j);
+        let f = if small { round_small(k ^ (k >> 30), l, modulus) } else { round(k, l, modulus) };
         let prev_l = if r >= f { r - f } else { r + modulus - f };
         l = prev_l;
         r = prev_r;
@@ -255,8 +287,20 @@ const ROUND_TWEAKS: [u64; 6] = [
 /// where permutations are stored by the thousands and lookups are bound by
 /// memory traffic: two fit in a cache line. It is a different permutation
 /// family from [`FeistelPerm`] (see its golden values).
+pub type CompactPerm = CompactPermR<6>;
+
+/// The [`CompactPerm`] network with 4 rounds: the fewest the Luby–Rackoff
+/// construction needs for a strong pseudorandom permutation
+/// ([`MIN_ROUNDS`]), at two thirds of the cost. For a bijection on a hot
+/// path whose job is only to decorrelate two orders. A different
+/// permutation from [`CompactPerm`] for the same key.
+pub type CompactPerm4 = CompactPermR<4>;
+
+/// The compact Feistel network with `R` rounds (`4 ≤ R ≤ 6`): see
+/// [`CompactPerm`] and [`CompactPerm4`]. (Three rounds leave a serial
+/// correlation of about −0.02 between the images of consecutive inputs.)
 #[derive(Clone, Copy, Debug)]
-pub struct CompactPerm {
+pub struct CompactPermR<const R: usize> {
     n: u64,
     a_inv: u64,
     seed: u64,
@@ -276,9 +320,12 @@ pub struct CompactParts {
     b: u32,
 }
 
-impl CompactPerm {
+impl<const R: usize> CompactPermR<R> {
+    const ROUNDS_OK: () = assert!(R >= MIN_ROUNDS as usize && R <= ROUND_TWEAKS.len());
+
     /// A permutation of `[0, n)` keyed by `key`.
     pub fn new(n: u64, key: Key) -> Self {
+        let () = Self::ROUNDS_OK;
         let (a, b, a_inv) = shape(n);
         Self {
             n,
@@ -315,7 +362,7 @@ impl CompactPerm {
     #[inline(always)]
     fn encrypt(&self, m: u64) -> u64 {
         let seed = self.seed;
-        encrypt(m, self.a as u64, self.b as u64, self.a_inv, 6, |j| {
+        encrypt(m, self.a as u64, self.b as u64, self.a_inv, R, |j| {
             seed ^ ROUND_TWEAKS[j]
         })
     }
@@ -323,13 +370,13 @@ impl CompactPerm {
     #[inline(always)]
     fn decrypt(&self, y: u64) -> u64 {
         let seed = self.seed;
-        decrypt(y, self.a as u64, self.b as u64, self.a_inv, 6, |j| {
+        decrypt(y, self.a as u64, self.b as u64, self.a_inv, R, |j| {
             seed ^ ROUND_TWEAKS[j]
         })
     }
 }
 
-impl Bijection for CompactPerm {
+impl<const R: usize> Bijection for CompactPermR<R> {
     #[inline]
     fn len(&self) -> u64 {
         self.n
@@ -735,6 +782,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<CompactPerm>(), 32);
         for n in 0..=2000u64 {
             assert_bijection(&CompactPerm::new(n, Key::from_seed(n)));
+            assert_bijection(&CompactPerm4::new(n, Key::from_seed(n)));
         }
     }
 
@@ -835,6 +883,69 @@ mod tests {
     }
     const GOLDEN_COMPACT: [u64; 5] = [849_834, 497_048, 627_643, 688_343, 59_700];
 
+    /// Four rounds: near-uniform from a few hundred elements on (on a
+    /// handful, four rounds over a 3 × 2 grid are visibly biased, ~9%), and
+    /// no linear trace of the input order in the output (correlation of x
+    /// and π(x), and of π(x) and π(x + 1), within a few standard errors of 0).
+    #[test]
+    fn compact4_is_uniform_and_decorrelates() {
+        uniform_and_decorrelated(|n, k| CompactPerm4::new(n, k));
+    }
+
+
+    fn uniform_and_decorrelated<P: Bijection>(make: impl Fn(u64, Key) -> P) {
+        const N: usize = 256;
+        let mut counts = vec![[0u32; N]; N];
+        for s in 0..40_000 {
+            let p = make(N as u64, Key::from_seed(1000 + s));
+            for (x, row) in counts.iter_mut().enumerate() {
+                row[p.fwd(x as u64) as usize] += 1;
+            }
+        }
+        // Each count: mean 156.25, sd 12.5; every one of 65,536 within 5.5 sd.
+        for row in &counts {
+            for &c in row {
+                assert!((87..226).contains(&c), "{c}");
+            }
+        }
+        for seed in 0..8 {
+            let n = 1_000_003u64;
+            let p = make(n, Key::from_seed(seed));
+            let m = (n as f64 - 1.0) / 2.0;
+            let (mut xy, mut yy, mut xx) = (0.0f64, 0.0f64, 0.0f64);
+            for x in 0..n - 1 {
+                let (a, b) = (p.fwd(x) as f64 - m, p.fwd(x + 1) as f64 - m);
+                xy += (x as f64 - m) * a;
+                yy += a * b;
+                xx += a * a;
+            }
+            // Standard error of a correlation over n pairs: 1/√n ≈ 0.001.
+            assert!((xy / xx).abs() < 0.005, "{seed}: order kept {}", xy / xx);
+            assert!((yy / xx).abs() < 0.005, "{seed}: serial {}", yy / xx);
+        }
+    }
+
+
+    #[test]
+    fn rem_by_inverse_is_exact() {
+        for n in [1u64, 2, 3, 7, 1000, 999_983, 1 << 31, (1 << 40) + 13, u64::MAX / 3, u64::MAX] {
+            let inv = u64::MAX / n;
+            for x in [0u64, 1, n - 1, n, n.wrapping_add(1), 12_345_678_901, u64::MAX - 1, u64::MAX] {
+                assert_eq!(rem_by_inverse(x, n, inv), x % n, "{x} mod {n}");
+                assert_eq!(divmod_by_inverse(x, n, inv), (x / n, x % n), "{x} / {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact4_golden_values() {
+        let p = CompactPerm4::new(1_000_000, Key::from_seed(2026));
+        let got: Vec<u64> = [0u64, 1, 2, 999_999, 123_456].iter().map(|&x| p.fwd(x)).collect();
+        assert_eq!(got, [886_829, 880_353, 25_121, 216_212, 495_995], "CompactPerm4 output changed: {got:?}");
+        let q = CompactPerm4::from_parts(1_000_000, p.parts());
+        assert!((0..1000).all(|x| q.inv(q.fwd(x)) == x && q.fwd(x) == p.fwd(x)));
+    }
+
     #[test]
     fn growable_is_a_bijection_on_each_prefix() {
         let g = GrowablePerm::new(500, Key::from_seed(4));
@@ -901,5 +1012,454 @@ mod tests {
             let first = SMALL_PERMS[3].iter().find(|p| total(p) == min).unwrap();
             assert_eq!(&got[..], *first);
         }
+    }
+}
+
+/// A bijection of `0..n` that spreads items within neighbourhoods of about
+/// `block`: a keyed [`CompactPerm`] inside each block of `block` items,
+/// then inside blocks staggered by half a block (`key(level, block start)`
+/// keys each). Forward applies level 0 then 1; inverse undoes them.
+pub fn staggered_blocks(n: u64, block: u64, k: u64, inverse: bool, key: impl Fn(u64, u64) -> Key) -> u64 {
+    let block = block.max(1);
+    let level = |k: u64, lvl: u64| -> u64 {
+        let off = if lvl == 0 { 0 } else { (block / 2).min(n) };
+        let (start, len) = if k < off {
+            (0, off)
+        } else {
+            let s = off + (k - off) / block * block;
+            (s, block.min(n - s))
+        };
+        let perm = CompactPerm::new(len, key(lvl, start));
+        start + if inverse { perm.inv(k - start) } else { perm.fwd(k - start) }
+    };
+    if inverse { level(level(k, 1), 0) } else { level(level(k, 0), 1) }
+}
+
+
+/// A Feistel domain shape `a × b` with `a`'s division inverse: what
+/// [`CompactPerm::new`] derives from the size (a square root and a
+/// division). Precompute it for a size used often.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermShape {
+    a_inv: u64,
+    a: u32,
+    b: u32,
+}
+
+impl PermShape {
+    /// The shape of `[0, n)`.
+    pub fn of(n: u64) -> Self {
+        let (a, b, a_inv) = shape(n);
+        PermShape { a_inv, a: a as u32, b: b as u32 }
+    }
+}
+
+impl CompactPerm {
+    /// [`CompactPerm::new`] with the shape of `n` given (`PermShape::of(n)`):
+    /// the same permutation.
+    #[inline]
+    pub fn shaped(n: u64, s: PermShape, key: Key) -> Self {
+        Self { n, a_inv: s.a_inv, seed: key.bits(), a: s.a, b: s.b }
+    }
+}
+
+/// [`staggered_blocks`] over a fixed `n` and block, with the full blocks'
+/// shape precomputed: the same bijection, without a shape per call.
+#[derive(Clone, Copy, Debug)]
+pub struct StaggeredBlocks {
+    n: u64,
+    block: u64,
+    full: PermShape,
+}
+
+impl StaggeredBlocks {
+    pub fn new(n: u64, block: u64) -> Self {
+        let block = block.max(1);
+        StaggeredBlocks { n, block, full: PermShape::of(block) }
+    }
+
+    /// As `staggered_blocks(n, block, k, inverse, key)`.
+    #[inline]
+    pub fn map(&self, k: u64, inverse: bool, key: impl Fn(u64, u64) -> Key) -> u64 {
+        let (n, block) = (self.n, self.block);
+        let level = |k: u64, lvl: u64| -> u64 {
+            let off = if lvl == 0 { 0 } else { (block / 2).min(n) };
+            let (start, len) = if k < off {
+                (0, off)
+            } else {
+                let s = off + (k - off) / block * block;
+                (s, block.min(n - s))
+            };
+            let perm = if len == block { CompactPerm::shaped(len, self.full, key(lvl, start)) } else { CompactPerm::new(len, key(lvl, start)) };
+            start + if inverse { perm.inv(k - start) } else { perm.fwd(k - start) }
+        };
+        if inverse { level(level(k, 1), 0) } else { level(level(k, 0), 1) }
+    }
+}
+
+#[cfg(test)]
+mod staggered_tests {
+    use super::*;
+
+    #[test]
+    fn staggered_blocks_are_bijections_with_inverse() {
+        for (n, block) in [(1u64, 1u64), (7, 3), (100, 10), (1000, 33), (257, 256), (50, 80), (15, 54), (3, 1000)] {
+            let key = |l: u64, s: u64| Key::from_seed(5).with2(l, s);
+            let mut seen = vec![false; n as usize];
+            for k in 0..n {
+                let f = staggered_blocks(n, block, k, false, key);
+                assert!(f < n && !seen[f as usize], "{n} {block}");
+                seen[f as usize] = true;
+                assert_eq!(staggered_blocks(n, block, f, true, key), k);
+                // Items move at most about one and a half blocks.
+                assert!(f.abs_diff(k) < block + block / 2 + 1, "{n} {block}: {k} -> {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn precomputed_shapes_give_the_same_bijection() {
+        for (n, block) in [(1u64, 1u64), (7, 3), (100, 10), (1000, 33), (257, 256), (50, 80), (15, 54), (3, 1000), (5000, 77)] {
+            let key = |l: u64, s: u64| Key::from_seed(5).with2(l, s);
+            let sb = StaggeredBlocks::new(n, block);
+            for k in 0..n {
+                assert_eq!(sb.map(k, false, key), staggered_blocks(n, block, k, false, key));
+                assert_eq!(sb.map(k, true, key), staggered_blocks(n, block, k, true, key));
+            }
+        }
+        for n in [1u64, 2, 3, 10, 99, 1 << 20, (1 << 33) + 7] {
+            let k = Key::from_seed(n);
+            let (a, b) = (CompactPerm::new(n, k), CompactPerm::shaped(n, PermShape::of(n), k));
+            for x in [0, n / 3, n - 1] {
+                assert_eq!(a.fwd(x), b.fwd(x));
+                assert_eq!(a.inv(x), b.inv(x));
+            }
+        }
+    }
+
+    #[test]
+    fn golden() {
+        let key = |l: u64, s: u64| Key::from_seed(9).with2(l, s);
+        let v: Vec<u64> = (0..10).map(|k| staggered_blocks(10, 4, k, false, key)).collect();
+        assert_eq!(v, GOLDEN);
+    }
+    const GOLDEN: [u64; 10] = [0, 2, 1, 3, 5, 4, 7, 8, 6, 9];
+}
+
+/// A lattice permutation of `[0, n)`: `r ↦ (a·r + b) mod n`, with `a`
+/// coprime to `n` and near `n/φ` (the golden ratio), so the points
+/// `(r, π(r))` form a rank-1 lattice whose 2-D discrepancy is
+/// `O(log n / n)`. Unlike a Feistel network, its graph is a lattice, so the
+/// number of `r` in an interval whose image lies in an interval is two
+/// floor sums ([`AffinePerm::count`], O(log n)). A world can use one inside
+/// a class to decorrelate two orders and still count their joint prefixes
+/// (`thinking/claude/005`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffinePerm {
+    n: u64,
+    a: u64,
+    b: u64,
+    a_inv: u64,
+}
+
+impl AffinePerm {
+    /// The permutation of `[0, n)` with the golden multiplier for `n` and an
+    /// offset from `key`.
+    pub fn new(n: u64, key: Key) -> Self {
+        let (a, a_inv) = golden_pair(n);
+        let b = if n == 0 { 0 } else { key.below(n) };
+        Self { n, a, b, a_inv }
+    }
+
+    /// The permutation with stored parts: multiplier `a`, its inverse
+    /// `a_inv` mod `n` and offset `b` (as [`Self::from_pair`] would derive
+    /// them): no Euclid and no key hash.
+    #[inline]
+    pub fn from_raw(n: u64, a: u64, a_inv: u64, b: u64) -> Self {
+        Self { n, a, b, a_inv }
+    }
+
+    /// [`AffinePerm::new`] from its stored [`golden_pair`]: no Euclid.
+    #[inline]
+    pub fn from_pair(n: u64, pair: (u64, u64), key: Key) -> Self {
+        let b = if n == 0 { 0 } else { key.below(n) };
+        Self { n, a: pair.0, b, a_inv: pair.1 }
+    }
+
+    /// The permutation `r ↦ (a·r + b) mod n` for a given `a` coprime to
+    /// `n` (`b < n`).
+    pub fn with_parts(n: u64, a: u64, b: u64) -> Self {
+        assert!(n > 0 && b < n && gcd(a % n, n) == 1, "a coprime multiplier and an offset below n");
+        Self { n, a: a % n, b, a_inv: mod_inverse(a % n, n) }
+    }
+
+    /// `inv(v)` for `v` in `[lo, hi)`, in order: one addition and a
+    /// conditional subtraction each (`inv(v + 1) = inv(v) + a⁻¹ mod n`).
+    #[inline]
+    pub fn inv_range(&self, lo: u64, hi: u64) -> impl Iterator<Item = u64> + '_ {
+        let mut r = if lo < hi { self.inv(lo) } else { 0 };
+        let (n, step) = (self.n, self.a_inv);
+        (lo..hi).map(move |_| {
+            let out = r;
+            r += step;
+            if r >= n {
+                r -= n;
+            }
+            out
+        })
+    }
+
+    /// `a⁻¹ mod n`.
+    pub fn inverse_multiplier(&self) -> u64 {
+        self.a_inv
+    }
+
+    /// The multiplier `a` and offset `b`.
+    pub fn parts(&self) -> (u64, u64) {
+        (self.a, self.b)
+    }
+
+    /// Of the `r` in `[lo, hi)`, how many map below `d`.
+    pub fn count_below(&self, lo: u64, hi: u64, d: u64) -> u64 {
+        if hi <= lo || d == 0 {
+            return 0;
+        }
+        let (n, len) = (self.n, hi - lo);
+        if d >= n {
+            return len;
+        }
+        // [v mod n < d] = 1 − (⌊(v + n − d)/n⌋ − ⌊v/n⌋), with v = a·r + b;
+        // shifting b by multiples of n leaves the difference unchanged.
+        let b = ((self.a as u128 * lo as u128 + self.b as u128) % n as u128) as u64;
+        let over = crate::lattice::floor_sum(len, n, self.a, b + n - d) - crate::lattice::floor_sum(len, n, self.a, b);
+        len - over as u64
+    }
+
+    /// Of the `r` in `[lo, hi)`, how many map into `[c, d)`.
+    pub fn count(&self, lo: u64, hi: u64, c: u64, d: u64) -> u64 {
+        if d <= c {
+            return 0;
+        }
+        self.count_below(lo, hi, d) - self.count_below(lo, hi, c)
+    }
+
+    /// The `j`-th (from 0) `r` at or after `lo` whose image lies in
+    /// `[c, d)`, if there is one below `n`.
+    pub fn select(&self, lo: u64, c: u64, d: u64, j: u64) -> Option<u64> {
+        if self.count(lo, self.n, c, d) <= j {
+            return None;
+        }
+        // The least `hi` with `count(lo, hi) > j`, by bisection.
+        let (mut a, mut b) = (lo, self.n);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if self.count(lo, mid + 1, c, d) > j {
+                b = mid;
+            } else {
+                a = mid + 1;
+            }
+        }
+        Some(a)
+    }
+}
+
+impl Bijection for AffinePerm {
+    fn len(&self) -> u64 {
+        self.n
+    }
+
+    #[inline]
+    fn fwd(&self, r: u64) -> u64 {
+        assert!(r < self.n, "{r} outside [0, {})", self.n);
+        // a·r + b in 64 bits when it fits (one division), else 128.
+        match self.a.checked_mul(r).and_then(|p| p.checked_add(self.b)) {
+            Some(p) => p % self.n,
+            None => ((self.a as u128 * r as u128 + self.b as u128) % self.n as u128) as u64,
+        }
+    }
+
+    #[inline]
+    fn inv(&self, v: u64) -> u64 {
+        assert!(v < self.n, "{v} outside [0, {})", self.n);
+        let d = if v >= self.b { v - self.b } else { v + self.n - self.b };
+        match self.a_inv.checked_mul(d) {
+            Some(p) => p % self.n,
+            None => ((self.a_inv as u128 * d as u128) % self.n as u128) as u64,
+        }
+    }
+}
+
+/// [`golden_multiplier`] and its inverse mod `n`, from one extended Euclid
+/// per candidate. Store it to build [`AffinePerm::from_pair`] without one.
+pub fn golden_pair(n: u64) -> (u64, u64) {
+    if n <= 2 {
+        return (1, if n <= 1 { 0 } else { 1 });
+    }
+    let g = 0.618_033_988_749_894_9_f64;
+    let c = ((n as f64 * g).round() as u64).clamp(1, n - 1);
+    for d in 0..n {
+        for a in [c.saturating_sub(d), c + d] {
+            if a >= 1 && a < n {
+                if let Some(inv) = inverse_mod(a, n) {
+                    return (a, inv);
+                }
+            }
+        }
+    }
+    (1, 1)
+}
+
+/// `a⁻¹ mod n`, or `None` when `a` and `n` share a factor: extended Euclid
+/// with a subtraction for quotient 1.
+fn inverse_mod(a: u64, n: u64) -> Option<u64> {
+    // |t| stays below n, so 64-bit signed arithmetic is exact for n < 2⁶³.
+    let (mut r0, mut r1) = (n as i64, a as i64);
+    let (mut t0, mut t1) = (0i64, 1i64);
+    while r1 != 0 {
+        let q = if r0 - r1 < r1 { 1 } else { r0 / r1 };
+        (r0, r1) = (r1, r0 - q * r1);
+        (t0, t1) = (t1, t0 - q * t1);
+    }
+    (r0 == 1).then(|| t0.rem_euclid(n as i64) as u64)
+}
+
+/// The multiplier of [`AffinePerm`] for `n`: the integer nearest
+/// `n·(φ − 1)` that is coprime to `n`, searching outwards (1 for `n ≤ 2`).
+pub fn golden_multiplier(n: u64) -> u64 {
+    if n <= 2 {
+        return 1;
+    }
+    let g = 0.618_033_988_749_894_9_f64;
+    let c = ((n as f64 * g).round() as u64).clamp(1, n - 1);
+    for d in 0..n {
+        for a in [c.saturating_sub(d), c + d] {
+            if a >= 1 && a < n && gcd(a, n) == 1 {
+                return a;
+            }
+        }
+    }
+    1
+}
+
+/// Euclid with a subtraction for quotient 1 (the common case near `n/φ`,
+/// which is Euclid's worst case for steps, not for quotients).
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = if a >= b && a - b < b { a - b } else { a % b };
+        (a, b) = (b, r);
+    }
+    a
+}
+
+/// `a⁻¹ mod n` for `a` coprime to `n` (0 when `n ≤ 1`).
+fn mod_inverse(a: u64, n: u64) -> u64 {
+    if n <= 1 {
+        return 0;
+    }
+    let (mut r0, mut r1) = (n as i64, a as i64);
+    let (mut t0, mut t1) = (0i128, 1i128);
+    while r1 != 0 {
+        let q = if r0 - r1 < r1 { 1 } else { r0 / r1 };
+        (r0, r1) = (r1, r0 - q * r1);
+        (t0, t1) = (t1, t0 - q as i128 * t1);
+    }
+    debug_assert_eq!(r0, 1, "a coprime multiplier");
+    t0.rem_euclid(n as i128) as u64
+}
+
+#[cfg(test)]
+mod affine_tests {
+    use super::*;
+
+    #[test]
+    fn affine_is_a_bijection_with_its_inverse() {
+        for n in [1u64, 2, 3, 7, 10, 64, 97, 1000, 4096] {
+            let p = AffinePerm::new(n, Key::from_seed(n));
+            let mut seen = vec![false; n as usize];
+            for r in 0..n {
+                let v = p.fwd(r);
+                assert!(!seen[v as usize]);
+                seen[v as usize] = true;
+                assert_eq!(p.inv(v), r);
+            }
+        }
+    }
+
+    #[test]
+    fn counts_and_selects_match_brute_force() {
+        for n in [1u64, 5, 13, 100, 257, 1000] {
+            let p = AffinePerm::new(n, Key::from_seed(7 * n + 1));
+            let step = (n / 9).max(1);
+            for lo in (0..=n).step_by(step as usize) {
+                for hi in (lo..=n).step_by(step as usize) {
+                    for c in (0..=n).step_by(step as usize) {
+                        for d in (c..=n).step_by(step as usize) {
+                            let brute = (lo..hi).filter(|&r| (c..d).contains(&p.fwd(r))).count() as u64;
+                            assert_eq!(p.count(lo, hi, c, d), brute, "n {n} [{lo},{hi}) → [{c},{d})");
+                        }
+                    }
+                }
+            }
+            for (c, d) in [(0, n), (n / 3, n), (0, n / 2), (n / 4, 3 * n / 4)] {
+                let hits: Vec<u64> = (0..n).filter(|&r| (c..d).contains(&p.fwd(r))).collect();
+                for (j, &r) in hits.iter().enumerate() {
+                    assert_eq!(p.select(0, c, d, j as u64), Some(r));
+                }
+                assert_eq!(p.select(0, c, d, hits.len() as u64), None);
+            }
+        }
+    }
+
+    #[test]
+    fn from_pair_equals_new() {
+        for n in [1u64, 2, 3, 97, 1000, 1 << 33] {
+            let k = Key::from_seed(n);
+            assert_eq!(AffinePerm::from_pair(n, golden_pair(n), k), AffinePerm::new(n, k));
+        }
+    }
+
+    #[test]
+    fn inv_range_steps_exactly() {
+        for n in [1u64, 2, 7, 100, 1000, 65_537] {
+            let p = AffinePerm::new(n, Key::from_seed(n + 3));
+            for (lo, hi) in [(0, n), (n / 3, n), (n / 2, n / 2)] {
+                let v: Vec<u64> = p.inv_range(lo, hi).collect();
+                let w: Vec<u64> = (lo..hi).map(|x| p.inv(x)).collect();
+                assert_eq!(v, w);
+            }
+        }
+    }
+
+    #[test]
+    fn counts_match_hand_vectors() {
+        // Tursi's vectors (`thinking/tursi/002`): `#{r < R : (a r + b) mod n
+        // ≥ thr}` against brute force, over `R` past `n` too.
+        for (a, b, n, thr, r, at_least) in [(3u64, 1u64, 17u64, 5u64, 20u64, 13u64), (7, 2, 31, 10, 40, 27), (5, 0, 16, 8, 16, 8)] {
+            let p = AffinePerm::with_parts(n, a, b);
+            let brute = (0..r).filter(|&x| (a * x + b) % n >= thr).count() as u64;
+            assert_eq!(brute, at_least);
+            assert_eq!(r - p.count_below(0, r, thr), at_least);
+            assert_eq!(p.count_below(0, r, thr), r - at_least);
+        }
+    }
+
+    #[test]
+    fn large_domains_count_exactly() {
+        // Against brute force over a window of a large domain.
+        let n = (1u64 << 40) + 15;
+        let p = AffinePerm::new(n, Key::from_seed(3));
+        let (lo, hi) = (n / 3, n / 3 + 20_000);
+        let (c, d) = (n / 5, n / 5 + n / 7);
+        let brute = (lo..hi).filter(|&r| (c..d).contains(&p.fwd(r))).count() as u64;
+        assert_eq!(p.count(lo, hi, c, d), brute);
+    }
+
+    #[test]
+    fn golden() {
+        let p = AffinePerm::new(1_000_003, Key::from_seed(42));
+        assert_eq!(p.parts(), (golden_multiplier(1_000_003), p.parts().1));
+        assert_eq!(golden_multiplier(1_000_003), 618_036);
+        let v: Vec<u64> = (0..4).map(|r| p.fwd(r)).collect();
+        assert_eq!(v, vec![p.parts().1, (p.parts().1 + 618_036) % 1_000_003, (p.parts().1 + 2 * 618_036) % 1_000_003, (p.parts().1 + 3 * 618_036) % 1_000_003]);
     }
 }

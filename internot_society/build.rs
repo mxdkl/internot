@@ -35,6 +35,14 @@ fn main() {
         }
     }
     files.sort();
+    // A directory's timestamp changes only when entries come or go, so
+    // every file is watched too (an edited pack must re-embed).
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        if let Some(d) = f.parent() {
+            println!("cargo:rerun-if-changed={}", d.display());
+        }
+    }
     let mut code = String::from("&[\n");
     for f in &files {
         let rel = f.strip_prefix(&worlds).unwrap();

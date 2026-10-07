@@ -67,6 +67,22 @@ pub fn positive_mass(dens: &[f64]) -> f64 {
     dens.iter().map(|d| d.max(0.0)).sum()
 }
 
+/// The quantile at `q ∈ [0, 1)` of a density uniform within each band
+/// `bands[k] = (lo, hi)`, band `k` carrying share `share(k)` (shares summing
+/// to 1): the band where the cumulative share passes `q`, then linear
+/// within it. `default` when the shares run out first.
+pub fn band_quantile(bands: &[(f64, f64)], share: impl Fn(usize) -> f64, q: f64, default: f64) -> f64 {
+    let mut acc = 0.0;
+    for (k, &(lo, hi)) in bands.iter().enumerate() {
+        let w = share(k);
+        if q < acc + w {
+            return lo + (hi - lo) * (q - acc) / w;
+        }
+        acc += w;
+    }
+    default
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,4 +137,29 @@ mod tests {
         4582742530556696104,
         4589765843249920888,
     ];
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    #[test]
+    fn band_quantiles_are_monotone_and_land_in_bands() {
+        let bands = [(1.0, 4.0), (4.0, 8.0), (8.0, 13.0)];
+        let w = [0.2, 0.5, 0.3];
+        let mut last = 0.0;
+        for i in 0..1000 {
+            let q = i as f64 / 1000.0;
+            let x = band_quantile(&bands, |k| w[k], q, 40.0);
+            assert!((1.0..13.0).contains(&x) && x >= last, "{q}");
+            last = x;
+        }
+    }
+
+    #[test]
+    fn golden() {
+        let bands = [(1.0, 4.0), (4.0, 8.0)];
+        assert_eq!(band_quantile(&bands, |k| [0.25, 0.75][k], 0.5, 40.0), 4.0 + 4.0 * (0.25 / 0.75));
+        assert_eq!(band_quantile(&bands, |k| [0.25, 0.5][k], 0.9, 40.0), 40.0);
+    }
 }

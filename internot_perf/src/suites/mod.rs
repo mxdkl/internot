@@ -4,8 +4,8 @@
 use crate::harness::Harness;
 
 mod core_hash;
-mod kinship;
 mod primitives;
+mod society;
 
 /// A named group of benchmarks.
 pub struct Suite {
@@ -19,7 +19,7 @@ pub struct Suite {
 }
 
 /// Every suite, in the order `perf-gate` runs them.
-pub const ALL: &[Suite] = &[core_hash::SUITE, primitives::SUITE, kinship::SUITE];
+pub const ALL: &[Suite] = &[core_hash::SUITE, primitives::SUITE, society::SUITE];
 
 /// The suite with this name.
 pub fn find(name: &str) -> Option<&'static Suite> {

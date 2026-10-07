@@ -7,41 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
-ordered-float = { workspace = true }
-serde = { workspace = true }
 xxhash-rust = { workspace = true }
-quine-mccluskey = "1.0"
 # Pinned exactly: world facts must be bit-identical across machines and
 # versions. See docs/superpowers/research/2026-09-29-deterministic-numerics.md.
 libm = { version = "=0.2.16", default-features = false }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 proptest = "1.4"
-criterion = "0.5"
-insta = "1.38"
-
-[[example]]
-name = "graph_demo"
-path = "examples/graph_demo.rs"
-
-[[example]]
-name = "profile_harness"
-path = "examples/profile_harness.rs"
-
-[[bench]]
-name = "primitives"
-harness = false
-
-[[bench]]
-name = "search"
-harness = false
-
-[[bench]]
-name = "scale"
-harness = false
-
-[[bench]]
-name = "local_access"
-harness = false
-

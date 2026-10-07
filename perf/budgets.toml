@@ -30,11 +30,6 @@ mode = "warm"
 p99_ns = 100
 max_allocs = 0
 
-[budget."core_hash/lognormal"]
-mode = "warm"
-p99_ns = 400
-max_allocs = 0
-
 # --- primitives (Phase 0, spec §4) ----------------------------------------
 # Set 2026-09-30 at about 2x the p99 measured on the reference machine
 # (Ryzen 9 5900HX, powersave governor): tight enough that a real regression
@@ -148,82 +143,74 @@ mode = "warm"
 p99_ns = 600
 max_allocs = 0
 
-# --- kinship (R1 prototype, spec §6 and §16.2) -----------------------------
-# The R1 world (internot_society) keeps no memo caches: every query is a
-# pure lookup over structure built with the ledger, so "warm" here is also
-# the spec's "cold" case and the cold targets apply. Inputs: uniform ids
-# over the 1840-2100 prototype world (11.1M ever born, 152 MB) plus the most
-# prolific 1900 mothers and their partners.
-# Lookups are timed one call per sample (a batch repeats one input and runs
-# from cache), with the CPU settled to 65 °C first (perf/README.md).
-# Measured 2026-09-30 (performance governor), after the locality work and
-# the founder's death decision (fathers alive at conception): p99 death
-# 0.45-0.87 µs (bimodal across rounds), mother 1.1-1.2 µs, father 3.1 µs,
-# union 3.0-3.3 µs, children 3.6-3.95 µs, siblings 2.8-3.35 µs.
-# Earlier notes below record how each budget was set.
-
-[budget."kinship/birth"]
+# --- society (the monotone world, internot_society::mono) --------------------
+# The `us` pack at its own scale (about 14M born by 2023); memory and lookups
+# don't grow with scale (measured to 14 trillion, AGENTS.md). Inputs are
+# uniform over everyone born by 2023, timed one call per sample. Provisional
+# budgets (2026-10-03): about 2-3x the p99 measured by mono_report.
+[budget."society/birth"]
 mode = "warm"
-p99_ns = 25
+p99_ns = 1000
+
+[budget."society/death"]
+mode = "warm"
+p99_ns = 1500
 max_allocs = 0
 
-[budget."kinship/death"]
+[budget."society/mother"]
 mode = "warm"
 p99_ns = 1000
 max_allocs = 0
 
-# 2 µs approved by the founder on 2026-09-30, tighter than the §16.2 one-hop
-# target of 5 µs. The earlier 700 ns came from batched runs that timed
-# repeated inputs from cache. Single-call p99 (performance governor, thermal
-# settle) is 1.3-1.4 µs: about 15 dependent DRAM loads at ~95 ns.
-[budget."kinship/mother"]
-mode = "warm"
-p99_ns = 2000
-max_allocs = 0
-
-# Re-applied 2026-09-30 after a design change: R1b-2 immigrants doubled
-# the world (11.3M ever born, 61 MB of structure) and added entry cohorts.
-# The same rule (about 2x measured p99, capped at the §16.2 one-hop target
-# of 5 µs) gives the cap: father measured 3.4 µs, children 3.9 µs.
-[budget."kinship/father"]
-mode = "warm"
-p99_ns = 5000
-max_allocs = 0
-
-# Raises to union, father, children and world_build approved by the founder
-# on 2026-09-30.
-# Re-applied 2026-09-30 after two more design changes: arrival cells for
-# immigrant couples and same-sex union cells tripled the union cells (35k ->
-# 98k, mostly tiny), and the world's structure grew to ~85 MB. Measured p99
-# alternates 2.9 / 4.5 µs between runs under the powersave governor; the
-# rule (about 2x measured, capped at the §16.2 one-hop target) gives the
-# 5 µs cap. Next lever: tiny cells without a stored permutation (see
-# AGENTS.md, Phase 1).
-[budget."kinship/union"]
-mode = "warm"
-p99_ns = 5000
-max_allocs = 0
-
-[budget."kinship/children"]
-mode = "warm"
-p99_ns = 5000
-max_allocs = 0
-
-[budget."kinship/siblings"]
+[budget."society/father"]
 mode = "warm"
 p99_ns = 4000
 max_allocs = 0
 
-# World::build(Params::prototype()) end to end: ledger (two regions, local
-# and national markets, immigrants with families) plus lookup structure.
-# Measured 0.50 s before immigrants; re-derived 2026-09-30 after the R1b-2
-# design change (arrival cohorts, arrival cells and plans): 0.90 s, budget
-# ~2.2x. The spec's full-scale target is < 30 s and < 100 MB (§16.2); this
-# prototype budget guards the per-region cost.
-# R1c (2026-09-30): second unions took it to 4.28 s; the build work brought
-# it to 1.45 s on 16 threads (rayon; 3.44 s on one thread, 1.64 s on four).
-# The committed 1.04 s baseline predates R1c; it is re-recorded once the
-# stage B lookup regressions are fixed (AGENTS.md, R1c).
-[budget."kinship/world_build"]
+[budget."society/spouse"]
 mode = "warm"
-p99_ns = 2_000_000_000
+p99_ns = 2000
+max_allocs = 0
+
+[budget."society/children"]
+mode = "warm"
+p99_ns = 8000
+
+[budget."society/siblings"]
+mode = "warm"
+p99_ns = 10000
+
+# A full name at 2023 (first, middle, surname: the surname walks the father's
+# line to a founder). Warm: every input's year tables built first.
+[budget."society/full_name"]
+mode = "warm"
+p99_ns = 100_000
+
+# Work (2026-10-04): a whole career; the spell in force at a date (the
+# career walk, then a search); a job's employer with its name and place
+# (one home lookup at the job's start, memoized per unit).
+[budget."society/career"]
+mode = "warm"
+p99_ns = 150_000
+
+[budget."society/work_at"]
+mode = "warm"
+p99_ns = 150_000
+
+[budget."society/employer"]
+mode = "warm"
+p99_ns = 1_500_000
+
+# Everyone alive at a date, exact (16 threads): closed form plus the
+# infant band checked one by one; and the instant bounds.
+[budget."society/count_alive"]
+mode = "warm"
+p99_ns = 5_000_000
+
+[budget."society/alive_bounds"]
+mode = "warm"
+p99_ns = 5_000_000
+
+[budget."society/world_build"]
+mode = "warm"
+p99_ns = 500_000_000

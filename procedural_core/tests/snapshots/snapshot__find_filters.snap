@@ -1,8 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-expression: snapshot
----
-where_eq(a, 3) + filter(b_even) + scan_budget(20):
-yielded count = 8, sorted = [3, 35, 67, 99, 131, 163, 195, 227]
-evaluated = 16
-termination = Exhaustive

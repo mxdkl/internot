@@ -446,6 +446,41 @@ pub fn rake_columns(
     b
 }
 
+/// [`rake_columns`] over dense inputs (`q` row-major, `rows × cols`), stopping
+/// after the first pass whose column sums are all within `tol` (relative)
+/// of their targets, or after `max_passes`. Each pass is bit-identical to a
+/// [`rake_columns`] pass, so the result equals `rake_columns` run for the
+/// returned number of passes; the stop depends only on the inputs. Returns
+/// `(b, passes)`.
+pub fn rake_columns_dense(row_total: &[f64], q: &[f64], targets: &[f64], max_passes: usize, tol: f64) -> (Vec<f64>, usize) {
+    let cols = targets.len();
+    assert_eq!(q.len(), row_total.len() * cols, "one profile per row");
+    let mut b = vec![1.0; cols];
+    for pass in 1..=max_passes {
+        let mut col = vec![0.0; cols];
+        for (i, &c) in row_total.iter().enumerate() {
+            let qi = &q[i * cols..(i + 1) * cols];
+            let z: f64 = (0..cols).map(|h| qi[h] * b[h]).sum();
+            if z > 0.0 {
+                for (h, col) in col.iter_mut().enumerate() {
+                    *col += c * qi[h] * b[h] / z;
+                }
+            }
+        }
+        let mut worst = 0.0f64;
+        for h in 0..cols {
+            if col[h] > 0.0 && targets[h] > 0.0 {
+                worst = worst.max((targets[h] / col[h] - 1.0).abs());
+                b[h] *= targets[h] / col[h];
+            }
+        }
+        if worst <= tol {
+            return (b, pass);
+        }
+    }
+    (b, max_passes)
+}
+
 /// A raked row's weight in column `h`: `row_total · q(h) · b_h / Σ_g q(g) · b_g`,
 /// or zero if the row has no mass under `b`. `q` is the row's profile.
 #[inline]
@@ -842,4 +877,22 @@ mod tests {
         4596776774931541614,
         4596080829253300131,
     ];
+
+    #[test]
+    fn dense_rake_equals_rake_columns_for_its_passes() {
+        let key = crate::key::Key::from_seed(17);
+        let (rows, cols) = (300, 5);
+        let total: Vec<f64> = (0..rows).map(|i| 1.0 + key.with2(i as u64, 0).below(1000) as f64).collect();
+        let q: Vec<f64> = (0..rows * cols).map(|k| key.with2(k as u64, 1).unit()).collect();
+        let targets = [0.4, 0.3, 0.15, 0.1, 0.05].map(|t| t * total.iter().sum::<f64>());
+        let (b, passes) = rake_columns_dense(&total, &q, &targets, 500, 1e-9);
+        assert!(passes > 1 && passes < 500, "{passes}");
+        let r = rake_columns(rows, cols, |i| total[i], |i, h| q[i * cols + h], &targets, passes);
+        assert_eq!(b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), r.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        // The columns meet their targets.
+        for h in 0..cols {
+            let got: f64 = (0..rows).map(|i| raked_weight(total[i], |g| q[i * cols + g], &b, h)).sum();
+            assert!((got / targets[h] - 1.0).abs() < 1e-8, "{h}: {got} vs {}", targets[h]);
+        }
+    }
 }

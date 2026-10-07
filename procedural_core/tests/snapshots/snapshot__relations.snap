@@ -1,7 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-expression: snapshot
----
-World.related(families, 7, parents) = [9223372036854777600, 9223372036854777601]
-World.related(families, 7, children) count = 2
-World.related(families, 7, children) = [1792, 1793]

@@ -150,9 +150,59 @@ pub fn first_above(lo: i32, hi: i32, f: impl Fn(i32) -> f64, v: f64) -> Option<i
     (lo..=hi).find(|&x| f(x) > v)
 }
 
+/// Where a piecewise-linear nonincreasing function given by `n ≥ 1` knots
+/// (`x(i)` increasing, `y(i)` nonincreasing) first falls to `v`: the
+/// inverse of a survival curve, so a uniform `v` draws from it. Between
+/// knots `x` is linear in `y`; at or above `y(0)` it is `x(0)`, at or below
+/// `y(n − 1)` it is `x(n − 1)`. Flat stretches return their first `x`.
+#[inline]
+pub fn inverse_decreasing(n: usize, x: impl Fn(usize) -> f64, y: impl Fn(usize) -> f64, v: f64) -> f64 {
+    assert!(n >= 1, "at least one knot");
+    if v >= y(0) {
+        return x(0);
+    }
+    for i in 1..n {
+        let (y0, y1) = (y(i - 1), y(i));
+        if v >= y1 {
+            // y0 > v ≥ y1, so y0 > y1.
+            return lerp(x(i - 1), x(i), (y0 - v) / (y0 - y1));
+        }
+    }
+    x(n - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_decreasing_inverts_survival() {
+        let xs = [50.0, 60.0, 65.0, 70.0, 90.0];
+        let ys = [1.0, 0.8, 0.8, 0.3, 0.0];
+        let inv = |v: f64| inverse_decreasing(5, |i| xs[i], |i| ys[i], v);
+        assert_eq!(inv(1.0), 50.0);
+        assert_eq!(inv(1.5), 50.0);
+        assert_eq!(inv(0.9), 55.0);
+        // A flat stretch returns its first x.
+        assert_eq!(inv(0.8), 60.0);
+        assert_eq!(inv(0.55), 67.5);
+        assert_eq!(inv(0.0), 90.0);
+        assert_eq!(inv(-1.0), 90.0);
+        // Round trip with the forward function, and monotone in v.
+        let mut last = f64::INFINITY;
+        for k in 0..=1000 {
+            let v = k as f64 / 1000.0;
+            let a = inv(v);
+            assert!(a <= last + 1e-12, "nonincreasing in v");
+            last = a;
+            if !(0.8..=0.8).contains(&v) && v > 0.0 && v < 1.0 {
+                assert!((piecewise_linear(5, |i| xs[i], |i| ys[i], a) - v).abs() < 1e-12);
+            }
+        }
+        assert_eq!(inv(0.37).to_bits(), GOLDEN_INVERSE);
+    }
+
+    const GOLDEN_INVERSE: u64 = 4634576970908382003;
 
     const XS: [f64; 4] = [1900.0, 1950.0, 1960.0, 2000.0];
     const YS: [f64; 4] = [1.0, 3.0, 2.0, 2.5];

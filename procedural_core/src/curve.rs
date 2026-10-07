@@ -104,6 +104,45 @@ pub fn piecewise_power(x: f64, flat: f64, segments: &[(f64, f64)], beyond: f64) 
     value * pow(x / start, beyond)
 }
 
+/// An algebraic sigmoid, `½ + ½·z/(1 + |z|)`: no exponential, and a
+/// closed-form inverse ([`algebraic_sigmoid_inv`]).
+#[inline]
+pub fn algebraic_sigmoid(z: f64) -> f64 {
+    0.5 + 0.5 * z / (1.0 + z.abs())
+}
+
+/// The inverse of [`algebraic_sigmoid`] on `(0, 1)`.
+#[inline]
+pub fn algebraic_sigmoid_inv(v: f64) -> f64 {
+    let w = 2.0 * v - 1.0;
+    w / (1.0 - w.abs())
+}
+
+/// The quantile of the log-logistic CDF ([`log_logistic_cdf`]) at
+/// `q ∈ (0, 1)`: `origin + (median − origin)·(q/(1 − q))^(1/shape)`.
+#[inline]
+pub fn log_logistic_quantile(q: f64, origin: f64, median: f64, shape: f64) -> f64 {
+    origin + (median - origin) * pow(q / (1.0 - q), 1.0 / shape)
+}
+
+/// The CDF on `[lo, hi]` of an [`algebraic_sigmoid`] centred at `mu` with
+/// scale `s`, truncated to that range.
+#[inline]
+pub fn truncated_sigmoid_cdf(x: f64, mu: f64, s: f64, lo: f64, hi: f64) -> f64 {
+    let g = |x: f64| algebraic_sigmoid((x - mu) / s);
+    let (a, b) = (g(lo), g(hi));
+    ((g(x) - a) / (b - a)).clamp(0.0, 1.0)
+}
+
+/// The inverse of [`truncated_sigmoid_cdf`] at `f ∈ [0, 1]`.
+#[inline]
+pub fn truncated_sigmoid_inv(f: f64, mu: f64, s: f64, lo: f64, hi: f64) -> f64 {
+    let g = |x: f64| algebraic_sigmoid((x - mu) / s);
+    let (a, b) = (g(lo), g(hi));
+    let v = (a + f * (b - a)).clamp(1e-12, 1.0 - 1e-12);
+    mu + s * algebraic_sigmoid_inv(v)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -203,4 +242,50 @@ mod tests {
         4605074088703779486,
         4601909268418673106,
     ];
+}
+
+#[cfg(test)]
+mod sigmoid_tests {
+    use super::*;
+
+    #[test]
+    fn inverse_round_trips_and_is_monotone() {
+        let mut last = 0.0;
+        for i in -400..=400 {
+            let z = i as f64 / 20.0;
+            let v = algebraic_sigmoid(z);
+            assert!(v > 0.0 && v < 1.0 && v > last);
+            assert!((algebraic_sigmoid_inv(v) - z).abs() < 1e-9 * (1.0 + z.abs() * z.abs()), "{z}");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!((algebraic_sigmoid(0.0), algebraic_sigmoid(1.0), algebraic_sigmoid(-3.0)), (0.5, 0.75, 0.125));
+        assert_eq!(algebraic_sigmoid_inv(0.75), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod quantile_tests {
+    use super::*;
+
+    #[test]
+    fn quantiles_invert_their_cdfs() {
+        for i in 1..200 {
+            let q = i as f64 / 200.0;
+            let x = log_logistic_quantile(q, 15.0, 23.0, 6.0);
+            assert!((log_logistic_cdf(x, 15.0, 23.0, 6.0) - q).abs() < 1e-9, "{q}");
+            let a = truncated_sigmoid_inv(q, 27.0, 3.5, 15.0, 46.0);
+            assert!((15.0..=46.0).contains(&a) && (truncated_sigmoid_cdf(a, 27.0, 3.5, 15.0, 46.0) - q).abs() < 1e-9, "{q}");
+        }
+        assert_eq!((truncated_sigmoid_cdf(15.0, 27.0, 3.5, 15.0, 46.0), truncated_sigmoid_cdf(46.0, 27.0, 3.5, 15.0, 46.0)), (0.0, 1.0));
+    }
+
+    #[test]
+    fn golden() {
+        assert_eq!(log_logistic_quantile(0.5, 15.0, 23.0, 6.0), 23.0);
+        assert_eq!(format!("{:.9}", truncated_sigmoid_cdf(27.0, 27.0, 3.5, 15.0, 46.0)), "0.478299380");
+    }
 }

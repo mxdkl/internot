@@ -1,8 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-assertion_line: 532
-expression: summary
----
-candidates(0x35, simple, euclidean) + budget(20) + take(5):
-hits = [(6164691116303888918, -2.2361), (15295271895527098147, -2.2361), (5714541171656070178, -3.1623), (15174081190928617478, -3.1623), (3353513245750086147, -3.6056)]
-evaluated = 20, total_considered = 20, budget = 20

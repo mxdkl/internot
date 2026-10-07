@@ -55,10 +55,9 @@ says `no baseline`.
    times to last about 2 µs, so clock-read overhead stays near 1%. **Calls
    of 250 ns or more (mean) are timed one per sample.** A batch repeats one
    input, so its later calls run from cache and hide the DRAM misses that
-   dominate a lookup. On the kinship suite, batching made p99 flip by ±40%
-   depending on whether calibration picked a batch of 1 or 2. A suite can
-   force single calls with `.batch(1)`; `kinship` does for every lookup but
-   `birth`.
+   dominate a lookup. On the old kinship suite, batching made p99 flip by
+   ±40% depending on whether calibration picked a batch of 1 or 2. A suite
+   can force single calls with `.batch(1)`; `society` does for every lookup.
 3. Sampling: 100,000 samples (10,000 with `--quick`), one input each, visited
    in a fixed shuffled order. Allocations are counted in the same region.
 4. Summary: the samples are split, in time order, into up to 10 rounds.
@@ -200,13 +199,14 @@ full runs stayed within +9% of the baseline.
 Separate gate runs of a DRAM-bound lookup still vary by about ±10%, so the gate cannot see a 5% change. To compare two versions of a source file, run them alternately with `perf/ab.sh`. Alternating cancels drift in temperature and background load:
 
 ```sh
-cp internot_society/src/world.rs /tmp/world_before.rs   # before the change
-# ... edit world.rs ...
-perf/ab.sh internot_society lookup_timing internot_society/src/world.rs /tmp/world_before.rs 3
+cp internot_society/src/mono.rs .scratch/mono_before.rs   # before the change
+# ... edit mono.rs ...
+perf/ab.sh internot_society mono_report internot_society/src/mono.rs .scratch/mono_before.rs 3
 ```
 
 - **What it does:** it builds the example with the current file (B) and with the saved one (A), and restores the file afterwards. It then prints A and B alternately, cooling the CPU to 60 °C before each run.
-- **Checksums:** `lookup_timing` prints `p50/p90/p99` per kinship query and a checksum of every answer. A change that should not alter any answer must print the same checksum for A and B.
+- **Checksums:** `mono_report` prints `p50/p99/mean` per lookup and a checksum of every answer. A change that should not alter any answer must print the same checksum for A and B.
+- **Two saved binaries:** `perf/society_ab.py BASE NEW ROUNDS` runs two built `mono_report` binaries alternately (×1, then ×1000 with `BOUNDS_ONLY`) and prints medians, changes and checksum agreement for every metric.
 - **Reading the output:** trust a difference only when it holds in every pair. If one run is an outlier on every query, that run was disturbed; rerun it.
 
 ## The 10% rule

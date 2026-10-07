@@ -1,5 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-expression: summary
----
-where_eq(a, 3) + at_any(1d) + filter_exists_in_range(b>7) + scan_budget(20): yielded count = 8, sorted = [131, 147, 163, 179, 195, 211, 227, 243], evaluated = 16, termination = Exhaustive

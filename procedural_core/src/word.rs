@@ -467,10 +467,10 @@ mod tests {
             .insert_bits(4, 28, 0x0FFF_FFFF)
             .insert_bits(32, 4, 0x7)
             .insert_bits(36, 28, 0x089A_BCDE);
-        assert_eq!(layout_id.extract_bits(0, 4), 0xF);
-        assert_eq!(layout_id.extract_bits(4, 28), 0x0FFF_FFFF);
-        assert_eq!(layout_id.extract_bits(32, 4), 0x7);
-        assert_eq!(layout_id.extract_bits(36, 28), 0x089A_BCDE);
+        assert_eq!(BitWord::extract_bits(layout_id, 0, 4), 0xF);
+        assert_eq!(BitWord::extract_bits(layout_id, 4, 28), 0x0FFF_FFFF);
+        assert_eq!(BitWord::extract_bits(layout_id, 32, 4), 0x7);
+        assert_eq!(BitWord::extract_bits(layout_id, 36, 28), 0x089A_BCDE);
     }
 
     #[test]
@@ -480,54 +480,54 @@ mod tests {
             .insert_bits(8, 56, 0x00FF_FFFF_FFFF_FFFF)
             .insert_bits(64, 8, 0xCD)
             .insert_bits(72, 56, 0x00AA_BBCC_DDEE_FF11);
-        assert_eq!(id.extract_bits(0, 8), 0xAB);
-        assert_eq!(id.extract_bits(8, 56), 0x00FF_FFFF_FFFF_FFFF);
-        assert_eq!(id.extract_bits(64, 8), 0xCD);
-        assert_eq!(id.extract_bits(72, 56), 0x00AA_BBCC_DDEE_FF11);
+        assert_eq!(BitWord::extract_bits(id, 0, 8), 0xAB);
+        assert_eq!(BitWord::extract_bits(id, 8, 56), 0x00FF_FFFF_FFFF_FFFF);
+        assert_eq!(BitWord::extract_bits(id, 64, 8), 0xCD);
+        assert_eq!(BitWord::extract_bits(id, 72, 56), 0x00AA_BBCC_DDEE_FF11);
     }
 
     #[test]
     fn insert_preserves_other_bits() {
         // Set bits 0..4, then overwrite bits 4..8 — bits 0..4 must survive.
         let id = 0u64.insert_bits(0, 4, 0xF).insert_bits(4, 4, 0xA);
-        assert_eq!(id.extract_bits(0, 4), 0xF);
-        assert_eq!(id.extract_bits(4, 4), 0xA);
+        assert_eq!(BitWord::extract_bits(id, 0, 4), 0xF);
+        assert_eq!(BitWord::extract_bits(id, 4, 4), 0xA);
     }
 
     #[test]
     fn insert_masks_oversized_value() {
         // Passing 0xFF to a 4-bit field should keep only low 4 bits (0xF).
         let id = 0u64.insert_bits(0, 4, 0xFF);
-        assert_eq!(id.extract_bits(0, 4), 0xF);
+        assert_eq!(BitWord::extract_bits(id, 0, 4), 0xF);
     }
 
     #[test]
     fn u128_can_hold_64_bit_field() {
         let id = 0u128.insert_bits(0, 64, u64::MAX);
-        assert_eq!(id.extract_bits(0, 64), u64::MAX);
+        assert_eq!(BitWord::extract_bits(id, 0, 64), u64::MAX);
     }
 
     #[test]
     #[should_panic(expected = "offset + width")]
     fn u64_extract_past_end_panics() {
-        0u64.extract_bits(60, 8);
+        BitWord::extract_bits(0u64, 60, 8);
     }
 
     #[test]
     #[should_panic(expected = "offset + width")]
     fn u128_extract_past_end_panics() {
-        0u128.extract_bits(120, 16);
+        BitWord::extract_bits(0u128, 120, 16);
     }
 
     #[test]
     #[should_panic(expected = "width > 64")]
     fn extract_width_over_64_panics() {
-        0u128.extract_bits(0, 65);
+        BitWord::extract_bits(0u128, 0, 65);
     }
 
     #[test]
     fn u64_zero_width_extract_returns_zero() {
-        assert_eq!(0xDEAD_BEEFu64.extract_bits(0, 0), 0);
+        assert_eq!(BitWord::extract_bits(0xDEAD_BEEFu64, 0, 0), 0);
     }
 
     #[test]
@@ -565,28 +565,28 @@ mod tests {
         let id = U256::default()
             .insert_bits(0, 8, 0xAB)
             .insert_bits(8, 56, 0x00FF_FFFF_FFFF_FFFF);
-        assert_eq!(id.extract_bits(0, 8), 0xAB);
-        assert_eq!(id.extract_bits(8, 56), 0x00FF_FFFF_FFFF_FFFF);
+        assert_eq!(BitWord::extract_bits(id, 0, 8), 0xAB);
+        assert_eq!(BitWord::extract_bits(id, 8, 56), 0x00FF_FFFF_FFFF_FFFF);
     }
 
     #[test]
     fn u256_extract_insert_round_trip_across_limbs() {
         // Field straddles bit 64 (limb boundary).
         let id = U256::default().insert_bits(60, 16, 0x1234);
-        assert_eq!(id.extract_bits(60, 16), 0x1234);
+        assert_eq!(BitWord::extract_bits(id, 60, 16), 0x1234);
     }
 
     #[test]
     fn u256_extract_insert_round_trip_high_limb() {
         let id = U256::default().insert_bits(192, 64, u64::MAX);
-        assert_eq!(id.extract_bits(192, 64), u64::MAX);
+        assert_eq!(BitWord::extract_bits(id, 192, 64), u64::MAX);
     }
 
     #[test]
     fn u256_can_hold_64_bit_field_at_each_limb() {
         for limb in 0..4u32 {
             let id = U256::default().insert_bits(limb * 64, 64, u64::MAX);
-            assert_eq!(id.extract_bits(limb * 64, 64), u64::MAX);
+            assert_eq!(BitWord::extract_bits(id, limb * 64, 64), u64::MAX);
         }
     }
 
@@ -596,9 +596,9 @@ mod tests {
             .insert_bits(0, 4, 0xF)
             .insert_bits(4, 4, 0xA)
             .insert_bits(192, 8, 0xCD);
-        assert_eq!(id.extract_bits(0, 4), 0xF);
-        assert_eq!(id.extract_bits(4, 4), 0xA);
-        assert_eq!(id.extract_bits(192, 8), 0xCD);
+        assert_eq!(BitWord::extract_bits(id, 0, 4), 0xF);
+        assert_eq!(BitWord::extract_bits(id, 4, 4), 0xA);
+        assert_eq!(BitWord::extract_bits(id, 192, 8), 0xCD);
     }
 
     #[test]
@@ -618,8 +618,8 @@ mod tests {
         let a = U256::from_hash_u64(1);
         let b = U256::from_hash_u64(2);
         assert_ne!(a, b);
-        assert_eq!(a.extract_bits(0, 64), 1);
-        assert_eq!(b.extract_bits(0, 64), 2);
+        assert_eq!(BitWord::extract_bits(a, 0, 64), 1);
+        assert_eq!(BitWord::extract_bits(b, 0, 64), 2);
         // Upper limbs should be non-zero for any non-trivial hash input.
         assert_ne!(a.limbs()[1], 0);
         assert_ne!(a.limbs()[2], 0);
@@ -661,23 +661,23 @@ mod tests {
             .insert_bits(0, 16, 0xABCD)
             .insert_bits(64, 16, 0x1234)
             .insert_bits(448, 16, 0x5678);
-        assert_eq!(id.extract_bits(0, 16), 0xABCD);
-        assert_eq!(id.extract_bits(64, 16), 0x1234);
-        assert_eq!(id.extract_bits(448, 16), 0x5678);
+        assert_eq!(BitWord::extract_bits(id, 0, 16), 0xABCD);
+        assert_eq!(BitWord::extract_bits(id, 64, 16), 0x1234);
+        assert_eq!(BitWord::extract_bits(id, 448, 16), 0x5678);
     }
 
     #[test]
     fn u512_extract_crossing_limb_boundary() {
         let id = U512::default().insert_bits(60, 16, 0x1234);
-        assert_eq!(id.extract_bits(60, 16), 0x1234);
+        assert_eq!(BitWord::extract_bits(id, 60, 16), 0x1234);
     }
 
     #[test]
     fn u512_insert_full_64_bit_limb() {
         let id = U512::default().insert_bits(192, 64, u64::MAX);
-        assert_eq!(id.extract_bits(192, 64), u64::MAX);
-        assert_eq!(id.extract_bits(0, 64), 0);
-        assert_eq!(id.extract_bits(256, 64), 0);
+        assert_eq!(BitWord::extract_bits(id, 192, 64), u64::MAX);
+        assert_eq!(BitWord::extract_bits(id, 0, 64), 0);
+        assert_eq!(BitWord::extract_bits(id, 256, 64), 0);
     }
 
     #[test]

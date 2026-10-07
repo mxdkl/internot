@@ -1,7 +1,0 @@
----
-source: procedural_core/tests/snapshot.rs
-assertion_line: 219
-expression: snapshot
----
-World.attribute_value(a, 42, linked_value) = 0.18777827754365184
-World.global(zeitgeist, 2026-04-21T12:00:00Z) = 0.7903361668044113

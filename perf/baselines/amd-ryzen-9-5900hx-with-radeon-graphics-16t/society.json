@@ -1,0 +1,782 @@
+{
+  "suite": "society",
+  "run": {
+    "machine": {
+      "cpu_model": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "logical_cores": 16,
+      "governor": "performance",
+      "slug": "amd-ryzen-9-5900hx-with-radeon-graphics-16t"
+    },
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "build_profile": "release",
+    "git_commit": "3341d9727eec-dirty",
+    "timestamp": "2026-10-04T05:24:01Z",
+    "quick": false,
+    "hw_counters_available": true,
+    "hw_counters_note": null,
+    "alloc_counting": true
+  },
+  "benchmarks": [
+    {
+      "name": "society/birth",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 98.36450463999994,
+        "p50_ns": 100.031,
+        "p90_ns": 111.039,
+        "p99_ns": 190.079,
+        "p999_ns": 261.119,
+        "max_ns": 4931.583,
+        "throughput_per_sec": 10166268.85541545,
+        "round_p99_ns": [
+          191.103,
+          191.103,
+          191.103,
+          190.079,
+          190.079,
+          181.119,
+          181.119,
+          180.095,
+          170.111,
+          141.055
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 4930.0,
+          "input": "Pid { cell: 0, y: 2018, i: 17030 }"
+        },
+        {
+          "ns": 3416.0,
+          "input": "Pid { cell: 1, y: 1994, i: 17886 }"
+        },
+        {
+          "ns": 2605.0,
+          "input": "Pid { cell: 1, y: 1923, i: 9830 }"
+        },
+        {
+          "ns": 2505.0,
+          "input": "Pid { cell: 1, y: 1966, i: 14508 }"
+        },
+        {
+          "ns": 591.0,
+          "input": "Pid { cell: 4, y: 1904, i: 295 }"
+        },
+        {
+          "ns": 572.0,
+          "input": "Pid { cell: 1, y: 1982, i: 17031 }"
+        },
+        {
+          "ns": 571.0,
+          "input": "Pid { cell: 0, y: 2010, i: 18200 }"
+        },
+        {
+          "ns": 541.0,
+          "input": "Pid { cell: 1, y: 2023, i: 13697 }"
+        },
+        {
+          "ns": 531.0,
+          "input": "Pid { cell: 0, y: 1920, i: 51195 }"
+        },
+        {
+          "ns": 501.0,
+          "input": "Pid { cell: 0, y: 1915, i: 23174 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 341.2636,
+        "instructions": 468.1368,
+        "ipc": 1.3717747805508704,
+        "cache_references": 26.1735,
+        "cache_misses": 7.1366,
+        "branch_misses": 0.7038,
+        "note": null
+      }
+    },
+    {
+      "name": "society/death",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 90.40054591999998,
+        "p50_ns": 81.023,
+        "p90_ns": 120.063,
+        "p99_ns": 170.111,
+        "p999_ns": 240.127,
+        "max_ns": 5152.767,
+        "throughput_per_sec": 11061880.10064619,
+        "round_p99_ns": [
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111,
+          170.111
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 5149.0,
+          "input": "Pid { cell: 0, y: 1885, i: 30553 }"
+        },
+        {
+          "ns": 3697.0,
+          "input": "Pid { cell: 0, y: 1958, i: 34204 }"
+        },
+        {
+          "ns": 3286.0,
+          "input": "Pid { cell: 0, y: 1923, i: 5894 }"
+        },
+        {
+          "ns": 1803.0,
+          "input": "Pid { cell: 0, y: 1937, i: 34776 }"
+        },
+        {
+          "ns": 531.0,
+          "input": "Pid { cell: 1, y: 2019, i: 116 }"
+        },
+        {
+          "ns": 461.0,
+          "input": "Pid { cell: 4, y: 1994, i: 3786 }"
+        },
+        {
+          "ns": 441.0,
+          "input": "Pid { cell: 1, y: 1974, i: 11433 }"
+        },
+        {
+          "ns": 440.0,
+          "input": "Pid { cell: 0, y: 1968, i: 53568 }"
+        },
+        {
+          "ns": 390.0,
+          "input": "Pid { cell: 0, y: 1773, i: 867 }"
+        },
+        {
+          "ns": 370.0,
+          "input": "Pid { cell: 0, y: 1878, i: 3442 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 245.0013,
+        "instructions": 370.0017,
+        "ipc": 1.5102030070860848,
+        "cache_references": 11.7778,
+        "cache_misses": 4.6655,
+        "branch_misses": 1.1306,
+        "note": null
+      }
+    },
+    {
+      "name": "society/mother",
+      "mode": "warm",
+      "attempts": 2,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 95.93575903999998,
+        "p50_ns": 100.031,
+        "p90_ns": 110.015,
+        "p99_ns": 160.127,
+        "p999_ns": 220.031,
+        "max_ns": 2705.407,
+        "throughput_per_sec": 10423641.924624316,
+        "round_p99_ns": [
+          180.095,
+          180.095,
+          170.111,
+          160.127,
+          160.127,
+          140.031,
+          140.031,
+          131.007,
+          131.007,
+          131.007
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 2705.0,
+          "input": "Pid { cell: 1, y: 2003, i: 9093 }"
+        },
+        {
+          "ns": 2444.0,
+          "input": "Pid { cell: 0, y: 1956, i: 7526 }"
+        },
+        {
+          "ns": 1794.0,
+          "input": "Pid { cell: 0, y: 1984, i: 14604 }"
+        },
+        {
+          "ns": 501.0,
+          "input": "Pid { cell: 1, y: 1885, i: 2439 }"
+        },
+        {
+          "ns": 500.0,
+          "input": "Pid { cell: 1, y: 1954, i: 20630 }"
+        },
+        {
+          "ns": 481.0,
+          "input": "Pid { cell: 0, y: 2020, i: 51582 }"
+        },
+        {
+          "ns": 481.0,
+          "input": "Pid { cell: 0, y: 1901, i: 2602 }"
+        },
+        {
+          "ns": 461.0,
+          "input": "Pid { cell: 0, y: 1961, i: 17404 }"
+        },
+        {
+          "ns": 441.0,
+          "input": "Pid { cell: 1, y: 1989, i: 10198 }"
+        },
+        {
+          "ns": 441.0,
+          "input": "Pid { cell: 0, y: 1889, i: 21313 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 500.5196,
+        "instructions": 450.5234,
+        "ipc": 0.9001114042287255,
+        "cache_references": 15.6461,
+        "cache_misses": 5.9648,
+        "branch_misses": 0.7088,
+        "note": null
+      }
+    },
+    {
+      "name": "society/father",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 296.20043623999976,
+        "p50_ns": 300.031,
+        "p90_ns": 361.215,
+        "p99_ns": 461.055,
+        "p999_ns": 661.503,
+        "max_ns": 5042.175,
+        "throughput_per_sec": 3376092.259329891,
+        "round_p99_ns": [
+          461.055,
+          471.039,
+          461.055,
+          461.055,
+          461.055,
+          451.071,
+          461.055,
+          461.055,
+          601.087,
+          802.303
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 5039.0,
+          "input": "Pid { cell: 0, y: 1863, i: 1874 }"
+        },
+        {
+          "ns": 4879.0,
+          "input": "Pid { cell: 0, y: 2016, i: 32768 }"
+        },
+        {
+          "ns": 3677.0,
+          "input": "Pid { cell: 0, y: 1934, i: 19293 }"
+        },
+        {
+          "ns": 3637.0,
+          "input": "Pid { cell: 0, y: 1850, i: 14025 }"
+        },
+        {
+          "ns": 3527.0,
+          "input": "Pid { cell: 0, y: 2008, i: 8348 }"
+        },
+        {
+          "ns": 3226.0,
+          "input": "Pid { cell: 0, y: 1983, i: 8714 }"
+        },
+        {
+          "ns": 3036.0,
+          "input": "Pid { cell: 0, y: 1955, i: 21953 }"
+        },
+        {
+          "ns": 2354.0,
+          "input": "Pid { cell: 4, y: 1916, i: 204 }"
+        },
+        {
+          "ns": 2194.0,
+          "input": "Pid { cell: 0, y: 2015, i: 39163 }"
+        },
+        {
+          "ns": 2013.0,
+          "input": "Pid { cell: 0, y: 1978, i: 5511 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 1739.1028,
+        "instructions": 1898.0123,
+        "ipc": 1.0913744144394455,
+        "cache_references": 83.77,
+        "cache_misses": 30.9262,
+        "branch_misses": 4.5142,
+        "note": null
+      }
+    },
+    {
+      "name": "society/spouse",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 180.7180668000001,
+        "p50_ns": 200.063,
+        "p90_ns": 250.111,
+        "p99_ns": 301.055,
+        "p999_ns": 391.167,
+        "max_ns": 3737.599,
+        "throughput_per_sec": 5533481.060898553,
+        "round_p99_ns": [
+          301.055,
+          301.055,
+          301.055,
+          301.055,
+          301.055,
+          310.015,
+          310.015,
+          310.015,
+          301.055,
+          310.015
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 3737.0,
+          "input": "Pid { cell: 0, y: 1924, i: 43425 }"
+        },
+        {
+          "ns": 2856.0,
+          "input": "Pid { cell: 0, y: 1952, i: 8242 }"
+        },
+        {
+          "ns": 2294.0,
+          "input": "Pid { cell: 0, y: 1921, i: 48127 }"
+        },
+        {
+          "ns": 2194.0,
+          "input": "Pid { cell: 1, y: 1968, i: 3734 }"
+        },
+        {
+          "ns": 2054.0,
+          "input": "Pid { cell: 0, y: 1987, i: 56132 }"
+        },
+        {
+          "ns": 1984.0,
+          "input": "Pid { cell: 0, y: 1982, i: 40245 }"
+        },
+        {
+          "ns": 1062.0,
+          "input": "Pid { cell: 1, y: 1953, i: 11244 }"
+        },
+        {
+          "ns": 621.0,
+          "input": "Pid { cell: 0, y: 1967, i: 20742 }"
+        },
+        {
+          "ns": 591.0,
+          "input": "Pid { cell: 1, y: 1982, i: 27313 }"
+        },
+        {
+          "ns": 581.0,
+          "input": "Pid { cell: 1, y: 1969, i: 14140 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 0,
+        "mean_per_call": 0.0,
+        "mean_bytes_per_call": 0.0
+      },
+      "counters": {
+        "cycles": 701.9391,
+        "instructions": 1132.9054,
+        "ipc": 1.6139653710699404,
+        "cache_references": 36.3825,
+        "cache_misses": 16.0578,
+        "branch_misses": 3.6043,
+        "note": null
+      }
+    },
+    {
+      "name": "society/children",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 531.6810383200003,
+        "p50_ns": 541.183,
+        "p90_ns": 832.511,
+        "p99_ns": 1202.175,
+        "p999_ns": 1943.551,
+        "max_ns": 15294.463,
+        "throughput_per_sec": 1880826.9017074383,
+        "round_p99_ns": [
+          1192.959,
+          1192.959,
+          1202.175,
+          1213.439,
+          1202.175,
+          1212.415,
+          1192.959,
+          1172.479,
+          1192.959,
+          1282.047
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 15288.0,
+          "input": "Pid { cell: 0, y: 1963, i: 64466 }"
+        },
+        {
+          "ns": 8256.0,
+          "input": "Pid { cell: 2, y: 1889, i: 606 }"
+        },
+        {
+          "ns": 4919.0,
+          "input": "Pid { cell: 0, y: 1964, i: 35686 }"
+        },
+        {
+          "ns": 4488.0,
+          "input": "Pid { cell: 1, y: 1850, i: 3132 }"
+        },
+        {
+          "ns": 3948.0,
+          "input": "Pid { cell: 1, y: 1992, i: 8313 }"
+        },
+        {
+          "ns": 3717.0,
+          "input": "Pid { cell: 4, y: 1849, i: 184 }"
+        },
+        {
+          "ns": 3597.0,
+          "input": "Pid { cell: 4, y: 1825, i: 53 }"
+        },
+        {
+          "ns": 3457.0,
+          "input": "Pid { cell: 2, y: 1826, i: 341 }"
+        },
+        {
+          "ns": 3436.0,
+          "input": "Pid { cell: 4, y: 1818, i: 43 }"
+        },
+        {
+          "ns": 3377.0,
+          "input": "Pid { cell: 2, y: 1818, i: 292 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 4,
+        "mean_per_call": 0.83562,
+        "mean_bytes_per_call": 63.77792
+      },
+      "counters": {
+        "cycles": 3108.1082,
+        "instructions": 5169.4363,
+        "ipc": 1.663209890826838,
+        "cache_references": 280.2951,
+        "cache_misses": 138.2239,
+        "branch_misses": 8.1745,
+        "note": null
+      }
+    },
+    {
+      "name": "society/siblings",
+      "mode": "warm",
+      "attempts": 2,
+      "batch": 1,
+      "calls": 100000,
+      "distinct_inputs": 100000,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 100000,
+        "rounds": 10,
+        "mean_ns": 580.0270744799996,
+        "p50_ns": 571.391,
+        "p90_ns": 751.103,
+        "p99_ns": 1022.463,
+        "p999_ns": 1502.207,
+        "max_ns": 4571.135,
+        "throughput_per_sec": 1724057.4517948332,
+        "round_p99_ns": [
+          1082.367,
+          1022.463,
+          1022.463,
+          1042.431,
+          1022.463,
+          992.255,
+          982.015,
+          972.287,
+          972.287,
+          952.319
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 4569.0,
+          "input": "Pid { cell: 1, y: 1900, i: 11564 }"
+        },
+        {
+          "ns": 4348.0,
+          "input": "Pid { cell: 1, y: 1863, i: 1468 }"
+        },
+        {
+          "ns": 4127.0,
+          "input": "Pid { cell: 0, y: 1954, i: 34712 }"
+        },
+        {
+          "ns": 4077.0,
+          "input": "Pid { cell: 4, y: 1990, i: 1524 }"
+        },
+        {
+          "ns": 3987.0,
+          "input": "Pid { cell: 1, y: 1868, i: 6596 }"
+        },
+        {
+          "ns": 3908.0,
+          "input": "Pid { cell: 1, y: 1948, i: 10866 }"
+        },
+        {
+          "ns": 3858.0,
+          "input": "Pid { cell: 0, y: 1861, i: 8375 }"
+        },
+        {
+          "ns": 3556.0,
+          "input": "Pid { cell: 0, y: 1956, i: 9445 }"
+        },
+        {
+          "ns": 3386.0,
+          "input": "Pid { cell: 1, y: 1926, i: 254 }"
+        },
+        {
+          "ns": 3236.0,
+          "input": "Pid { cell: 0, y: 1916, i: 13389 }"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 4,
+        "mean_per_call": 1.41785,
+        "mean_bytes_per_call": 129.33504
+      },
+      "counters": {
+        "cycles": 2507.5111,
+        "instructions": 5909.7682,
+        "ipc": 2.356826336681022,
+        "cache_references": 328.4803,
+        "cache_misses": 165.8176,
+        "branch_misses": 10.3802,
+        "note": null
+      }
+    },
+    {
+      "name": "society/count_alive",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 30,
+      "distinct_inputs": 3,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 30,
+        "rounds": 1,
+        "mean_ns": 147460.3690666667,
+        "p50_ns": 147455.999,
+        "p90_ns": 155975.679,
+        "p99_ns": 162791.423,
+        "p999_ns": 162791.423,
+        "max_ns": 162791.423,
+        "throughput_per_sec": 6781.4830949453335,
+        "round_p99_ns": [
+          162791.423
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 162785.0,
+          "input": "7061990400"
+        },
+        {
+          "ns": 159900.0,
+          "input": "7037193600"
+        },
+        {
+          "ns": 149310.0,
+          "input": "4733510400"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 13,
+        "mean_per_call": 11.7,
+        "mean_bytes_per_call": 120362.66666666667
+      },
+      "counters": {
+        "cycles": 78672.33333333333,
+        "instructions": 92832.33333333333,
+        "ipc": 1.1799870348322368,
+        "cache_references": 6622.666666666667,
+        "cache_misses": 1287.6666666666667,
+        "branch_misses": 269.3333333333333,
+        "note": null
+      }
+    },
+    {
+      "name": "society/alive_bounds",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 30,
+      "distinct_inputs": 3,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 30,
+        "rounds": 1,
+        "mean_ns": 104962.45760000001,
+        "p50_ns": 111607.807,
+        "p90_ns": 118423.551,
+        "p99_ns": 119209.983,
+        "p999_ns": 119209.983,
+        "max_ns": 119209.983,
+        "throughput_per_sec": 9527.215948114384,
+        "round_p99_ns": [
+          119209.983
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 119174.0,
+          "input": "7061990400"
+        },
+        {
+          "ns": 118763.0,
+          "input": "7037193600"
+        },
+        {
+          "ns": 90761.0,
+          "input": "4733510400"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 5,
+        "mean_per_call": 4.033333333333333,
+        "mean_bytes_per_call": 30010.666666666668
+      },
+      "counters": {
+        "cycles": 17190.666666666668,
+        "instructions": 33317.0,
+        "ipc": 1.9380865585976887,
+        "cache_references": 1517.3333333333333,
+        "cache_misses": 475.6666666666667,
+        "branch_misses": 46.0,
+        "note": null
+      }
+    },
+    {
+      "name": "society/world_build",
+      "mode": "warm",
+      "attempts": 3,
+      "batch": 1,
+      "calls": 5,
+      "distinct_inputs": 1,
+      "hit_time_limit": false,
+      "latency": {
+        "samples": 5,
+        "rounds": 1,
+        "mean_ns": 42932895.744,
+        "p50_ns": 43016781.823,
+        "p90_ns": 43486543.871,
+        "p99_ns": 43486543.871,
+        "p999_ns": 43486543.871,
+        "max_ns": 43486543.871,
+        "throughput_per_sec": 23.29216286650669,
+        "round_p99_ns": [
+          43486543.871
+        ]
+      },
+      "slowest": [
+        {
+          "ns": 43466598.0,
+          "input": "42"
+        }
+      ],
+      "allocs": {
+        "max_per_call": 11110,
+        "mean_per_call": 11109.2,
+        "mean_bytes_per_call": 70297892.0
+      },
+      "counters": {
+        "cycles": 63467318.0,
+        "instructions": 151140553.0,
+        "ipc": 2.381391836976631,
+        "cache_references": 3499874.0,
+        "cache_misses": 596349.0,
+        "branch_misses": 63925.0,
+        "note": null
+      }
+    }
+  ]
+}

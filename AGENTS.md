@@ -22,10 +22,23 @@ A procedural-world substrate for AI-agent training and evaluation. The thesis: a
 
 > **Current state: read "Current phase" below before anything else.** The git history was re-initialized on 2026-09-29. Mail, calendar, chat, files, tasks and money were removed for quality problems; sections below that mention them describe removed code unless marked otherwise. Since 2026-10-01 the MCP tools are the `directory` service on the society world (`internot_society`) plus `_get_trace`; the old `people` service was cut over and deleted.
 
+## Where files go (founder, 2026-10-01)
+
+**Nothing outside this repository.** No files in `~`, `/tmp` or caches elsewhere, and no global installs: no `cargo install`, `pip install` or shell-profile edits. Use these git-ignored folders instead:
+- `.scratch/` for scratch work, downloads and temporary binaries;
+- `.tools/` for tools. It holds the Lean 4 toolchain (`.tools/elan`), a Lean project with mathlib (`.tools/lean`) and mathlib's download cache. Run Lean with:
+
+  ```sh
+  export ELAN_HOME=$PWD/.tools/elan PATH=$PWD/.tools/elan/bin:$PATH
+  cd .tools/lean && lake env lean <file.lean>
+  ```
+
+Raw datasets stay in `datasets/`, which is also git-ignored.
+
 ## Crates
 
 **Substrate (framework, never edited per-service):**
-- `procedural_core` — bit layouts, hashes, samplers, trajectories, `Space::find()` query builder with bit-pattern pushdown, `SlotLayout` helper.
+- `procedural_core`: deterministic math for procedural worlds: keys and hashes, samplers and laws, exact counts and splits (`partition`, `lattice` floor sums), bijections (`perm`, including `AffinePerm`), life tables (`life`, including `HazardTable`), fits and event streams. The `Space`/`World`/search framework and the old worlds' primitives were removed on 2026-10-03 (archived in `.scratch/archive/2026-10-03-old-core/`, and in git history).
 - *(Removed 2026-10-01, founder: "outright remove them and rebuild something exact that we need when we need": `procedural_overlay` (a session overlay for mutation), `internot_renderer` (an LLM render client and cache), the `mcp_harness/` Python scenario harness, and `internot`'s empty `Services` bag. All are in git history; rebuild what a service needs when it needs it.)*
 
 **World packs (spec `specs/2026-10-01-world-packs.md`):**
@@ -37,15 +50,15 @@ A procedural-world substrate for AI-agent training and evaluation. The thesis: a
   - the value vocabulary (`Series`, `VecSeries`, `Steps`, `Bands`, `Ranges`, `BySex`), evaluated by `procedural_core::interp` (its one dependency inside the workspace).
 - **Every statistic lives in a pack** (`worlds/us/`), never in code. `worlds/README.md` is the guide.
 
-**New layers under construction (spec `specs/2026-09-29-society-as-a-function.md`):**
-- `internot_society` — the R1 kinship prototype: the demographic ledger (`ledger.rs`), schedules (`params.rs`), plan catalogs (`plan.rs`) and the lookups (`world.rs`). Population, unions (including same-sex and couples who arrived together), births, parents, children, siblings and deaths, for natives and immigrants, all as pure functions of `(seed, id, t)`. It depends on `procedural_core`, plus `rayon` for a parallel `World::build`. Status and guarantees are under "Phase 1" below.
-- `internot_perf` — the benchmark and profiling harness (`perf-gate` binary): suites `core_hash`, `primitives` and `kinship`, budgets in `perf/budgets.toml`, per-machine baselines in `perf/baselines/`, and flamegraphs. `perf/check.sh` runs all workspace tests and then the gate.
+**The society world (spec `specs/2026-09-29-society-as-a-function.md`):**
+- `internot_society`: the world pack's typed sections (`params.rs`), the pack's name data (`names.rs`), and the monotone world (`mono.rs`). The monotone world holds people, first unions, separation, births, parents and deaths as pure functions of `(seed, id, t)`, built so that the counts a search asks for are closed form at any population. It depends on `procedural_core`, `internot_def` and `rayon`. Status, guarantees and measurements are under "The society world" below.
+- `internot_perf`: the benchmark and profiling harness (the `perf-gate` binary), with suites `core_hash`, `primitives` and `society`. Budgets are in `perf/budgets.toml`, per-machine baselines in `perf/baselines/`; flamegraphs are generated on demand. `perf/check.sh` runs all workspace tests and then the gate; `perf/society_ab.py` A/B-tests two builds of the society world.
 
 **The world (one crate, services as folders):**
-- `internot/` — every domain service lives here as a sibling folder under `src/`. `Universe` carries the society world (`society`), three procedural worlds (`&'static World<u128>` + `&'static World<U256>` + `&'static World<U512>`, empty since the cutover), the `Mutex<SessionState>` and the injectable `now`. `registry()` concatenates each service's `views()` into the canonical list.
-  - **Service plug-and-play.** `src/services.rs` defines the `Service` trait (methods `name`, `register_u128/u256/u512` (default no-op), `views`). `lib.rs::SERVICES: &[&dyn Service]` is the **single source of truth** — adding a service is one line here. `Universe::build_world_*()` and `crate::registry()` both walk this list; they never name services individually. Each service's `mod.rs` defines its tag struct (`DirectoryService`, …) and impls `Service`.
-  - `src/directory/`: people of the society world through MCP (`read_person`, `read_household`): names, family, unions, households and addresses at any time. Spec `specs/2026-10-01-directory.md`.
-  - `src/society.rs`: the society world (`internot_society::World` plus `Residence`), built once per process from the embedded pack `INTERNOT_PACK` (default `us`) and seed `INTERNOT_SEED` (default 42); `Universe::society` holds it, and tests use `Universe::for_pack("us-tiny", now)`.
+- `internot/` — every domain service lives here as a sibling folder under `src/`. `Universe` carries the society world (`society`), the `Mutex<SessionState>` and the injectable `now`. `registry()` concatenates each service's `views()` into the canonical list.
+  - **Service plug-and-play.** `src/services.rs` defines the `Service` trait (methods `name` and `views`). `lib.rs::SERVICES: &[&dyn Service]` is the **single source of truth** — adding a service is one line here. `crate::registry()` walks this list; it never names services individually. Each service's `mod.rs` defines its tag struct (`DirectoryService`, …) and impls `Service`.
+  - `src/directory/`: people of the society world through MCP (`read_person`): name, sex, heritage, life dates, age, partner, union, parents, children and siblings, home and household, education and work at any time. Spec `specs/2026-10-01-directory.md` (updated 2026-10-04).
+  - `src/society.rs`: the society world (`internot_society::mono::Mono`), built once per process (milliseconds) from the embedded pack `INTERNOT_PACK` (default `us`), seed `INTERNOT_SEED` (default 42) and scale `INTERNOT_SCALE` (default 1). `Universe::society` holds it, and tests use `Universe::for_pack("us-tiny", now)`.
   - *(Removed 2026-10-01: `src/people/`, the old slot-layout people, with its leaked name data. Its individual attributes (personality, education, languages, hobbies, working hours) are in git history, to re-key to the new ids when needed.)*
   - *(Removed; do not restore: `mail/`, `calendar/`, `files/`, `tasks/`, `money/`, `chat/`.)*
   - `src/universe.rs` — Universe + SessionState wiring. SessionState carries one field per mutating service (still explicit; session types differ structurally).
@@ -58,11 +71,11 @@ A procedural-world substrate for AI-agent training and evaluation. The thesis: a
 
 ## Load-bearing invariants (do not violate)
 
-1. **Single procedural floor.** Every service derives from the shared procedural world held by `Universe`. The world is split across three width-specialized containers (`World<u128>`, `World<U256>`, `World<U512>`) for bit-pattern-pushdown performance, but they are one logical floor — services pick the narrowest width that fits their layout. A new service is a lens on this floor, never an independently-seeded World. `internot_sql` was deleted because it built its own world.
+1. **Single procedural floor.** Every service derives from the one society world held by `Universe` (`internot_society::mono`, built once per process). A new service is a lens on this floor, never an independently seeded world. `internot_sql` was deleted because it built its own world.
 2. **Single viewer per scenario.** Agents act as ONE user (the launched viewer). Views must not contain affordances that switch the active viewer. Read views can surface information about *other* people; mutations are always on behalf of the launched viewer.
 3. **`now` is injectable, never a constant.** A frozen calendar overfits training data to one month and dates the simulation. Tests pin a specific `Utc.with_ymd_and_hms(...)`. Procedural generation can derive `now` from the `World` seed for variety while remaining 100% reproducible.
-4. **32-bit person references throughout.** Mail's `mail_id: u32` set the convention. New services follow it. Population can reach 4.3B. Don't truncate to 16 bits to save padding.
-5. **Cross-entity references via reconstruction, not materialization.** When entity A points at B, A stores B's defining bit fields, not the full u128 id. Then a procedural function reconstructs B's id deterministically. Keeps bit layouts narrow, makes references free queries.
+4. **Person references are the society world's external ids** (`u64`, `Mono::id`/`Mono::pid`: `cell·2^(9+b) + (birth year − first year)·2^b + index`, `b = 53 − 9 − cell bits`, below 2⁵³ so JSON carries them exactly). The earlier 32-bit convention (from mail's `mail_id: u32`) capped populations at 4.3B; the society world runs to trillions. Don't truncate ids to save padding.
+5. **Cross-entity references via reconstruction, not materialization.** When entity A points at B, B is found by a pure function of A's facts (a mother from a child's birth-order position, a husband from a wife's interleave position), never stored. References are free queries.
 6. **Stage Manager paradigm** (validated 2026-04-25). Procedural floor → typed AVMs → constrained renderer (LLM is a renderer of structured data, never a source of facts). Cross-service coherence is automatic because every service computes `f(id, key)` from the same primitives.
 7. **Hand-curated lookup tables are tech debt.** Use Faker / geonamescache / procedural generators with a small hand-list for marquee items (e.g., 5-10 global brands at fixed `vendor_idx` slots; the rest procedural). An earlier incident with hand-curated city and name tables is the cautionary tale.
 
@@ -104,14 +117,15 @@ let u = Universe::for_pack("us-tiny", now);   // tests
 ```rust
 use internot::View;
 use internot::directory::views::{ReadPerson, ReadPersonParams};
-let rec = View::execute(&ReadPerson, &u, ReadPersonParams { person_id: 9_000_000, at: None })?;
+let id = u.society.world.id(internot_society::mono::Pid { cell: 0, y: 1960, i: 1_000 });
+let rec = View::execute(&ReadPerson, &u, ReadPersonParams { person_id: id, at: None })?;
 ```
 
 *Untyped (transport-style).* Best for any code that walks the registry generically:
 ```rust
 let reg = internot::registry();
 let view = reg.get("read_person").expect("registered");
-let out: serde_json::Value = view.execute(&u, serde_json::json!({"person_id": 9000000, "at": "1990-01-01"}))?;
+let out: serde_json::Value = view.execute(&u, serde_json::json!({"person_id": id, "at": "1990-01-01"}))?;
 ```
 `view.input_schema()` returns the JSON Schema for the params; `view.read_only()` flags mutating views. This is exactly what `internot_mcp` does.
 
@@ -125,28 +139,26 @@ For any new chained-tool flow, write a Rust integration test in `internot/tests/
 
 ## Adding a new service (the canonical recipe)
 
-The substrate is plug-and-play as of 2026-05-06. To add a new service `foo`:
+To add a new service `foo`:
 
-1. **Create `internot/src/foo/`** with the standard module layout: `mod.rs`, `slot.rs` (or `thread.rs` etc. — whatever your bit-layout file is called), `derive.rs` (hash-derived attrs), `avm.rs` (AVM struct), `views.rs` (read views), `session.rs` (mutating overlay, if any), and a `pub fn views() -> Vec<Arc<dyn DynView>>` exporter.
-2. **In `foo/mod.rs`**, define a tag struct + impl `Service`:
+1. **Create `internot/src/foo/`** with `mod.rs`, `views.rs` (read views over `ctx.society.world`), `avm.rs` (an AVM struct, when a renderer needs one) and `session.rs` (a mutating overlay, if any), and a `pub fn views() -> Vec<Arc<dyn DynView>>` exporter.
+2. **In `foo/mod.rs`**, define a tag struct and implement `Service`:
    ```rust
    pub struct FooService;
    impl Service for FooService {
        fn name(&self) -> &'static str { "foo" }
-       fn register_u128(&self, w: &mut World<u128>) -> Result<(), WorldError> { slot::register(w) }
        fn views(&self) -> Vec<Arc<dyn DynView>> { views::views() }
    }
    ```
-   (Use `register_u256` / `register_u512` instead if your layout exceeds 128 bits. Default impls are no-ops, so only override what you use.)
 3. **Add `&FooService` to `internot::SERVICES`** in `lib.rs`. That's the only edit to crate-level files.
-4. **If `foo` mutates state**, add a field to `SessionState` in `universe.rs` (still explicit because session types differ structurally per service) and initialize in `SessionState::new`.
+4. **If `foo` mutates state**, add a field to `SessionState` in `universe.rs` and initialize it in `SessionState::new`.
 5. **If `foo` needs an LLM renderer or other process-wide infrastructure**, build exactly that when it's needed (the old renderer crate and `Services` bag were removed unused).
 
-Adding the service automatically: registers spaces on the right world, exposes views as MCP tools (`internot_mcp` rebuilds and they appear).
+Adding the service exposes its views as MCP tools automatically (`internot_mcp` rebuilds and they appear).
 
 ## Current phase: rebuild for the coherence pilot (2026-09-29 →)
 
-**What exists.** The `directory` service on the society world plus `_get_trace`: 3 MCP tools (`read_person`, `read_household`, `_get_trace`). The transport still contains zero domain knowledge.
+**What exists.** The `directory` service on the society world (the monotone world, since 2026-10-03) plus `_get_trace`: 2 MCP tools (`read_person`, `_get_trace`). `read_person` serves names, heritage, kin, home and household, education and work (2026-10-04). The transport still contains zero domain knowledge.
 
 **Direction (set by the user, 2026-09-29).**
 - Internot is free/open. The goal is usefulness, not revenue; the 2026-09-26 memo's sales plan (design partners, Nov 20 "concrete ask" gate) no longer applies.
@@ -228,616 +240,220 @@ Adding the service automatically: registers spaces on the right world, exposes v
   - Feistel rounds use conditional subtraction and a precomputed inverse for division; a `%` there cost ~25%.
   - hdrhistogram's `saturating_record` never resizes and silently records zeros. The harness uses `record()`, and a test guards it.
 
-**Phase 1 (population, kinship, households): IN PROGRESS.** The kinship prototype R1 is built. Households and the rest wait on founder decisions (below).
+**Phase 1 now runs on the monotone world (2026-10-03).** The founder replaced every earlier world with it: "i want to remove everything related to the cell and old world and completerly replace it with this new promising world".
 
-**What exists: crate `internot_society`** (built alongside `people`, per D6). The plan and a dated outcome log for every step are in `docs/superpowers/plans/2026-09-30-r1-kinship-prototype.md`.
-- **Model.** Every fact is a pure function of `(seed, id, t)` over an integer ledger, with no simulation.
-  - Blocks are `(birth year, lineage region)`, in two prototype regions. A block's members are entry cohorts: natives, then immigrants by arrival year.
-  - First unions come from yearly two-sex markets: regional, national, and one same-sex market per sex. The IPF runs over birth years, with keyed integer rounding.
-  - Fertility plans are apportioned per union cell. There are non-union births, dissolution by era, and deaths drawn from era mortality conditioned on the survival the person's *own* cells require: entry, the union year and, for a woman, her planned births.
-  - **A father need only be alive at conception** (founder decision, 2026-09-30; `research/2026-09-30-death-locality-problem.md`).
-    - `father()` is the mother's partner at conception, `GESTATION_DAYS` = 266 before the birth.
-    - A child conceived after his death has no in-world father until widowed re-partnering.
-    - No death depends on another person.
-  - Immigrants arrive single or as couples. Couples arrive with their children born abroad, who have in-world parents.
-- **API:** `World::build(params, seed)`, then:
-  - `sex`, `birth_year`, `birth`, `death`, `alive_at`;
-  - `region`, `is_founder`, `is_immigrant`, `arrival`;
-  - `union`, `union_class`, `partner_at`;
-  - `mother`, `father`, `children`, `siblings` (the last two return an inline `KinList`, with no allocation).
-- **Guarantees.** Tested exhaustively on the tiny world (`tests/kinship.rs`, same-sex share boosted 10×) and by sampling on the prototype (`tests/realism.rs`):
-  - partners are mutual, with identical union facts on both sides;
-  - mother/child and father/child are dual;
-  - siblings are the union of both parents' children;
-  - life bounds hold, including immigrants alive at arrival and children born abroad arriving with both parents;
-  - ledger closure holds per (block, block, year, cell kind);
-  - worlds are deterministic across builds;
-  - **zero close-kin couples**, checked exhaustively on 7 tiny seeds and on the full prototype (3.8M couples).
-- **Realism (prototype, 11.1M ever born, 1840–2100).** Natives' cohort e0, CFR, union age, childlessness and divorce are within bands (`examples/realism_report.rs`). Also:
-  - cross-region unions rise from 11% to 24%;
-  - the foreign-born share of the living tracks the Census within ~3 points from 1870 to 2020;
-  - children are ~12–18% of arrivals;
-  - same-sex couples are 1.46% in 2019 (ACS ~1.5%);
-  - only children are 2.8% of the 1880 cohort, 6% of the 1950 cohort and 11.6% of the 2010 cohort; mean siblings fall from 4.5 to 1.9 (spec ~9% only children; the child-weighted US figure is about 10–13%).
-  - posthumous births are 0.8% of the 1860 cohort and 0.2% of the 1950 cohort (historically ~1% in high-mortality eras);
-  - children conceived after the mother's partner died, who therefore have no in-world father, are 6.7% of the 1860 cohort, 3.4% of 1920, 1.2% of 1950 and 0.5% of 2010. Widowed re-partnering would give them stepfathers.
-  - **Provisional parameters** (calibration targets are named in their docs): `national_market_share`, `couple_arrival_share`, `same_sex_share`, the immigration anchors.
-- **Performance** (`kinship` suite; `perf/budgets.toml`). Measured 2026-09-30 under the `performance` governor, with single-call timing and thermal settling (below). Baselines for all suites were re-recorded then. Gate runs vary about ±10% (death more; see below), so compare changes with `perf/ab.sh`.
+### The society world: the monotone world (`internot_society::mono`)
 
-  | Query | p50 | p99 | Budget | Margin |
-  |---|---|---|---|---|
-  | birth | 8 ns | 10 ns | 25 ns | 60% |
-  | death | 200 ns | 0.45–0.87 µs | 1 µs (spec) | 13–55% |
-  | mother | 410 ns | 1.1–1.2 µs | 2 µs | ~42% |
-  | father | 1.45 µs | 3.1 µs | 5 µs | ~38% |
-  | union | 1.42 µs | 3.0–3.3 µs | 5 µs | ~36% |
-  | children | 0.72 µs | 3.6–3.95 µs | 5 µs | ~24% |
-  | siblings | 0.95 µs | 2.8–3.35 µs | 4 µs | ~22% |
-  | world build | 1.04 s | 1.04 s | 2 s | |
+**Why it exists.** The founder asked for searches at billions to trillions of people ("I want to do this on the scale of billions or trillions… I need it to be faster"). At 10¹² people no per-person scan survives, so every count a search asks for must be closed form, with cost proportional to the answer, not the population. Worked out with a second agent, Tursi, in `thinking/claude/` and `thinking/tursi/`; Tursi's own worktree is under `.tursi/`.
 
-  - **Starting point that morning** (single-call timing): death 2.0–2.6 µs and mother 1.3 µs, both failing; union, father and children 4.4–4.9 µs against 5 µs.
-  - **All lookups are DRAM-bound** (IPC 0.3–0.6). On this machine a dependent load costs ~95 ns over 128 MB and 13 ns within L3 (16 MB), so **p99 ≈ the depth of the dependent-load chain × 95 ns**. Instructions barely matter.
-  - **The world is 152 MB RSS.** Cells take ~36 MB, cohorts ~18 MB and birth tables ~6 MB; the rest is plans and the ledger.
-  - **death's p99 is two-valued.** Partnered women drawn to die before 46 (1.3% of calls) need their own plan: three more DRAM loads, ~0.8 µs. The p99 sits at that group's edge, so round p99s come out at either ~0.43 or ~1.0 µs, and the gate's median over rounds picks one.
-  - **What worked,** each confirmed by an interleaved A/B with identical answer checksums:
-    - **Father survival at conception** (founder decision): death went from 2.3 to 0.8 µs.
-    - **One array per search:**
-      - partner slices as (block, start) with a sentinel;
-      - sub-cells as (start, in-cell start, cell, year, plan);
-      - plan leaves storing their start instead of their count.
+**The rules it is built on** (`thinking/claude/004`, `005`, `010`):
+- **Couplings preserve order.** Every map between index spaces is monotone, so a prefix in one space is a prefix in the next. Order-scrambling is allowed only inside a class.
+- **At most one decorrelating permutation per class, and it is affine** (`perm::AffinePerm`, `r ↦ (a r + b) mod n`, `a` the golden multiplier). Joint counts are then 2-D lattice counts, i.e. floor sums. Two maps on one modulus compose to one affine map.
+- **Deaths are quantile slots of classes.** A class is a rank interval of one cohort and sex sharing one law; "dead by t" is one count, and "alive" is a suffix.
+- **Deaths come from the cohort's life table from 16 (option A, `thinking/claude/010`, Tursi agreed in `thinking/tursi/003`).** A union whose partner is dead at its start is void for both. Wives are compensated only for the survivor's lost union (the census convention: `ever_partnered` is a share of survivors to 50).
+- **Births choose mothers among the living** (survival first), so no death depends on a birth.
 
-      A search and the read after it now touch one array, not two: union and children −10–15%, mother −10–18%.
-    - **Inline hot data:**
-      - each cell's first cohort, usually the natives (−8–15% on union);
-      - the union year in the sub-cell record (death −14–27%);
-      - the count of women without non-union births in the cohort.
-    - **Cheap exact filters in the kin predicate** (union p99 −10–14%):
-      - different mothers' union cells mean different mothers, since each woman has one union cell in R1 (tested against full resolution);
-      - a mother must be in the child's mother block;
-      - a father's union cell must have a slice of the mother's block.
-  - **What did not help, and was reverted:**
-    - an inverted per-offset leaf index: −43% instructions, no change in cycles, +31 MB;
-    - a direct year index for finding cells, whose small binary search was already cache-resident.
-  - **Plans moved** into a per-block array indexed from sub-cells: roughly neutral, but no per-cell box.
-  - **`CompactPerm`** (new in `procedural_core`, additive): the Feistel network in 32 bytes, with round keys `seed ^ π-constants`. `FeistelPerm` and its golden values are unchanged. The world uses it everywhere, which cut cells and cohorts by ~40%.
-  - **Harness fix 1: batching hid memory costs.** Calibration repeated one input up to 18 times per sample, so later calls ran from cache. That was the "bimodal ±40%" noise once blamed on the governor. Calls of ≥ 250 ns are now timed singly; kinship lookups use `.batch(1)`.
-  - **Harness fix 2: thermal settle.** Each benchmark waits until the CPU is ≤ 65 °C (`PERF_NO_COOL` skips it). The laptop goes from 63 °C to 93 °C within ~7 s of load.
-  - **Levers left:**
-    - huge pages, measured at 10–20% on every lookup via `MADV_COLLAPSE` (a process-level step for the MCP binary and the harness, not yet built);
-    - hot/cold splits of cells and cohorts into 64-byte headers plus per-block arenas.
-  - **R1c warning:** second unions add sub-cells and plans to death and kin lookups. Keep every constraint local (see Lessons).
+**What it models** (one group, one area, natives):
+- **Cohorts:** sizes from the pack's births, women first; per sex, the young (die before 16), then adults.
+- **First unions:** an integer table (wife cohort × husband cohort) filled in year order by the pack's age-gap kernel under each husband cohort's adult men, laid out by `lattice::ExactInterleave` over the wives in union-age order.
+- **Separation:** a category in the wife class's space (a second affine map, multiplier `a²`), by the pack's dissolution classes. A union ends at the first of separation, his death and hers (competing risks).
+- **Births:** blocks per (year, married or single, mother age), a capped split under each block's eligible mothers (at most one child per mother a year, Lean `one_child_per_mother`), then children choose mothers by the proportional owner. A birth's phase in the year is the mother's death slot rotated per class and turned back 0.0937 of a year per calendar year (`year_turn`, 2026-10-03: before it, every child of a mother shared her birthday), so siblings are at least 330 days apart and "born by t" is at most two slot runs per class.
+- **Fathers:** the mother's husband if she was married, the union isn't void or separated by the conception, and he is alive at it.
 
-**R1c (divorce re-partnering): IN PROGRESS, design written 2026-09-30** (`plans/2026-09-30-r1c-divorce-repartnering.md`; targets in `research/2026-09-30-remarriage-targets.md`).
-- **Mechanism:**
-  - dissolution years are exact classes on each partner slice, via keyed systematic apportionment;
-  - sub-cells are (cell, class): kin repair, coupling and plans work within them;
-  - isolated couples move to the nearest class, and one pass suffices;
-  - markets have a status dimension (never partnered or divorced), giving four kinds of opposite-sex cell;
-  - second-union membership comes from each first-union sub-cell's remarriage parts;
-  - every life constraint stays local.
-- **Scope:** at most two unions per person; no same-sex re-partnering. The founder is informed and it proceeds unless told otherwise.
-- **Build order:** primitive → ledger → world → realism → performance, tiny world first.
-- **Stage A DONE (2026-09-30): dissolution classes and class-cells, without remarriage.**
-  - Every test passes: the exhaustive kinship suite, closure per class, and zero close kin.
-  - Realism bands pass.
-  - **The layout that works:** one cell per (year, kind, class), in one cache line (64-byte `CellLayout`, arrays in per-block arenas), with coarse-indexed keys, cohort lines and birth rows.
-  - **Cost against pre-R1c:**
-    - union p99 +41% (4.4 µs) and father +55% (4.8 µs) against 5 µs budgets;
-    - children +20%;
-    - world build 1.52 s.
-  - Details and the three layouts tried are in the R1c plan, "Stage A outcome".
-- **Stage B BUILT, gates FAILING (2026-09-30): divorced pools, status markets, second unions.**
-  - Every test passes (845 in the workspace), including the exhaustive kinship suite with second unions: reciprocity on both unions, closure per (year, kind, class, block, block, sex), zero close kin, duality and life bounds.
-  - **Realism, calibrated** (targets in `research/2026-09-30-remarriage-targets.md`):
+**API** (`Mono::new(params, seed, scale)`; build ~13–20 ms; ~10 MB at ×1, 16.5 MB at ×1000, 18.3 MB at ×10⁵, growing with the log of the population (deeper death-table tails, more late union-age classes); `memory_report()` lists the components, `MEMORY=1 examples/mono_report` prints them):
+- `birth`, `death`, `alive_at`, `sex`;
+- `mother`, `father`, `children` (anyone), `siblings`;
+- `spouse` (with the void check), `partner_seat`, `separation`, `union_end`;
+- `count_alive(t)` (exact) and `alive_bounds(t)` (instant);
+- `alive_in_cohort` / `for_each_alive` (enumeration);
+- `Mono::id` / `Mono::pid` (external ids, below 2⁵³ so JSON numbers carry them; see "Cells" below).
 
-    | Measure | Model | Target |
-    |---|---|---|
-    | remarried within 1 / 3 / 5 / 10 years of divorce | 17 / 39 / 52 / 69% | NSFG 15 / 39 / 54 / 75% |
-    | median age at second union, women / men | 34 / 36 | 33 / 36 |
-    | remarriages with the husband 10+ years older | 17.2% | 16% |
-    | second unions broken within 10 years | 36% | 39% |
-    | new unions with both / one partner previously partnered | 15 / 16% | Pew 20 / 20%; the gap is the widowed, deferred |
+**Guarantees** (`internot_society/tests/mono.rs`, exhaustive on small worlds; `MONO_SEEDS`, `MONO_MULT`):
+- mother ↔ children and father ↔ children agree both ways;
+- spouses and union ends are symmetric;
+- every mother is alive and aged 15–46 at each birth, and every father is alive at conception;
+- every child is counted once;
+- `count_alive` equals brute force at four dates, within `alive_bounds`.
 
-    - Couples moved by de-isolation: 2.4%.
-    - CFR of the 1950 cohort: 2.31.
-    - Ever born: 12.06M.
-    - Provisional parameters: `SECOND_UNION_FERTILE` = 0.45, the remarriage hazard by duration, men ×1.2, status affinity 3.5 for two divorced partners, divorce ×1.35 in second unions, and remarriage age gaps ×0.6.
-  - **World build: 4.28 s → 1.45 s** (min of 3; 3.44 s on one thread, 1.64 s on four). Every change was checked bit-identical, by a checksum of the whole ledger and of 600k lookup answers:
-    - the IPF fuses its passes and sums eight rows side by side (a float sum is a serial add chain);
-    - market rounding skips the draw on zero cells;
-    - `procedural_core::partition::SystematicShares` (new, additive) computes shares once, with a sparse `for_each_part` for small splits. It is used by class splits, plan partitions (`plan::PlanShares`, `PlanTables`) and arrival classes;
-    - births are a dense year × block table;
-    - free couples come from one pass over single-member cells, replacing a search into another block's ledger cells for every one of 4M slices (20% of the build);
-    - **parallel, with `rayon`** (new dependency of `internot_society`): per-block layouts and tables, each block's side of a market group, all of a year's market solves (caps then apply in order), class splits and the year-end sort. Each task touches only its own block, and births merge as sums, so results don't depend on scheduling.
-  - **Gate, 2026-09-30** (performance governor). world_build 1.59 s, within the 2 s budget; its baseline (1.04 s) predates R1c. **Lookups fail:**
+Passing on 12 seeds at ×0.01 and 2 at ×0.1.
 
-    | Query | p99 | Budget |
-    |---|---|---|
-    | death | 1.77 µs | 1 µs |
-    | mother | 1.93 µs | 2 µs |
-    | father | 12.3 µs | 5 µs |
-    | union | 11.4 µs | 5 µs |
-    | children | 15.2 µs | 5 µs |
-    | siblings | 22.4 µs | 4 µs |
+**Measured** (`us` pack; `examples/mono_report.rs`; perf suite `society`):
 
-  - **Memory: 890 MB peak RSS** (R1: 152 MB).
-    - Union cells: 1.30M (stage A: 592k).
-    - Partner slices: 4.77M, 4.0M of them a single couple.
-    - Cohort or source parts: 2.93M.
-    - Divorced sources: 656k, with 1.64M remarriage parts.
-    - The ledger's per-cell `Vec`s stay alive inside `World`.
-  - **Founder decision (2026-09-30): performance is good enough for now; the work is deferred.**
-    - The bar is "decent enough not to get in the way of high workloads", not extreme p99s.
-    - In absolute terms, lookups are fine: a family-heavy view call is a few ms, and bulk kin generation is about 20 s per million people on one thread.
-    - Deferred, in priority order:
-      1. **Memory**: 890 MB per process, so ~14 GB for 16 parallel MCP servers.
-      2. **Sharing one world across processes**: a memory-mapped build, or one server for many sessions.
-      3. **Full-scale estimates**: memory and build time grow with population, and the national market's rounding with regions².
-      4. **Lookup budgets sized to workloads**: about 25 µs for one-hop lookups and 2 µs for death, in place of the 4–5 µs caps.
-    - The kinship gate's lookup failures are known and accepted until then. Do not re-record baselines; that would hide them.
+| | ×1 (14.2M ever) | ×100000 (1.42 trillion) | ×1000000 (14.19 trillion) |
+|---|---|---|---|
+| build / memory | 13 ms / 10.3 MB | 20 ms / 18.3 MB | not re-measured |
+| exact alive count | 0.07–0.1 ms (0.4–0.7 before the speed pass) | 1.0–2.7 s (2.6–7.1 before) | 27–77 s before the speed pass |
+| instant bounds (±0.01–0.06%) | 0.04–0.13 ms | 0.13–0.18 ms | 0.5–0.75 ms before |
+| list everyone alive, 1 thread | 8 ms (1.1 ns/person) | | |
 
-**L3 households: BUILT, calibrated (2026-09-30)** (`plans/2026-09-30-l3-households.md`, including §13; targets in `research/2026-09-30-household-targets.md`).
-- **Module:** `internot_society::household`: `World::household(x, t)`, `World::members(h, t)`, `World::kin_host`.
-  - Household kinds: `Union`, `Solo` (with anyone who lives with them), `Roommates`.
-  - Rules:
-    1. dependents live with a parent or guardian (minors whose union ended go back);
-    2. a unit (single or couple) seeks kin with a propensity by age and era: moving back with a parent, other relatives, an elder with a child, a young couple with a parent. It joins the first **anchor** among its kin (anchors never seek kin), so it's one step and never cycles;
-    3. partners live together;
-    4. single adults live alone or with roommates (ages 18 to 64, no child under 18; keyed frames of 12 over birth-year bands).
-- **Tests** (`tests/households.rs`, exhaustive on the tiny world at 15 dates): exact reciprocity both ways; partners together; minors never alone except the measured residuals; no next-day reversion.
-  - The residuals: founder minors until 18 (1840 to 1857); kinless orphans, 0.15% of minors in 1900 and none by 2025.
-- **Calibrated:**
-  - at home at 18 to 24;
-  - adults with other relatives (12.0% against 12.3%);
-  - household size and couple share for 1980 and 2000 (2.75 against 2.76; 53.2% against 52.8%);
-  - 65+ with an adult child (18.5% in 2000).
-  - **Report:** `examples/household_report.rs` (about 80 s), including partner status by age.
-- **Still off (2025):**
+At ×10⁹ (1.4·10¹⁶ ever) the bounds take 5–12 ms. The original ledger world needed 3.1 s to scan the US-scale count (33.4 s for the cell world), 1.5 GB and a 7 s build.
 
-  | Measure | Model | Census |
-  |---|---|---|
-  | adults living alone | 22.5% | 14.8% |
-  | one-person households | 40.6% | 29.5% |
-  | 65+ living alone | 39% | 28% |
+| Lookup (p50/p99, perf gate, ×1, after the speed pass below) | Time |
+|---|---|
+| birth | 90/121 ns |
+| death | 80/210 ns |
+| mother | 90/211 ns |
+| spouse | 190/291 ns |
+| father | 261/431 ns |
+| children | 581 ns/1.18 µs |
+| siblings | 611/912 ns |
 
-  This is mostly the kinship partner deficit at older ages; see R1d debt.
-- **Speed:** `household` 17 µs p50 / 176 µs p99; `members` 167 µs / 731 µs. No gate yet.
-- **Out of scope:** dorms, boarders and servants.
-- **Founder decision (2026-10-01): accepted as is.** "We can drift from the census a little." Phase 1 (population, kinship, households) is done.
-  - Still open, as debt: widowed re-partnering, mortality by partnership, the young-union timing, and the deferred speed items (lookup budgets, memory, the 2.4 s world build).
+The gate's single-call timer adds ~20 ns to every p50 (an empty call measures 20 ns). Lookups are the same at ×10⁶.
 
-**R1d (statistics, not rules): steps 1 to 4 DONE (2026-09-30)** (`plans/2026-09-30-r1d-statistics-not-rules.md`).
-- Rules removed:
-  - the age cutoffs on first unions and re-partnering;
-  - "at most two unions" (now any number; `MAX_UNIONS` = 16 is a bound on lookups, and the most reached is 9);
-  - single immigrants partnering on the never-partnered first-union schedule (now at their single native peers' rate).
-- Recalibrated to living with a spouse or partner by age (Census A1 plus UC3):
-  - re-partnering;
-  - dissolution, with cohabitation included, so recent unions end sooner;
-  - fertility compensation.
-- The 1970 cohort has 2.02 children; 14.0M ever born.
-- **Open debt:** no widowed re-partnering (widowed singles at 75+: 39% against 33%); mortality ignores partnership; no same-sex re-partnering. World build is 2.4 s.
+**What still grows with population:** the exact count checks one by one the young whose age at death falls within a year of `t` (≈0.025% of the alive). The closed-form part and the bounds are flat.
 
-**World packs: steps 1 to 4 DONE (2026-10-01)** (`specs/2026-10-01-world-packs.md`; research `research/2026-10-01-world-definitions.md`).
-- **Founder decision (2026-10-01):** "everything configurable through those rust json-like files". That covers races, names, birth rates, countries, places and, later, services, "easily extendible by anyone"; the specifics are delegated.
-- **The design:**
-  - Mechanisms are code; every number, list and name is data.
-  - Packs are RON files in `worlds/<pack>/`, and `us` and `us-tiny` are embedded in the binary.
-  - `extends` merges a child pack into its parent field by field. Lists of records with an `id` merge by id.
-  - Unknown fields are errors. Every number sits next to a comment naming its source.
-  - The merged pack is compiled once at build. A fingerprint identifies the pack.
-  - A new crate, `internot_def`, does the loading and merging and holds the value vocabulary (`Series`, `Steps`, `BySex`, ...).
-- **Migration is bit-identical,** checked by `examples/world_fingerprint.rs`. Baseline: tiny `b19c209ec97e8c4c` / `f3bd18ec8c5afb2e`, prototype `e47e257ad076f57d` / `bc764f24987f394f`.
-- **Done:**
-  - `internot_def` crate.
-  - Packs `worlds/us` (nine sections) and `worlds/us-tiny` (one file extending `us`).
-  - `worlds/README.md`, the guide for anyone.
-  - `internot_society::params` is typed sections plus `Params::{prototype, tiny, embedded, load, from_pack}`.
-  - `build.rs` embeds `worlds/`.
-  - Heritage groups are pack-defined: `Heritage` is an index, and there is no enum.
-- **Checks:**
-  - The fingerprint is unchanged (re-recorded baseline with heritage as an index: tiny `830e0ddfaf6b1702` / `f3bd18ec8c5afb2e`, prototype `fc1cc62ffcc638bb` / `bc764f24987f394f`).
-  - All 860 workspace tests pass.
-- **How to work from now on:**
-  - New statistics go in the pack, never in code.
-  - A new section is a typed struct in its consumer's crate, read with `pack.section(name)`, checked in `validate`, and documented in `worlds/README.md`.
-  - Structural bounds stay in code and are listed in the README.
-  - Check refactors that must not change the world with `examples/world_fingerprint.rs`.
-- **Next:** N1 resumes on the packs: group fertility and mortality rates, calibration, then names.
+**Primitives added to core for it:**
+- `perm::{AffinePerm, golden_pair}` (incl. `from_pair`, `inv_range`, `count`, `select`);
+- `life::HazardTable` (tabulated cumulative hazard with an exact inverse, no Newton; now used only to build the quantile tables);
+- `quantile::{OctaveTable, OctaveShape, slot_w, count_from_threshold}` (speed pass, below);
+- `perm::{CompactPerm4, CompactPermR, rem_by_inverse, divmod_by_inverse}` and `SystematicShares::{offset, part_of_offset, end_of_offset}` (speed pass).
 
-**Names and heritage (N1): heritage DONE, names BUILT (2026-10-01)** (plan outcome for details).
-- **Names:** `internot_society::names`, with data and rules in `worlds/us/names.ron` and `data/names.bin`.
-  - First names come from SSA by year, split by group with Census 2020 and raked to the world's own births.
-  - Surnames are inherited, change at weddings by era, and can revert after a separation.
-  - Marriage is now a fact of each union (`World::marriage_date`). 86.5% of couples living together are married in 2023, against 86.7%.
-- **Speed:** `first_name` 5.5 / 24 µs and `surname` 51 / 286 µs (p50 / p99).
-- **Debt:** Asian names mix origins (needs origin countries); no women's middle-name pool; names frozen after 2025.
-- **Heritage is in the ledger and calibrated** (plan outcome):
-  - composition 1850–2020 within about 2–3 points of the Census;
-  - intermarriage by group and sex matches Pew for 1980 and 2015;
-  - group fertility and mortality are pack factors, with adult mortality solved to the e0 gaps.
-- **Debt:** children join the mother's group (Hispanic 16.7% against 19.6%); same union rates for every group; no generation effect in intermarriage.
-- **Build:** 4.9 s.
-- **Why heritage first.** First names and surnames depend strongly on race and Hispanic origin (Census 2020 name files). For a family's names to make sense, partners must mostly share a heritage, at real intermarriage rates by era (Pew: 3% of newlyweds in 1967, 17% in 2015).
-  - A heritage-blind ledger can't give that. Any labelling of a heritage-blind union graph either mixes families at random within a few generations or lets one label take over.
-  - So heritage must shape the markets, not only the names.
-- **Founder decision (2026-10-01): heritage goes in the ledger.**
-  - Lineage groups become region × heritage.
-  - Five groups follow the Census 2020 name files: non-Hispanic White, Black, Asian and Pacific Islander, AIAN, and Hispanic of any race.
-  - "Two or more races" is not a group; it comes from mixed parents.
-  - The founder asked whether heritage affects the couple or only the children. The answer is both: it shapes who partners with whom, and children inherit it.
-- **Cost measured before design (10 groups against 2, uniform mixing, the worst case):**
-  - world build 10.4 s against 2.7 s;
-  - peak RSS during the build 2.6 GB against 1.6 GB.
-  - The time is the cross-group market's dense rounding, which grows with groups² (the known regions² debt).
-  - Sparse rounding (per row group: cumulative shares and systematic placement, O(couples · log) instead of O(rows · cols)) is part of the plan.
-- **v1 scope (debt from the start):**
-  - every group has the same fertility, mortality and union rates; real groups differ, so composition will drift;
-  - children join their mother's group in the ledger (as with regions, D-R1.1), and their names draw on both parents.
+**Proofs:**
+- `docs/superpowers/research/proofs/2026-10-03-mono-world.lean`: monotone slots, proportional-owner intervals, rotated phases, one child per mother;
+- the affine count identity, from the pure-world proofs.
 
-**Phase 2, residence: research DONE, design A chosen (2026-10-01).**
-- **Notes:** `research/2026-10-01-residence-data-and-targets.md` (data in `datasets/geo/`, mobility and proximity targets) and `research/2026-10-01-residence-algorithms.md` (the obstruction, P1/P2).
-- **Data in hand** (public domain):
-  - tracts with population and centres (2000/2010/2020), the Gazetteer, GNIS neighbourhoods and CBSA metros;
-  - Forstall county populations 1800–1990 plus estimates to 2025, and WP27 largest cities 1840–1990;
-  - a street-name frequency list computed from TIGER.
-- **Binding targets:**
-  - at 26, 30% are in the same tract as at 16, and 58% within 10 miles;
-  - 59.8% of adults have their nearest parent within 30 miles;
-  - about 76% of domestic moves are under 50 miles;
-  - mover rate 20% (1948–70) → 7.8% (2023).
-- **Finding:** an exact roster must evaluate every household that could have entered N.
-  - Each move channel is either static-indexed (cost ∝ |N|, no dependence on the current location) or confined to a closed unit (cost ∝ that unit's history, once, then memoized).
-  - Option B as decided can't put new households near parents (it fails the targets above).
-- **Recommended: P1.** About county-sized closed basins; formation near parents or partner via kin edges; local moves relative to the current address; long moves as static itinerary flows.
-  - Exact both ways. Forward is about 0.1 ms; a basin's first roster takes seconds at full scale, then is memoized.
-- **Open coupling:** partner geography. The ledger pairs within lineage regions, which don't follow residence, so realistic partner distance needs a multiregional (counted-residence) ledger.
-- **Founder, 2026-10-01:** P1's forward replays a household's moves, which "does not sound very f(time, id)". Find a direct construction for both questions, and move all the math into `procedural_core`.
-- **Answer** (`research/2026-10-01-residence-closed-form.md`):
-  - **Forward is direct by hierarchical regeneration.** A move at level k redraws levels ≥ k, so the level-k place at t is the draw at the last level-≤k move. That is one `last_before` per level, O(L · log T), with no replay.
-  - **Rosters are direct for static channels**, through bijective draws.
-  - **"Near the parents" can't be both direct and exact** (the catchment argument). It needs a closed unit (A, cached), place counted in the ledger (B), or dropping it (C).
-  - **Recommended: A**, with B at state level later for partner geography.
-- **Founder decision (2026-10-01): A, closed units.**
-  - Forward by hierarchical regeneration.
-  - Rosters exact, by enumerating a unit's history once and caching it.
-  - Channels that cross a unit's boundary are static (seeds, itinerary bijections).
-  - "Near the parents" and local moves work inside units.
-  - Debt from the start: partner geography (B at state level is the later fix), and first long moves that can't depend on an inherited place.
-  - **Next:** design and prototype on a synthetic geography (forward cost, first-touch roster cost, the proximity targets) before production code.
-- **Design A written (2026-10-01):** `specs/2026-10-01-residence.md`.
-  - **Units:** unions and single spells, each with a position process over its whole span, latent while nobody lives there. Households live at their anchor unit's position.
-  - **Forward:** nested regeneration over basin ⊃ county ⊃ cluster ⊃ tract. New units start near their source (leaving home: the parent's unit; a union: one partner's unit; after a separation, the keeper stays). Formation never leaves the basin.
-  - **Long moves:** a counted flow, per (birth block, year), with a keyed selection. Destinations are tiered around the lineage region, exactly invertible.
-  - **Rosters:** each basin's closure E(B) is the least fixed point from its static entries through sources, proved equal to "every unit ever in B", and cached.
-  - **New core primitives:** `geo` (haversine), `fixpoint::closure`, a tiered (ultrametric) destination kernel, and possibly a segmented keyed permutation.
-  - **Open:** move hazards, distances and commuting-zone data. A research pass is writing `research/2026-10-01-residence-moves-and-basins.md`.
-  - **Next:** the core primitives, then a prototype on a synthetic geography (exactness on the tiny world, then costs on the prototype world), then real geography and calibration.
-- **Core primitives added (2026-10-01):** `dmath::{asin, atan2}`, `geo` (haversine), `fixpoint::closure`, `perm::SegmentedPerm`, each with property tests and golden values (553 core tests pass).
-- **Prototype `internot_society::residence` (2026-10-01): exactness PASSES.**
-  - Pack section `residence.ron`, with provisional rates.
-  - `Places`: a tree with weights by decade, and a synthetic builder.
-  - Units, sources, `pos` (nested regeneration), counted long-move and seed flows (`SegmentedPerm`), per-basin closures, `roster`, `address`.
-  - **Exactness:** `tests/residence.rs` checks the tiny world (2 seeds × 7 dates, 6 basins × 36 tracts): every tract's roster equals brute force over every person, and county rosters equal the union of their tracts.
-  - Bug found on the way: a union starting exactly at the world's start was not treated as seeded. Units that start by the time their people enter the world are seeds.
-  - **Timelines:** `Residence::timeline` replays a unit's events into stretches. It agrees exactly with the direct `pos` (property test, 1,062 units and 5,878 stretches). Histories store the stretches with a per-tract index, so a roster is a range scan plus occupancy checks.
-  - **Speed work, in order:**
-    1. Memoized per-person facts and per-unit info: 3.8 → 0.75 s per tiny basin.
-    2. A fast path for first independence.
-    3. Candidate pruning (descend through a child only if they were still a dependent at 31, or died while the unit lasted).
-    4. `fixpoint::closure_layers` (new in core), with rayon expanding each layer and sharded memo locks.
-    5. Caches cleared after each history.
-    6. Parallel occupancy checks in rosters.
-  - **Bug found by the exactness test while pruning:** grandchildren are orphaned into a grandparent's care whenever the parent dies before they leave, at any age. Fixed.
-  - **Measured on the prototype world** (13.8M people ever born; synthetic tree of 120 basins, 11,520 tracts; `examples/residence_report.rs`, release):
+**How to add a feature** (founder, 2026-10-03: "slowly adding in features without sacrificing any time. back to lean"):
+1. math, and a Lean lemma where it isn't definitional;
+2. code;
+3. the exhaustive tests;
+4. the speed gate: `perf/society_ab.py BASE NEW ROUNDS`, which runs two saved `mono_report` binaries alternately (×1, and ×1000 bounds-only) and compares medians and answer checksums. Noise is p50 ±1–2%, p99 and sub-ms counts up to ±20–30%. A feature must not move existing p50s.
 
-    | Measure | Result | Budget |
-    |---|---|---|
-    | `address_of`, cold | p50 259 µs, p99 619 µs | about 1 ms ✓ |
-    | `address_of`, warm | p50 24 µs, p99 279 µs | ✓ |
-    | first touch of a basin (210k–420k units) | 6–12 s | ≤ 10 s for the largest ✗ for the biggest |
-    | warm tract roster | p50 0.9–1.5 ms, p99 1.5–2.8 ms | about 10 ms ✓ |
-    | memory per cached basin history | about 100–140 MB | |
+A speed change that must not change the world is checked with `examples/mono_checksum.rs` (every lookup's full answer on 200k people, plus alive counts, bounds and separated-and-alive; `PACK`, `MULT`): the `ALL` line must not move. `examples/mono_parts.rs` gives each internal step's mean cost (`HOT=1`: from cache), and `perf-gate --suite society` the single-call latencies with hardware counters.
 
-    - The closure's cost is mostly the kinship layer's union lookups (kin repair inside `repaired_partner`): the deferred kinship performance debt.
-    - Large real basins must be split.
-    - The world itself is now 2.5 GB RSS after build (heritage multiplied cells; debt).
-- **Real geography (2026-10-01):** `internot_society/data/distill_places.py` writes `worlds/us/data/places.bin` (5.6 MB).
-  - Contents: 2020 tracts with population centres; ERS 2020 commuting zones; clusters of at most 16 tracts; weights by decade 1840–2100 from Forstall county censuses scaled to state totals, 2000/2010/2020 counts and the 2025 estimates. Puerto Rico is dropped.
-  - Census-region shares match CPH-2-1 within 0.3 points from 1850 to 2020, and the 2020 total is exact.
-  - `places.ron` maps states to the pack's lineage regions: east is the Atlantic seaboard, 62.6% of people in 1840, against the 0.6 founder weight.
-  - `Places::from_params` parses it.
-- **First realism report** (`examples/residence_realism.rs`, provisional rates): families scatter far too widely.
+**Log** (`thinking/claude/001`–`011`; `thinking/tursi/001`–`003`):
+- **Tier 1, a negative result:** cheap death bounds settle 95.6% of checks but even "cheap" facts cost ~1 µs in the cell world. Per-person schemes can't scale.
+- **Prototype:** exact counts in ms, flat to trillions.
+- **Separation, verified:** "separated and alive" in closed form equals brute force in every class.
+- **Option A:** cut men's death classes from ~3000 per cohort to one; with `HazardTable` and stored multipliers, counts went 6 → 0.4 ms and enumeration 13 → 1.1 ns/person.
+- **Step 1:** children and siblings for everyone.
+  - Bug found by the exhaustive test and fixed: single mothers assumed alive.
+- **Step 2:** close kin.
+  - Defect found and fixed: a mother could get up to 110 children in a year (blocks ignored eligible mothers). Now capped, at no time cost.
+- **Women ever partnered by 50:** 92–93% (pack 92%).
+- **Void seats:** 2–4% (modern), ~10% (1880), including people who die unmarried before a wedding.
 
-  | Measure | Model | Target |
-  |---|---|---|
-  | nearest parent under 30 mi | 17.8% | 59.8% |
-  | nearest parent 500+ mi | 41.7% | 9.2% |
-  | same tract at 26 as at 16 | 16.9% | 30% |
-  | 500+ mi from where they were at 16 | 29% | 10% |
-  | West's share in 2020 | 12% | 23.7% |
+**Speed pass (2026-10-03, founder goal "make it 2x as fast as now").** Perf suite `society`, p50 (the gate's timer adds ~20 ns to each lookup):
 
-  - The cause: every move between zones is static and tiered only around a half-continent lineage region.
-- **Research note done:** `research/2026-10-01-residence-moves-and-basins.md`.
-  - Keep zones whole: splitting turns 30–50% of local moves static.
-  - A static key works for long moves only if fine: the birth state's overlap is 0.62, the current state's 0.56, national 0.42.
-  - Rates by age and era with gamma frailty and no duration term; level shares; formation channels; the cross-zone kernel (piecewise power law, median 240 mi).
-- **Restructure decided (within design A):**
-  - The closed unit becomes the **area**: whole zones grouped by state, capped, with a zone too big for the cap as its own area. Tree: area ⊃ zone ⊃ county ⊃ cluster ⊃ tract.
-  - Moves between zones inside an area draw by gravity around the unit's home zone (its first zone). That keeps the regeneration lemma, and per research §4d a home key predicts as well as the origin.
-  - Only moves between areas are static counted flows.
-  - Rates, frailty, level shares and formation channels follow the research.
-- **Restructure built (2026-10-01), still exact** (all three residence tests pass).
-  - Five levels, real places; `places.bin` v2 has 62 areas of whole zones, with counties over 2M cut into 1M parts.
-  - Seeds and own-region shares use each region's tract weights per area.
-  - Core gained `sample::{gamma, frailty}` and `curve::piecewise_power` (556+ core tests).
-- **Realism is blocked by residence-blind kinship** (spec §7, `examples/residence_realism.rs`, `examples/residence_trace.rs`):
+| Benchmark | Goal start | After | Speedup |
+|---|---|---|---|
+| death | 170 ns | 70–80 ns | 2.1–2.4× |
+| father | 912 ns | 261 ns | 3.5× |
+| spouse | 441 ns | 190 ns | 2.3× |
+| children | 1.20 µs | 561–581 ns | 2.1× |
+| siblings | 1.25 µs | 611–631 ns | 2.0× |
+| count_alive | 350 µs | 68 µs | 5.1× |
+| alive_bounds | 227 µs | 42 µs | 5.4× |
+| world_build | 56.5 ms | 13 ms | 4.3× |
+| birth | 140 ns | 90 ns | 1.56× |
+| mother | 140 ns | 90 ns | 1.56× |
 
-  | Measure | Model | Target |
-  |---|---|---|
-  | natives outside their birth state | 43–58% | 21–34% |
-  | adults with a parent under 30 mi | 16% | 59.8% |
+In bulk (mean per lookup over 1M random people, `examples/mono_parts.rs`): death 113 → 40 ns, birth 94 → 50, mother 87 → 50, spouse 289 → 125, father 464 → 217. Interleaved against the saved goal-start binary (`.scratch/mono/bin/mono_goal_base`, same timing loop): death 160 → 70 ns, mother 130 → 81, father 890 → 251, spouse 421 → 170, children 1.12 → 0.54 µs, siblings 1.21 → 0.59 µs, count 0.36 → 0.08 ms, build 60 → 10 ms. Memory: world 10.3 MB at ×1 (`memory_report`; death tables 3.9, alive prefixes 2.9, interleaves 1.1, class records 1.0, eligible rows 0.5), +13 MB resident after the build; about 7 MB before the speed pass (cache-line records and rows cost ~3 MB).
+- **World changes** (statistics unchanged: the realism table, e0, ever married, CFR, the age gap and void seats move within noise; brute-force alive counts equal; exhaustive tests pass on 18 seeds at ×0.0005–×0.3):
+  - **death ages from quantile tables** (`quantile::OctaveTable`): each (cohort, sex) has an adults' table (age given alive at the adult requirement) and a young table (age given death before 16), knots on octaves of `w = 1 − u` (256 cells in the body halving to 16 per octave in the tail), read from the bits of `w` and interpolated: no `ln`, no search. Exactly monotone, so every count stays exact: `count_alive` inverts the shared table once per (cohort, sex, date) (`threshold_near`) and counts each class with `count_from_threshold`;
+  - **union ages from one shared two-tailed table** of the log-logistic shape `(q/(1−q))^(1/shape)` (only the median varies by cohort): no `pow`;
+  - **the bridge has 4 Feistel rounds, not 6** (`perm::CompactPerm4`). Four is Luby–Rackoff's minimum for a strong pseudorandom permutation; three leave a serial correlation of −0.02 between consecutive inputs' images (20 standard errors on 1M pairs; `perm` tests), so three were rejected.
+- **Answer-identical** (checked by `examples/mono_checksum.rs`, full answers on 200k people plus counts: `us` `cc70eae70beda454`, `us-tiny` and ×1000 in `.scratch/mono/`):
+  - the availability passes computed the age-gap kernel 4.2M times though it ignores age: weights once, the same float sums (build 56 → 11 ms);
+  - one death threshold per (cohort, sex, date) shared by all adult classes; a tight per-class loop; the band check in chunks of 64; births by the date counted per block in parallel;
+  - a 64-byte record per death class (`ClassRec`: range, permutation, phase rotation, reciprocal); wife-class guides in the cohort's first cache lines; the eligibility row as one cache line with a 32-bucket guide (the early-loaded class record is right 90% of the time); the bridge parameters in a dense array; the year's block row loaded while the bridge computes; divisions by stored or early reciprocals (`perm::divmod_by_inverse`); Feistel rounds fold the key's xorshift (`round_small`, bit-identical below 2³⁰);
+  - children: a mother's alive check compares her death time with the year's end, and her index needs one prefix entry.
+- **Why birth and mother stop at ~1.56×.** With every line cached they still take ~215 cycles: the 4-round bridge is ~84 cycles of serial arithmetic (a 64-bit mixer per round), then a block search, a division, the class search and the phase. Cold, two dependent cache lines (the eligibility row, then the alive prefix with the class record) add ~50. Reaching 70 ns would need ~195 cycles. Tried and dropped: 3 rounds (correlated, above); an affine bridge (its rotation number against each class's golden map is arbitrary, so ~1–2% of classes would show order correlations between mother and child); prefetching the age group's rows (16 outstanding loads slowed the critical ones); inlining the Feistel (code bloat slowed children); a branchy block guide (mispredicts). A per-block table holding each bucket's class constants would cut a cache level, for ~16–33 MB more state: a founder decision (below).
+- **Lessons:** measure the same lookups with all data cached (16 repeated inputs) before optimizing memory: birth was compute-bound. Prefetch only lines that will be used; a few extra outstanding loads cost more than they save. The gate's p50 moves in 10 ns steps.
 
-  - Traces show people jump when their household composition changes. The main cause is partners paired from a half-continent market: one partner relocates at every union.
-  - Roommates (region-wide frames) and custody add to it.
-  - Turning roommates off, lowering move rates, or making county and zone moves rare barely helps.
-  - **Experiment** `worlds/us-states` (one lineage region per state): better (500+ mi from parents 30% against 45%), but the world build is 46 s against 5 s, and pairing is by birth state, stale for migrants.
-- **Founder decision (2026-10-01): B at area level.** The ledger tracks each person's residence area and pairs partners by it (spec §8).
-  - **Design:** `specs/2026-10-01-ledger-areas.md`.
-    - Blocks by (birth year, upbringing area, heritage).
-    - Single migration classes before a first union.
-    - Couple move classes on cells.
-    - Markets per area.
-    - Residence uses exactly these classes for moves between areas.
-  - **Step 1 done** (regions = areas, as a variant pack):
-    - `clear_year` indexes each market's members instead of scanning every block: bit-identical, and 53 regions now build in 36 s against 46 s.
-    - `places.ron` can set `by_area: true`.
-    - `internot_society/data/make_area_regions.py` generates `worlds/us-areas` (62 area regions from the 1840 shares; immigrant weights a proxy).
-    - The `us-areas` build takes 40 s and 5.2 GB (two regions: 5 s and 2.5 GB). The cost is mostly one class IPF per market per year (310 local markets).
-  - **Anchored gravity:**
-    - core `stream::nested_regen_anchored`: moves at a level draw around the level's anchor, its node at the last coarser regeneration; it matches a full replay exactly;
-    - residence uses it at the zone, county and cluster levels (`LevelGravity`; `local_gravity` in the pack), formation draws its first level by gravity around the source, and long-move rates are ×0.4;
-    - the residence tests stay exact.
-  - **Realism of `us-areas` with a 6–10% inter-area marriage share** (experiment):
+**Cells: heritage groups and the open market (2026-10-03, Phase 1 of `specs/2026-10-03-global-world.md`; math in `research/2026-10-03-monotone-cells-math.md`).** `Mono::new` builds one cell per heritage group of the pack (the `us` pack: White, Black, American Indian and Alaska Native, Asian, Hispanic); `Mono::blind` builds the one-cell world. People are `Pid { cell, y, i }`.
+- **Births by group, in 15-year waves.** A year's births split over groups by their *realized* eligible mothers (women alive through the year, all in cohorts of earlier waves) times the age shape and the group's fertility factor, capped by them, so a small group never gets more births than it has living mothers. Children are in their mother's cell.
+- **Mortality by group: one table per country cohort, scaled per group.** Every cell shares the country cohort's death tables; a group's adults scale the table's ages about the adult requirement (accelerated failure time) so that the remaining life there is the group law's (`life::HazardTable::remaining_life`). The young's count is the group law's; their ages share the table. The scaling is folded into the seconds conversion (`aft_secs`: `[0, YEAR]` is the table itself, bit for bit).
+- **Unions:** each group's own space (in-group wives × in-group men, as before) plus the open market. A cohort's open wives are an exact Beatty set of its wives; the open space's categories are (husband cohort, group), weighted by the kernel and the groups' open pools; its wives of a cohort are an exact interleave over groups (`open_mix`). A wife cohort with too few in-group men in reach sends the rest to the open market (small groups marry out more); open wives who find no man in reach (only in tiny worlds) are void seats (`open_seated`).
+- **Wife death classes** are union-age years up to the last childbearing age, then one class for every later union (union times still come from the full union-age prefix). Separation of the merged class uses its first union year's dissolution shares (debt: about 3% of first unions are after 45).
+- **Layout:** every per-cohort and per-year array is flat over cells (`cell · years + year`); interleave nodes are 16 bytes (`lattice::InterleaveTable` carries lengths down the walk) and locate with one division per level (`RationalBeatty::count_member`); alive prefixes are u32 below 2³² (`Prefixes`); the union tables are dropped after the build.
+- **Checks:** `Mono::blind` reproduced the single-cell world's answers bit for bit through every step except deliberate changes (the merged wife classes; then birthdays turned by year, below): `us` blind `af8c5acc63c18ea3`, heritage `2a2f4c305eb8b3bf` (`examples/mono_checksum.rs`, `BLIND=1`; recheck after rebuilding the *examples*: a stale example binary once gave a wrong reference). Exhaustive tests run both worlds and pass on 18 seeds at ×0.0003–×0.01 and on 2–4 seeds at ×0.03–×0.3, adding: ids round-trip, mothers in the child's cell.
+- **Measured** (×1, `perf/society_ab.py` against the speed pass's binary, 5 interleaved rounds):
+  - blind world: memory 10.86 → 7.75 MB (`memory_report`; resident +22 → +10 MB); lookups equal or faster (mother −1%, spouse 0, father 0, children −16%, siblings −15%, p99s −7 to −20%);
+  - heritage world (5 groups + open market): memory 20.2 MB (resident +25 MB vs +22 MB for the old single-cell world); p50 +5–14% (one 10 ns tick: death 81, mother 100, spouse 200, father 300 ns in the gate), p99 +20–43% (its hot set, ~20 MB, exceeds the 16 MB L3); `count_alive` 0.15 ms (2×), build 43 ms (3×). The perf gate's `society` baseline was re-recorded on the heritage world.
+- **Build memory:** eligibility rows are written by the waves straight into per-cell flat arrays (inline arrays for the hand-off from worker threads): per-row heap vectors allocated on workers and freed on the main thread had cost +5 MB resident (glibc arena fragmentation), inline arrays held all at once +11 MB. Resident after the build: heritage +22 MB (the old single-cell world's), blind +9 MB.
+- **Realism (`examples/mono_heritage.rs`):** without migration the composition drifts: alive in 2020 66% White, 28% Black, 1.2% AIAN, 0% Asian, 5% Hispanic (census 2020 ~58/12/1/6/19); e0 by cohort falls 1.5–2.5 years against the blind world (the pack's group mortality factors were calibrated on a population with immigrants). Newlyweds across groups 2000–19: White 6.5%, Black 6.4%, AIAN 45%, Hispanic 31% (Pew 2015: ~11%, 18%, 58%, 27%). Realistic composition needs migration (Phase 4: life cells and movers).
 
-    | Measure | Model | Target |
-    |---|---|---|
-    | natives outside their birth state, 1900 / 1930 / 1960 / 2000 / 2020 | 19.8 / 24.3 / 28.9 / 34.6 / 37.4% | 20.9 / 23.8 / 29.7 / 32.5 / 33.7% |
-    | adults with a parent under 30 mi | 24% (+12.6% coresident) | 59.8% (+5.9%) |
-    | adults 500+ mi from a parent | 21.8% | 9.2% |
-    | born 1990–94, under 10 / 100 mi at 26 against 16 | 39.6 / 65.5% | 58 / 80% |
-    | moving to another area per year, 1950 → 2019 | 1.4 → 2.4% | 3.1 → 1.5% |
+**Names (2026-10-03, Phase 2; `mono/naming.rs`, ported from the ledger world's naming; pack `names.ron`, data `names.bin`):** `first_name`, `middle_name`, `birth_surname`, `surname(x, t)`, `full_name(x, t)`, `marriage_of`/`marriage_date`/`married_at`; kin in one walk: `union_of(x)` (partners, start, end, how) and `parents(x)` (mother, birth, father's union).
+- **First names:** SSA by birth year and sex, split over groups by Census 2020's `P(group | name)` raked to the world's births by group that year (`fit::rake_columns_dense`, stops at 1e-9). Drawn by exact rejection from the year's table (shared by all groups; SSA counts stored cumulative in `NameData`): a name drawn by count is kept with probability its group share over the group's largest. Only a year's rake factors and envelopes are stored (built on first use: ~7 ms per year and sex).
+- **Surnames:** founders from their group's Census column (rare tail spread over rare names); children the father's, the mother's or both by whether the parents were married at the birth; Spanish double surnames; wedding changes by era, age and group; reverts after separations. A surname walks the father's line to a founder.
+- **Birthdays (fixed with names):** every child of a mother shared her birthday (the phase was her death slot). Phases now turn back 0.0937 of a year per calendar year (`year_turn`): siblings differ, consecutive-year siblings stay at least 330 days apart (tested), counts stay closed form.
+- **Checks:** `tests/names.rs` (both worlds: every surname from a parent's line or a founder's table; weddings take the partner's surname or hyphenate; partners agree on the wedding; middle ≠ first; >90% of 1900–39 brides take the husband's name). `examples/mono_names.rs`: top SSA names match within sampling noise (1990 girls: Jessica 2.45% vs 2.57%, Ashley 2.40/2.29; 1950 boys: James 4.82/4.94); top surnames by group follow Census (Smith, Williams, Rodriguez…); women keeping their surname 1.7% (1900s cohorts) to 30% (1990s).
+- **Cost:** `full_name` 5 µs p50, 23 µs p99 warm (perf gate `society/full_name`, budget 100 µs); the first name of an unseen year adds its ~7 ms rake once.
+- **Directory:** `read_person` serves `name`, `birth_surname` (when changed) and `heritage`; every person reference carries its name (`internot/examples/read_person.rs` prints one).
+- **Debts:** no immigrants yet (the pack's foreign names wait for migration); Asian names unused (no Asians without migration); same-sex unions and their marriage rules wait for same-sex unions; in small cells (Hispanic before 1900 at ×1) cousins marry often enough that double surnames sometimes repeat.
 
-    - Leaving home lands a median 4 mi from the mother. After that, the child's own moves spread it: median 17 mi, 90th percentile 680 mi.
-    - The rising cross-area rate comes from the national open (intermarriage) and same-sex markets.
-  - **Local open and same-sex markets** (`unions.ron` `local_open_markets`, default off, so `us` is bit-identical). `us-areas` turns them on, with a 6–10% inter-area share.
+**Households (2026-10-03, Phase 3 step 1; `mono/household.rs`, ported from the ledger world's L3; pack `households.ron`):** `household(x, t)` (a couple's home, or a single adult's spell), `members(h, t)`, `dependent_of`, `chain_end`, `kin_host`, `leave_time`. Rules: dependents live with the custodial parent (the father after a separation with the pack's custody share) or a guardian (grandparent, then eldest adult sibling); units seeking kin live with an anchor; couples in their home; singles alone.
+- **Exact** (`tests/households.rs`, both worlds, 7 seeds × 4 dates at ×0.003–×0.01): `household` and `members` agree both ways; chains end at independent adults.
+- **Cost:** household + members p50 24 µs, p99 204 µs (×0.05).
+- **Realism (`examples/mono_households.rs`) is off where unions are:** 2020 mean household 2.32 people (Census 2.5), 47% of households alone (28%), 44% of 65+ alone (~28%); 1900 4.14 people (4.6), 22% alone (5%). Causes: no re-partnering (widowed and separated people stay single for good: open item 3 below is now needed), no roommates (debt until areas). 18–24 at home 64% (ACS ~55%).
 
-    | Measure | Model | Target |
-    |---|---|---|
-    | natives outside their birth state, 1900 / 1930 / 1960 / 2000 / 2020 | 19.9 / 23.6 / 28.5 / 32.5 / 32.7% | 20.9 / 23.8 / 29.7 / 32.5 / 33.7% |
-    | nearest parent or parent-in-law (PSID counts in-laws): under 30 mi + coresident | 33.7 + 14.1 = 47.8% | 59.8 + 5.9 = 65.7% |
-    | nearest parent or parent-in-law, 500+ mi | 12.1% | 9.2% |
-    | born 1990–94, under 10 / 100 / over 500 mi at 26 against 16 | 39.3 / 68.9 / 13.8% | 58 / 80 / 10% |
+**Residence (2026-10-03, Phase 3 step 2; `mono/residence.rs`, design A forward, ported; packs `residence.ron`, `places.ron`, `data/places.bin`):** `home(x, t)` (place-tree position, dwelling, mail address), `address_of`, `unit_pos`, `unit_dwelling`, `birth_place`, `places()`.
+- **Places:** areas (62) ⊃ commuting zones (588) ⊃ counties or 1M parts (3,215) ⊃ clusters (8,450) ⊃ tracts (83,848). Weights by decade down to counties; clusters and tracts by static shares (the data scales 2020 tract shares by county populations), so the tree is 7.5 MB with names, ZIPs and streets, built on first use in 25 ms.
+- **`places.bin` v3** (`data/distill_places.py`): adds each tract's ZIPs by land area (Census 2020 ZCTA–tract relationship), each ZIP's postal place (GeoNames postal codes, CC BY 4.0: credit www.geonames.org) and 20,000 street names by TIGER 2025 frequency (named streets with a type). The tree part is byte-identical to v2.
+- **Units** are first unions (named by the wife) and single spells (0 before the union, 1 after); households live at their anchor unit's position. A unit starts near its source (the household left, one partner's household, or the union's home kept or left after a separation); positions over time by nested regeneration: local moves at four levels by gravity around the unit's anchor, long moves (to another area) by the driver's Poisson stream landing in the lineage region of the area left with the pack's share. Founders' units are seeded by weight in 1840.
+- **Addresses:** a dwelling is the unit that moved in and when (a kept home keeps its source's dwelling); its house number and street are keyed by the dwelling, its ZIP drawn from the tract's by land area. "78 Robin Ln, Belmont, MA 02478" → Cambridge → Leominster → "2126 Cross St, Lunenburg, MA 01462".
+- **Exact** (`tests/residence.rs`, both worlds, 6 seeds × 4 dates): everyone alive has a home; positions are tree paths; household members share the address; addresses are stable across calls and within a stay.
+- **Realism (`examples/mono_residence.rs`, ×0.05):** movers in a year 20.5% (1900), 19.1% (1950), 8.6% (2023) (targets 20%, 20%, 7.8%); living outside the birth state 43–56% (21–34%); adults 25+ with a parent within 30 miles 33–44% (59.8%); born 1990–94, within 100 miles at 26 of where they lived at 16: 68% (80%). The misses are national pairing: partners come from anywhere, so one moves at every union (the design-A finding). Fix: areas as cells of the kinship world with migration (the global spec's P10–P11).
+- **Cost:** `address_of` p50 ~100 µs, p99 ~190 µs (the source chain's positions; memoized per unit up to 32k units). Memory when used: places 7.5 MB, gravity kernels 0.7, move-rate tables 1.5, memos ≤ 3.2.
+- **Directory:** `read_person` serves `home` (address, city, state, ZIP, county, since) and `household` (the others living there).
+- **Debts:** no rosters (who lives in a place) until areas; street names national (not by county); no same-tract moves; founders who are minors in 1840 live alone; roommates.
 
-    - Coresidence with parents is overcounted by L3 (14% against 6%).
-  - **Founder decision (2026-10-01): finish B (steps 2–4), then calibrate, fix build performance, and make `us-areas` the default.** Partners paired across a whole area stays a known gap (zone-level pairing was not chosen).
-  - **The question, as it stood** (2026-10-01): what's left is mostly *within* areas.
-    - Partners are paired across a state-sized area, so one partner usually relocates 100+ mi; research §5d says 75% of couples lived within 50 km.
-    - Steps 2–4 (migration classes, couple moves, upbringing area) improve cross-area consistency, where realism is already close.
-    - Within-area partner locality needs pairing at zone level (588 zones), which multiplies ledger cost again.
-  - **Debt:**
-    - the ledger build at 62 areas is 40 s and 5.2 GB;
-    - the cross-area move rate rises over time (1.3 → 1.9%) where CPS falls (3.1 → 1.5%); calibration pending.
-  - **Stages 2b and 2c built (2026-10-01):** births by area with cross-group parent lines, and migration classes as native cohorts (spec §6). Details and numbers are in spec §7.
-  - **Ledger defects found at full scale, fixed (2026-10-01).** They were mostly already in the ledger and showed once 62 areas × 5 heritages made blocks thin. Before the fixes, `us-areas` had 5.2M people against 13.8M, and deferred 21% of pairs:
-    1. **Caps:** the cap was `⌊expected never-partnered⌋` per market, so small pools were starved. It is now rounded up, keeping the integer bound on members available. `us-tiny` had lost 18% of its solved couples.
-    2. **Founders' first year:** that market was capped by the *never*-partnered, so in `us` only 25% of women born 1800–1819 were ever partnered. Founder pools are now `founding` during it.
-    3. **Deferral:** an isolated couple's want is now carried to next year, so the union is delayed, not lost. Before, `us-tiny` lost a quarter of its pairs this way.
-    4. **Arrival couples:** rounded with core `partition::round_unbiased` (new: `⌊x + u⌋`, keyed).
-    5. **Residual deaths:** second-union members were subtracted twice (a source index read as a cohort index), so the never-partnered died too young. In area mode, 84.5% of women born 1980 reached 50, against 94.5% in `us`.
-    - Area mode also needed: `settle` takes each market group's exact count; divorced sources record each remarriage part's area; the first year's cells are sorted.
-    - **Default worlds changed** (realism report diffed against the old behaviour; temporary `LEGACY_*` env switches reproduce the old fingerprints exactly):
-      - population 13.8M → 17.3M (the founders now have their unions);
-      - ever partnered, 1970 cohort: 89.1 → 91.1%;
-      - men's e0, 1970–2010 cohorts: +0.8 to 1.4 years (the residual fix);
-      - same-sex couples in 2019: 1.43 → 1.68% (ACS about 1.5%; recalibrate);
-      - other measures move within noise.
-    - **New fingerprints** (after the build work below): tiny `f6eb885c416edd0c` / `1f61e7c1386778d9` / names `d894734870db2d8f`; prototype `2e34fbc85c3bc774` / `be7cd490145a4249` / names `4e44d4de2914f815`.
-    - **`us-areas` now matches `us`:** women born 1980 reaching 50, 94.7 against 94.5%; ever partnered among them, 89.2 against 89.6%; 16.5M people.
-  - **`us-areas-tiny` is four areas** (PA 1, PA 2, OH 1, OH 2), from `internot_society/data/make_area_test_pack.py`: a subset of the place tree, extending `us-tiny`.
-    - With all 62 areas, blocks held a few people, and pairwise kin repair could not avoid siblings: two full siblings ended up in a two-couple cell whose other pairing was also related.
-    - The exhaustive kinship suite passes on it (`TEST_PACK=us-areas-tiny`) and on `us-tiny`.
-  - **Close kin at prototype scale is rare but not zero** (`examples/kin_debug.rs` checks every couple in parallel, about 35–50 s):
-    - `us`: 1 sibling couple in 9.0M (old behaviour: 0 in 7.1M);
-    - `us-areas`: 5 in 8.7M, all full siblings born 1910–1920 in small groups (AIAN, Hispanic) in small areas.
-    - Each is a repair pair in which both pairings are related; in `us` the pair sat in a six-couple cell. R1's "zero on the full prototype" was luck, not a guarantee: pairwise repair fails at about 10⁻⁷ per couple, more where blocks are thin.
-    - **Founder decision needed:** accept it as measured debt; or repair groups of three (much rarer failures; about +50% `related` calls per partner lookup); or check small cells at build time and re-key failing ones (year order, since kinship depends on earlier repairs).
-  - **Build time: `us-areas` 475 s → 63 s** (`us` 5.5 s), each step but two checked bit-identical by fingerprint. Phase timers, not pprof (it misattributed twice), found the costs:
-    - **Caps** rescanned a pool's cohorts on every call (about 1,100 markets a year, each capping every row and column). Pools now cache each area's availability and wants once a year (`Pool::refresh`, sorted per area), kept current by `settle`, which works on each area's cohort list.
-    - **Empty rows** (most seekers get no couple in a given market) were capped and hashed anyway; they are skipped.
-    - **`record`** walked every block for each market group's side and allocated arrays sized by the largest block id; it now splits the slices at the group's blocks and sorts.
-    - **Rounding** built a `classes × columns` cumulative table per market. Core `GroupedIpf::{columns_by_class, class_weights_cumulative, round_row}` (new, with tests and golden values) rounds in two levels, over column classes and then within a class: the same law, different bits (one of the two world-changing steps; the other is the founding-capacity fix).
-    - In parallel now: rates, availability and seekers per pool; each market's participants; mortality (the living still summed in pool order). The open-market shares and the age-gap kernels are tabled once.
-    - **Left:** the class IPF is about 190 s of CPU (272k solves, 48 passes on average, 63% stopping at the 60-pass cap; the row-margin error is 5e-5 of the mass at 60 passes, 0.24% at 20, 1.9% at 10, so the passes stay). Warm starts from last year's factors, or over-relaxed Sinkhorn, would reach the same fixed point faster; later.
-  - **Memory is the next blocker for making `us-areas` the default:** peak RSS 9.3 GB against 2.9 GB for `us`. The ledger alone is 4.9 GB (1.6 GB for `us`) and the world's layouts add 4.4 GB.
-    - The ledger holds 9.5M union cells (61% of one couple), 16.4M partner slices, 2.9M cohorts and 5.9M divorced sources, each cell with three small heap vectors, and the world keeps the whole ledger.
-    - Fixes to weigh: arenas instead of per-cell vectors; dropping what the world doesn't read after its build.
-  - **L3 in area mode:** `World::migration(x)` gives a native's single long move, `(destination, time)` at a keyed time in the class's move year, if they are alive and never partnered by then. Leaving home is the earliest of independence, first union and that move.
-  - **Tests on other packs:** `TEST_PACK=<pack>` runs the kinship and household suites on any pack in `worlds/` (default `us-tiny`). Both pass on `us-areas-tiny`.
-    - The household suite's "kinless orphan" check now matches the guardian rule: an adult sibling counts only if on their own. A paternal half-sibling still living with his own mother is not a guardian.
-  - **Stage 3 BUILT (2026-10-01): couple moves in the woman's plan leaf** (spec §8).
-    - `ledger::CoupleMoves` splits each women's plan leaf over "stays" and `(move offset, destination)`, by keyed systematic apportionment. The move year's chance is the long-move rate at the woman's age; destinations follow `Migration`.
-    - The ledger records each birth in the area the mother lives in that year. The world splits the same leaves (`move_key`), builds its birth-line area runs per leaf, and keeps a sorted table of moving leaves.
-    - `World::couple_moves(x)` gives each union's move, aligned with `unions(x)`; a widow still moves. `World::union_birth(x)` tells plan births from non-union ones.
-    - **Tests:** the exhaustive suite passes on both packs, now 12 tests. The new test checks that both partners see the same move and that this union's later plan births are in the destination. On `us-areas-tiny`, 25.5% of unions move during the union (1900–1990, before calibration).
-    - **v1 debt:**
-      - one move per union;
-      - same-sex couples don't move;
-      - the divorced re-partner in the formation area;
-      - a non-union birth to a woman whose union moved is placed in her cohort's area, not where she lives.
-    - **Cost:** `us-areas` build 64.6 s, 9.4 GB; default worlds bit-identical.
-  - **Stage 4 BUILT (2026-10-01): residence on the ledger's areas** (spec §9). Invariant: everyone independent lives in their ledger area, `World::area_at(x, t)`.
-    - **Upbringing area:** a child's block is the area of their upbringing, where the family lives at 18 (`ledger::upbringing_moved`): the couple's destination if the move comes by then and the couple hasn't separated by then.
-    - **Couple moves:** a couple's move is made by whichever partner is alive (the family moves).
-    - **Residence** (area mode) takes every move between areas from the ledger: the change points of `area_at`. These are a single's migration, the couple's move, and a widowed partner's return to the formation area at the couple's planned separation. Its own long-move flows are off.
-    - **Sources:**
-      - a union keeps or forms near a partner's household only if the household is in the cell area, otherwise it is fresh there;
-      - a first single spell starts near the household only if the household is in the person's ledger area, otherwise fresh there;
-      - a separated couple that had moved returns near where it formed (`Source::Back`).
-    - **Closures** take ledger entries, a superset that is cheap to enumerate:
-      - first spells of the area's blocks (natives and immigrants) and of migrants into it;
-      - `World::unions_formed_in`;
-      - `World::couple_movers_into`, either partner;
-      - widowed partners returning at the planned separation.
-    - **L3:**
-      - leaving home also happens when the parents' household moves after the child's upbringing year;
-      - kin hosting only joins kin in the same ledger area;
-      - roommates must be counted in their frame's area (`roommate_ok`).
-    - **Tests:**
-      - `TEST_PACK=us-areas-tiny`: residence rosters equal brute force (2 seeds × 7 years);
-      - a new test checks that every independent person lives in their ledger area: 109k in their own homes, 364 roommates, 5,160 kin guests, zero elsewhere;
-      - the kinship test checks that every union forms in the woman's ledger area except the move-year window (1.1%: a migrant partnering before her move date);
-      - every suite passes on both packs; default fingerprints unchanged.
-    - **v1 debt:**
-      - divorced and widowed singles don't move between areas;
-      - the divorced return to the formation area;
-      - no moves to kin in another area;
-      - migrants have no roommates in their new area;
-      - the household suite on the area world runs 66 s against 32 s (`couple_moves` in `leave_time`).
-  - **Realism of `us-areas` after stage 4** (`examples/residence_realism.rs`, uncalibrated):
+**Education (2026-10-03, Phase 5; `mono/education.rs`, `mono/schools.rs`; pack `education.ron`, data `data/schools.bin` from `data/distill_schools.py`):** `education_level` (final), `education_at(x, t)` (completed by then), `schooling_at(x, t)` (kindergarten, grade, college or graduate year), `education_path` (dates), `school_at`, `college_of`, `graduate_school_of`, `education_history(x, until)` (stints at institutions), `institution(i)`.
+- **Levels:** less than high school, high school, some college, associate, bachelor's, master's, professional, doctorate. Final attainment by cohort and sex (1940/1947 census, CPS, ACS 2023), each group's thresholds shifted by its log-odds by cohort (proportional odds), associate and graduate splits by cohort.
+- **Family and partners without recursion:** `z = √own·ε_x + √parents·ε(mother's union) + √grandparents·(ε(mother's mother's union) + ε(father's mother's union)) + √union·ε(own union)`, a woman's union key her own (so a mother's children share it with her and her partner). With weights 0.10/0.35/0.05/0.45: mother–child latent 0.54 (target 0.55), partners 0.43 (0.65–0.73), siblings 0.45 (0.6). An age-only pairing can't reach all three with O(1) keys; the balance is a pack choice. (Assortative pairing in the kinship layer would need education-sorted couplings: noted as a design direction, not built.)
+- **Timeline:** grade 1 from a September cutoff (later before 1930), kindergarten by era, leaving without a diploma at the era's age ± spread, college on time or late (exponential delay), programs' lengths, graduate school after a gap. Calibrated: enrollment 1910 at 13/14/15/16 = 100/88/61/32% (89/81/68/51), 2020 at 17 = 93% (95); BA at ≤23/24–29/30+ = 58/28/14% (63/21/15).
+- **Institutions:** 89,220 public and 9,543 private K–12 schools (CCD 2024–25 with EDGE locations, PSS 2023–24) and 3,865 degree-granting colleges (IPEDS HD2023, EFFY2024). K–12: the nearest school offering the grade to home that September (private with the era's share); college by enrollment × `(1 + miles/15)^-1.8` from home at entry, 78% in the home state, two-year colleges for most who stop at some college; graduate school more national. Histories merge consecutive years at one school ("Waterloo Elementary K–4 → Waterloo Intermediate 5–6 → … → University of Wisconsin-Whitewater, left without a degree").
+- **Exact** (`tests/education.rs`, both worlds and both packs): completed levels never fall and end at the final level; enrollment only within the path's dates; histories ordered without overlap.
+- **Realism (`examples/mono_education.rs`):** BA+ by group for cohorts 1945/1975/1990: White 36.5/46.3/50.5 (35/44/47), Black 17.7/27.1/28.9 (20/29/29), Hispanic 16.2/22.2/26.5 (15/21/25), AIAN 19/22/18 (16). Overall attainment follows the world's composition (too few college graduates while the composition lacks migration).
+- **Cost:** level ~1 µs, schooling at a date ~1 µs, a history 0.25–0.5 ms (a home lookup per school year); institutions 8.5 MB when first used (40 ms).
+- **Directory:** `read_person` serves `education` (completed, enrolled, history with institutions).
+- **Debts:** today's institutions serve every era; no grade retention; no immigrants' bimodal attainment until migration; residence's founders now live from birth (units seeded when they start) so worlds whose first year is late (us-tiny) have homes before it.
 
-    | Measure | Model | Target |
-    |---|---|---|
-    | West's share, 2020 | 8.8% | 23.7% |
-    | natives outside their birth state, 1900 / 1960 / 2020 | 33 / 40 / 36% | 21 / 30 / 34% |
-    | nearest parent or in-law under 30 mi, coresident included | 44.0% | 65.7% |
-    | born 1990–94, under 10 / 100 mi at 26 against 16 | 39 / 72% | 58 / 80% |
-    | moving to another area per year, 1950 → 2019 | 1.5 → 0.8% | 3.1 → 1.5% (now falling, as it should) |
+**Work (2026-10-04, Phase 6; `mono/work.rs`; pack `work.ron`, data `data/work.bin` from `data/distill_work.py`):** `career(x)` (spells from 16 to death), `work_at(x, t)`, `employer(x, job)` (on demand), `employer_info`, `job_title`, `occupation_info`, `pay_at`, `nominal`.
+- **Career:** windows of schooling, keeping house and disability, then work. Students (from 16, and in college and graduate school) alternate part-time jobs with time out at the year's student share. Some women stay home before their first union, and others after a union or first birth, returning by cohort when the youngest child is about 6. Disability is a yearly hazard by age times an era factor, with returns. Work stretches walk jobs of lognormal length by starting age (NLSY79 completions), then a direct move (45%), a break (8%) or a search (lognormal weeks). Retirement age comes from each cohort's survival curve of working, by sex (`interp::inverse_decreasing`; cohorts interpolate the quantile's age).
+- **Occupations and titles:** ACS 2023 PUMS shares by sex, age band and education, SOC major groups scaled by era factors (farm ×38 in 1900, factory ×3 to 1950, computing from 1950). Titles: 25,600 from the Census 2022 occupation index (coding notes, abbreviations, inverted forms such as "Flight Attendant Ramp", activities such as "Farming" and dated forms dropped), restricted to their industries, weighted by the ACS 2019 public-use write-ins (10,449 records), plus the occupation's own name made singular for a third of draws ("Registered Nurse", "Truck Driver"). A title is kept across jobs in the same occupation where it fits.
+- **Employers:** K–12 teachers and anyone in the school industry at the nearest school offering a grade; college staff at a college by the education gravity; the self-employed at their own business; government workers at their county, state or the federal government; everyone else at an establishment `(county, industry, size class, index)`, the county the home's (or with 25% another of its commuting zone), the index below the class's establishment count there. Lines of business: 16,400 from the Census industry index ("Pizza Parlor", "Structural Iron Work"). Names come from the pack's patterns by NAICS prefix, after a place-like line 60% of the time ("Byrne's Diner", "Jefferson Blood Analysis Laboratory", "Blancher Freight Lines", "Hargrove & Sons").
+- **Pay:** the occupation's median full-time wage (ACS) × an experience curve × the real-wage index × exp(occupation sd × (0.9 person + 0.44 job)); nominal by CPI-U (Minneapolis Fed estimates before 1913).
+- **Exact** (`tests/work.rs`, both packs, several seeds): spells contiguous from the start to death, non-empty; jobs numbered in order; part-time exactly within schooling; retirement last; `work_at` is the spell in force; deterministic; employers resolve with names, and K–12 teachers work at schools. `internot/tests/directory.rs` checks the served records (current job, earlier jobs ordered without overlap, pay > 0).
+- **Realism (`examples/mono_work.rs`, ×0.05), model/CPS:**
+  - participation 16+, women/men: 1950 35/83 (33/87), 1970 44/75 (43/80), 2000 58/73 (60/75), 2023 54/65 (57/68);
+  - by age band, mostly within 5 points; worst: women 35–44 in 1970 60 (51), women 16+ in 1900 26 (~20), men 65+ in 2023 20 (24);
+  - unemployment 3–5%; median tenure 25–34/45–54 2.5–3.3/6.3–7.2 years (BLS 3.0/7.0); farm share of jobs 42/13/4/0.7% in 1900/1950/1970/2023 (38/12/4/~1);
+  - jobs held, born 1957–64, at 18–24/25–34/35–44/45–54: 5.2/3.6/2.5/1.9 (NLSY79 5.6/4.5/2.9/2.2).
+- **Cost** (perf gate, ×1): `career` p50 12 µs, p99 32 µs; `work_at` 6/29 µs; `employer` with its name and place 140/230 µs (a home lookup). Occupation tables 2.1 MB, loaded on first use. Kinship lookups unchanged (interleaved A/B against the names-era binary: identical answers, p50s within a 10 ns tick). The gate's committed baseline predates names; its p99s for father, children and count failed on a hot machine (88 °C) and passed the A/B, so the baseline needs re-recording on a cool machine (it will then include `full_name`, `career`, `work_at` and `employer`).
+- **Establishment sizes follow the sample (fixed 2026-10-04):** counts per (county, industry, class) use the county's real weight times `sample_share(year)` (the world's alive over the places' total by decade: ×1 is 0.022 of the US), so a 1,000+ class establishment at ×1 has about 2% of a real one's staff; before, every class had ~45× too many establishments at ×1.
+- **"Who works at E at t" has no index** (`examples/mono_roster_scan.rs`): a full scan at ×1 (5.8M adults, 3.4M employed, 16 threads) takes 10 s: enumerating the alive 0.05 s, `work_at` for each 9.7 s (~27 µs per person per thread), employers of the ~20k in the industry 0.3 s. Linear in population: about 7 minutes at the US's real scale. An answer in time proportional to its size needs rosters (open item 0) and a monotone job-to-establishment coupling inside them.
+- **Data** (git-ignored `datasets/census_io/`, public domain, from `https://www2.census.gov/programs-surveys/demo/guidance/industry-occupation/`): `Census-2022-Occupation-Index_Final.xlsx`, `Census-2022-Industry-Index_Final.xlsx`, `pub-io-write-ins-acs2019.xlsx`. BLS refuses scripted downloads (the SOC direct-match titles were not used).
+- **Debts:** no co-workers (rosters, open item 0): two workers drawn to the same establishment share it and its name, but nothing lists who works there; establishments have no open or close dates; lines of business uniform within an industry (a "Leprosy Hospital" now and then); part-time work only for students; no occupation by heritage group beyond education; pay ignores sex and region.
 
-  - **Founder decision (2026-10-01): calibration only needs to be close; focus on performance and features.** Fix gross defects with cheap levers; no calibration machinery (such as a doubly constrained gravity fit) unless asked.
-  - **Memory work (2026-10-01), every step bit-identical (fingerprints and the `lookup_timing` checksum):**
+**Open, in order:**
+0. **Areas and rosters (founder decision, `research/2026-10-04-areas-and-rosters.md`).** Coworkers, classmates, neighbours, friends and realistic residence all need a counted index of the people of a place, which the life-order index isn't. Options: (A) areas as kinship cells built lazily (~4 MB per cell: the US's 310 cells would be ~1.2 GB eager, ~20 MB per area touched); (B) areas as runs inside group cells (memory as A or on-the-fly eligibility; the cell world measured 5–20× slower lookups); (C) computed classes: per-cell state from a few numbers per cohort and shared tables (~64 B per cell cohort), lookups maybe 1.5–3× slower. Recommendation: prototype C's mother and death lookups, then A on top of C. Until decided, roster-free features are built.
+1. **Birth and mother at 2×** (founder decision): accept ~1.56× (bulk ~1.8×), or add per-block tables (~16–33 MB, still flat in population) that put each birth-order bucket's mother class constants in one cache line.
+2. **Sibling couples:** about 15 per world at any scale (random pairing between cohorts). Founder's choice: accept as debt, or a lookup-time check (~0.1–0.5 µs per spouse lookup).
+3. **Remarriage** under option A: widow availability per (husband cohort, year) is a floor-sum count; divorcées per (wife class, duration). Design: `thinking/claude/008`–`010`.
+4. **Rebuild on the monotone world** (the global world's phases): migration (life cells and movers, which the heritage composition needs), same-sex unions, areas, names, households, residence, education, work, ties.
+5. **The infant band in closed form.**
+6. **Calibration:** 31–37% of wives are older than their husbands (target ~22%).
 
-    | | `us-areas` RSS / peak | `us` RSS / peak |
-    |---|---|---|
-    | before | 9.6 / 9.6 GB | 2.95 / 2.95 GB |
-    | after | 5.6 / 6.3 GB | 1.5 / 2.2 GB |
+### Removed worlds (history, 2026-09-30 → 2026-10-03)
 
-    - `World::memory_report()` (printed by `examples/build_time.rs`) gives heap bytes and allocations by component.
-    - **Ledger detail freed:** `World::build` hands each block's ledger detail (union cells, divorced sources, mothers), which only layouts read, to its layout build and frees it after. `World::build_keeping_ledger` keeps it, for the kinship suite, `world_fingerprint` and `realism_report`.
-    - **Shared life tables:** one per (birth year, heritage), not per block.
-    - **Cohort arenas:** each cohort's sub-cells, coarse starts, non-union plans and parent line now live in per-block arenas. This took allocations from 19M to 2.5M.
-    - **Tight arrays:** layout arrays are shrunk to fit, and glibc's `malloc_trim` runs after the build.
-    - **Tried and dropped:** mimalloc as the global allocator. It gave higher RSS (`us` 2.8 GB, `us-areas` 6.3 GB) and only an 8% faster build.
-    - **Left in `us-areas`:** about 1.5 GB of build-time fragmentation, plus the biggest components: birth rows 620 MB (dense ages × plan columns), cells 609 MB (64 B each, by design), cohorts 492 MB (2.9M, from migration classes), sources 367 MB, sub-cells 308 MB, ledger cohorts 271 MB.
-  - **Lookups in area mode, about twice as slow as `us`** (p50/p99, µs): father 10/31, union 10/30, children 4/54, siblings 5/69, household 1.5/275, `area_at` 11/65. `couple_move_of` resolves one union's move without the partner's full union list, which halved `area_at` and the household tail.
-  - **Open:** build time (68 s for `us-areas`); lookups; making `us-areas` the default.
+Removed 2026-10-03 and archived in `.scratch/archive/2026-10-03-old-worlds/` (exact working-tree copies, many never committed) and git history (commit 3341d97 and earlier):
+- the ledger world: `world.rs`, `ledger.rs`, `plan.rs`, `household.rs`, `residence.rs`, the naming in `names.rs`, with the old directory service, the perf `kinship` suite and many reports;
+- the pure world, the transport world and the cell world (`zero.rs`).
 
-**Directory cutover: v1 DONE (2026-10-01)** (founder chose it as the next feature; spec `specs/2026-10-01-directory.md`).
-- `internot` serves the society world. `Universe::society` is built once per process (`INTERNOT_PACK`, default `us`; `INTERNOT_SEED`, default 42).
-- **The `directory` service:**
-  - `read_person`: names, with surname changes; birth, death and age; heritage; immigration; partner; unions with marriage dates; parents, children and siblings; the household with members, relations and address.
-  - `read_household`.
-  - Both take `at` (ISO 8601), defaulting to the Universe's `now`.
-- **Removed:** `people` (with its tests and the leaked name files). Its other data files (NAICS, SOC, CIP, languages, time zones, hobbies) stay in `internot/data/`, unused for now.
-- **Tests:** `internot/tests/directory.rs` runs every view through the JSON registry on `us-tiny`. Partners, parents and children, and household members agree both ways; time travel and errors are covered.
-- **MCP smoke test over stdio:** the server is ready in 6.9 s (`us`); `read_person` takes 22–32 ms.
-- **Debt:**
-  - no rosters ("who lives here") and no name search (needs an index);
-  - residence's memo caches grow without bound in a long-running server;
-  - no individual attributes yet.
-- **The proposal, as it stood** (spec §8):
-  - A person's ledger area is static: their block's area, or the destination of their last counted long move.
-  - The ledger counts residents per (block, area, year) and pairs by ledger area.
-  - Long moves become origin-keyed, and roommate frames go local.
-  - Design A stays inside areas.
-- **Kinship lookups have slowed since the R1c gate** (median p99, measured by the core-migration A/B, the same before and after the migration):
+Their designs, measurements and proofs stay in `docs/superpowers/plans/`, `specs/` and `research/` (including `research/2026-10-02-cell-world-math.md`, `research/2026-10-01-pure-world.md`, `research/2026-10-02-transport-world.md` and the Lean files in `research/proofs/`).
 
-  | Query | Now | At the R1c gate |
-  |---|---|---|
-  | death | 3.3 µs | 1.77 µs |
-  | father | 16.6 µs | 12.3 µs |
-  | children | 28.2 µs | 15.2 µs |
-  | siblings | 37.6 µs | 22.4 µs |
+Lessons carried into the monotone world:
+- kin repair needs exactness by construction;
+- the census survivors convention;
+- areas need residence-aware pairing (the B decision of 2026-10-01);
+- the residence design A of closed units (`specs/2026-10-01-residence.md`).
 
-  The likely cause, not yet profiled, is the five heritage groups multiplying blocks and cells. This joins the deferred performance debt; size the budgets to workloads when it is picked up.
-- **Math moved to `procedural_core`: DONE (2026-10-01)** (founder request). APIs are in the reference below ("Layer 0.6").
-  - `fit` (new): `ipf`, `GroupedIpf`, `rake_columns` / `raked_weight`, `tilt_mean`.
-  - `partition`: `round_systematic_cumulative`, `SparseCounts`, `sweep_capped`, `apportion_largest_remainder` (+ `_capped`), `trim_largest_first`.
-  - `table` (new): `CumTable<T>`.
-  - `stream`: `nested_regen`, `nested_regen_state` (new; tested against a full replay).
-  - `internot_society` now calls these. Its own copies are gone: `ledger::{ipf, scale_cols_and_sum_rows, Sparse, sweep, apportion_capped, trim}`, `plan::apportion`, `params::tilt`, `names::Table` and the names raking loop.
-  - **Bit-identical, checked:** `world_fingerprint` (now also hashing first and middle names, marriage dates and surnames at four dates) gives tiny `4734ebc318bcef8c` / `ed3c73a58212a955` / names `e894610a479cd2e5` and prototype `4b4b0fc1e69824f0` / `824be8ce7c830c39` / names `91447aced082ca14`, before and after. The `lookup_timing` sum is `200ecbd68ce20f73` both times.
-  - **World build:** 4.59 s after against 4.67 s before (min of 3).
-  - **Not unified:** names raking and dense IPF reach the same fixed point but iterate differently (factor form with a fixed 60 passes, against matrix form with a tolerance), so merging them would change the worlds. Both are kept, and the docs say how they relate.
-- **Round 2, "all math in procedural_core" (founder, 2026-10-01): DONE, bit-identical.** Every generic formula in `internot_society` and `internot_def` moved; the world fingerprints, names hash and `lookup_timing` sum are unchanged.
-  - **New core modules:**
-    - `interp`: `bracket`, `lerp`, `log_lerp`, `piecewise_linear`, `piecewise_log_linear`, `step_at_most`, `step_below`, `interval_value`, `first_above`;
-    - `life`: `survival`, `survivorship`, `first_event_pmf`, `cumulative_incidence`, `cure_hazard`, `Siler`, `stable_age_weight`, `add_conditional_deaths`, `invert_survival`, `invert_cumulative`;
-    - `curve`: `log_logistic_cdf`, `logistic_rise`, `logistic_floor_quantile`, `gaussian_bump`, `gaussian_kernel`, `ramp`, `rogers_castro_labour`, `symmetrized`, `dilated`;
-    - `pmf`: `normalized`, `floored`, `mix_into`, `one_fewer_or_none`, `spread_evenly`, `cumulative_normalized`, `positive_mass`.
-  - **Additions to existing core modules:**
-    - `table`: `Coarse`, `CoarseRow` (`first_fail`, `count_le`), `coarse_index`, `coarse_len`, `BucketIndex`;
-    - `sample`: `exp1_by_inversion`, `pick_linear`, `lazy_conditional`;
-    - `partition`: `pair_group`, `even_parts`, `segment_offset`, `locate_in_segments`;
-    - `perm`: `least_cost_assignment`;
-    - `stream`: `Epochs`;
-    - `bits`: `ones`.
-  - **Where each came from:**
-    - `internot_def` `Series`/`VecSeries`/`Steps`/`Bands`/`Ranges::at`. `internot_def` now depends on `procedural_core`.
-    - `params`:
-      - `interp_with`;
-      - mortality's log-linear multipliers, the Siler hazard and its year integral;
-      - first-union log-logistic and cure hazard;
-      - gap-kernel symmetrizing and dilation;
-      - parity shift, offset mix, non-union Gaussian, dissolution lerp and band spreading;
-      - Rogers–Castro;
-      - `normalized` and `floored`;
-      - the independence logistic quantile and the households' logistic, Gaussian and ramp curves.
-    - `ledger`: `period_survival`, `never_partnered_share`, stable-population weights, arrivals' ever-partnered share, `bits`.
-    - `plan`: `union_age_density`.
-    - `world`:
-      - `Coarse`, `Indexed`, `coarse_index`, `invert_survival`, `invert_cumulative`;
-      - the id buckets, `repair_group` and `PERMS` / `least_related`'s search;
-      - life-table construction, the residual's conditional deaths and cumulative;
-      - the two-stage death draw, the birth-row coarse search, the same-sex band pick.
-    - `household`: the epoch grid, band offsets and `CHUNKS` (now `even_parts`).
-    - `names`: the exponential marriage delay, the legal-year crossing, the group shares.
-  - **What stayed, and why:**
-    - **Ledger projection pools** (`CohortPool`, `DivPools`, `Pool::want/cap/settle`): bookkeeping of expected and counted members per cohort; no formula beyond sums and floors.
-    - **Market structure, `clear_year`, `class_cells`, `split_classes`, `deisolate`, `defer_isolated`**: ledger ontology (who meets whom, which cells exist).
-    - **Plan partitions** (`PlanShares`, `leaf_births`, `arrival_plans`, `nonunion_plans`): domain compositions of core apportionment.
-    - **Kin repair's predicates** (`related`, `same_mother`, group walks): kinship ontology. Only the permutation search moved.
-    - **`Repartnering::hazard/base`, `nonunion_count_pmf`, `class_pmf`'s share scaling, `status_affinity`**: products and caps of pack factors, the wiring from pack to core.
-    - **The surname "rare tail" lift**: a correction for the Census file's unlisted 12%, a data quirk rather than a method.
-    - **Rounding of expected counts** (`(rate · alive).round()`): one rounding per pack-scaled count.
-    - **`partition_point` searches over the crate's own arrays** (slices, leaves, cohorts): std binary search on data layouts.
-    - **`Leaf` bit packing and the other layouts**: data layouts.
-    - **`internot_def` validation**: checks, not math.
-    - **Timestamp placement within a year** (`year_start + key.below(...)`): a keyed uniform offset.
-  - **Speed:**
-    - `lookup_timing`, interleaved A/B against HEAD (3 runs each, median p99): death 3.0 against 3.3 µs, mother 1.78 against 1.75, father 16.7 against 16.6, union 15.4 against 15.2, children 28.3 against 28.2, siblings 37.9 against 37.6. All within run-to-run noise.
-    - World build, interleaved, min of 4: 4.63 s against 4.64 s.
+**Found defect in the removed ledger world (from Tursi):** natives of the 1880 cohort were 99.9% partnered by 50, against the pack's 92% and the ledger's own hazard. Recorded in case the ledger is ever restored.
 
-**Blocked on founder decisions** (each written up, with options and a recommendation):
-0. ~~Kinship current-status calibration~~ **Decided 2026-09-30: do what is realistic, statistics not rules** (see Direction). Immigrants arrive as they are and partner at rates for people like them. Being worked on (R1d, below). The original question: Too many people are divorced and single at 45+ (Census A1), and older single immigrants count as never partnered. Recommendation:
-   - (a) recalibrate R1c's re-partnering hazard to current-status targets (A1 divorced by age, plus cohabitation). It was calibrated to remarriage only, while unions include cohabitation.
-   - (b) give older single arrivals a previous union abroad (divorced or widowed), so they enter the re-partnering markets.
+**Standing decisions that still apply:**
 
-   Then reassess widowed re-partnering and third unions (now capped at two unions).
-1. ~~Residence and households~~ **Decided 2026-09-30: option B now, C prototyped as its upgrade** (`research/2026-09-30-residence-enumeration-problem.md`).
-   - Kinship is exact by lineage region.
-   - Residence is dynamic: exact per person and per address, with moves drawn from candidate tiers (same city, same lineage region, national).
-   - The ledger counts unions and births, not moves. This revises D2.
-   - C (a first home derived from the parents' address) is prototyped against the move-distance and distance-to-parent targets before it replaces B.
-   - Households (L3) are unblocked.
-2. ~~Re-partnering (R1c)~~ **Decided 2026-09-30: divorce re-partnering now, widowed later** (`research/2026-09-30-repartnering-exactness-problem.md`, §4 item 1).
-   - Dissolution becomes a partition of each partner slice, exact on both sides. This replaces D-R1.3's "plan independent of partner".
-   - Fertility plans are conditioned on the divorce year, per (cell, dissolution year) sub-cell.
-   - Kin repair (all three layers) runs within sub-cells.
-   - A second-union market pairs the divorced with each other and with the never-partnered.
-   - Widowed re-partnering is deferred; the later option is counting deaths of partnered people under 55.
-   - Prototype on the tiny world with the exhaustive kinship suite first. `siblings()` must then add a father's other children.
-3. ~~Name data~~ **Decided 2026-09-30: public-domain sources only.**
+- **Name data (decided 2026-09-30): public-domain sources only.**
    - First names come from SSA baby names by sex and birth year (1880–2023; earlier births reuse 1880).
    - Surnames come from Census 2010, weighted by heritage through its race/Hispanic shares, and are inherited through the new family tree.
    - The old `internot/data/{first,last}_names.json` had unrecorded provenance and likely derived from the 2021 Facebook leak (via `philipperemy/name-dataset`). It served only the old `people` crate and was deleted at the cutover (2026-10-01). Never restore it.
@@ -848,22 +464,18 @@ Adding the service automatically: registers spaces on the right world, exposes v
      - `Names2020_FirstNames_Sex.xlsx` and `Names2020_FirstNames_RaceHispanic.xlsx`: 53,616 first names with counts by sex and by race/Hispanic origin.
    - The Census 2020 release (April–May 2026, `https://www2.census.gov/topics/genealogy/2020surnames/`) replaces the 2010 file, whose link failed. Its `.xlsx` files download by script; the `*_WithNegatives` variants (presumably the 2020 differential-privacy counts before negatives were removed; not yet checked against the Census notes) are not used.
    - **Planned combination** for first names by sex, year and heritage: SSA's year distribution times each name's heritage lift from Census 2020 (the name's race/Hispanic share over the population share). Surnames come from Census 2020 counts by heritage.
-4. ~~Perf budgets and baseline~~ **Decided 2026-09-30.**
-   - The founder approved the raised budgets: union, father and children at the 5 µs one-hop cap; world build at 2 s.
-   - Baselines are re-recorded once the founder sets the `performance` governor (`sudo cpupower frequency-set -g performance`, restore with `-g powersave`).
-   - Memory levers wait until a layer's benchmarks need them:
-     - tiny cells skip their stored shuffle;
-     - `FeistelPerm` stores only its used round keys (touches Phase 0 goldens).
-5. ~~DeepSeek key~~ **Decided 2026-09-30:** the founder has a key, with ~$2 of credit now and more to be added.
-   - It goes into the project's `.env`, which is git-ignored (`OPENAI_BASE_URL=https://api.deepseek.com`, `OPENAI_API_KEY=...`), when Phase 5 starts. Never paste it into chat or commit it.
+- **DeepSeek key (decided 2026-09-30):** the founder has a key, with ~$2 of credit now and more to be added.
+   - **Update 2026-10-04 (founder):** the key is stored in Cloudflare AI Gateway's BYOK ("bring your own key") section, not locally. Rendering calls go through the gateway's DeepSeek endpoint (`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/deepseek`), which injects the key; what goes in the git-ignored `.env` is the gateway URL (and a gateway token if the gateway is authenticated), never the DeepSeek key. Ask the founder for the account and gateway ids when the renderer is built. Never paste keys or tokens into chat or commit them.
+   - (Before: it was to go into `.env` as `OPENAI_BASE_URL=https://api.deepseek.com`, `OPENAI_API_KEY=...`.)
    - The spend guard (usage logging, running dollar total, cap) lands before the first paid call.
    - Top up to ~$10 before the pilot's main run.
+
 
 **Lessons from R1 (durable):**
 - **Constraints must stay local to the person drawn.** Conditioning a man's death on his partner's plan made 3.9% of deaths pay a two-block partner lookup. That tripled death's p99 and biased male e0 by up to 1.8 years. Before adding any constraint, ask which endpoint can evaluate it without a hop.
 - **Sequential scans are nearly free next to dependent misses.** An inverted per-offset index replaced `mother`'s ~120-leaf scan. It cut instructions 43%, left cycles unchanged and added 31 MB, so it was reverted. Hardware prefetch streams a scan; a search is a chain of dependent loads.
 - **Huge pages** (`MADV_COLLAPSE` over the heap) gave 10–20% on every lookup at 152 MB. That is worth having once the world lives in a few large arenas, but it is not a design lever.
-- **Measure changes under 10% with interleaved A/B runs** (`perf/ab.sh`, `examples/lookup_timing.rs`), not separate gate runs. Separate runs vary ~10%. In one case they showed a 13% "regression" in `father` that reversed when the run order was swapped.
+- **Measure changes under 10% with interleaved A/B runs** (`perf/ab.sh` with `examples/mono_report.rs`, or `perf/society_ab.py`), not separate gate runs. Separate runs vary ~10%. In one case they showed a 13% "regression" in `father` that reversed when the run order was swapped.
 - **A search and the read after it should touch one array.** Parallel arrays (starts in one, payload in another) cost two dependent misses; interleave them with a sentinel.
 - **Finer structure costs lookups even when memory stays flat.** R1c's exact-year classes made about six times as many cells.
   - Sub-cells nested inside cells doubled instructions.
@@ -872,7 +484,7 @@ Adding the service automatically: registers spaces on the right world, exposes v
   - Don't group columns to save memory if lookups must then scan the group.
 - **Largest remainder is biased on small partitions:** a one-member split always goes to the modal class. Use keyed systematic apportionment (`partition::apportion_systematic`) wherever cells can be small.
 - **Build-time work (2026-09-30):**
-  - **Prove refactors bit-identical with checksums**: a hash of the ledger's `Debug` output plus `examples/lookup_timing.rs`'s answer sum. All ten build changes passed this way, so no realism rerun was needed.
+  - **Prove refactors bit-identical with checksums** (today: `mono_report`'s answer hashes): in the ledger world, a hash of the ledger's `Debug` output plus the lookups' answer sum. All ten build changes passed this way, so no realism rerun was needed.
   - **pprof line attribution is unreliable for inlined code.** It blamed `trim` for 18% when timers showed 64 ms. Mark candidates `#[inline(never)]` temporarily, or time them.
   - **A search into another block's cells is a cache miss per step, even at build time.** Precompute cross-block facts in one pass instead.
   - **Parallel tasks run ~1.7× slower each on this laptop** (turbo drops, memory contention), even at 8 threads. Parallelism pays only where the work is large. Keep glibc allocations and frees on the same thread; cross-thread frees lock the owner's arena.
@@ -913,7 +525,7 @@ Found the same day by reading the derivations:
 - The individual attributes (personality, education level, job titles, languages, hobbies, working hours) are reasonable and reusable; relationships, time and the population model are what need redesigning.
 
 Found during Phase 0 (substrate-wide, not just `people`):
-- **Float results aren't reproducible across machines.** Rust documents `f64::ln`, `exp`, `sin`, `powf` and other transcendentals as non-deterministic: results can vary by platform, Rust version, and even between calls. `hash_gaussian`, `sampler::{lognormal, pareto, exponential}`, trajectories and `people` all use them, so a published seed may not rebuild the same world elsewhere.
+- **Float results aren't reproducible across machines.** Rust documents `f64::ln`, `exp`, `sin`, `powf` and other transcendentals as non-deterministic: results can vary by platform, Rust version, and even between calls. `hash_gaussian`, the old `sampler` and trajectories (since removed) and `people` all used them, so a published seed may not rebuild the same world elsewhere.
   - **Rule from now on:** transcendental math goes through `procedural_core::dmath`, which wraps the pinned pure-Rust `libm`, and is pinned by golden tests. Never call `f64::ln` and friends in substrate code.
   - Existing call sites migrate in Phase 0. See `docs/superpowers/research/2026-09-29-deterministic-numerics.md`.
 
@@ -929,91 +541,14 @@ Found during Phase 0 (substrate-wide, not just `people`):
 
 ---
 
-# procedural_core — Full Feature Reference
+# procedural_core — reference
 
-**Keep this file in context whenever building on `procedural_core`.** The crate offers far more than hash-derived attributes; anything using only `hash_int`/`hash_float` is using ~10% of the framework.
+**Keep this in context whenever building on `procedural_core`.** All math lives here (founder rule 1). Every function is a pure function of its inputs, with golden values and property tests; float math goes through `dmath` (pinned `libm`).
 
-## Layer 0 — Primitives (`word`, `bits`, `hash`, `sampler`, `trajectory`, `edge`)
+## Keys and hashes
 
-### `word::BitWord` (trait)
-Implemented by `u64` and `u128`. Bounds include `Hash` (so word values can key `HashMap`s, as a mutation overlay does). Methods: `BITS`, `extract_bits(offset, width) -> u64`, `insert_bits(offset, width, value) -> Self`, `from_hash_u64(h)`. **`extract_bits` panics if `width > 64`** — the framework returns u64 from extraction, so any single field wider than 64 bits is unreachable. Split such fields into `_lo: 64` + `_hi: ≤63` and reconstruct with raw shifts (see `internot_mail::messages::compose_message_id` for an example).
-
-### `bits::BitLayout<W>` — the structural id
-Carves an id into named bit fields (LSB-first, declaration order). **Fields you constrain narrowly via `where_eq` should be declared LAST** — last-declared varies fastest in find() enumeration.
-
-```rust
-let layout = BitLayout::new(vec![
-    ("entropy", 16), ("age_idx", 6), ("country_idx", 4), ("signup_offset", 5),
-])?;
-let id: u64 = layout.compose(&[("age_idx", 24), ("country_idx", 1), ...]);
-let age_idx = layout.extract(id, "age_idx");
-let extractor = layout.extractor("age_idx"); // Fn(W) -> u64, cheap clone
-```
-
-Introspection: `total_width()`, `has_field(name)`, `field_offset_width(name) -> Option<(u32, u32)>`, `field_names()`. `compose()` **silently masks** out-of-range values to a field's declared width — range-check before calling if oversize values would indicate a bug.
-
-### `hash::*` — deterministic value derivation
-- `hash_int(id, key, n) -> u64` in `[0, n)` (Lemire bounded, no modulo bias)
-- `hash_float(id, key) -> f64` in `[0.0, 1.0)`
-- `hash_vec(id, key, dims) -> Vec<f64>` — independent per-dim sub-keys
-- `hash_gaussian(id, key) -> f64` — N(0, 1) via Box-Muller (zero-alloc; uses two streamed sub-hashes with a fixed `__gauss` separator)
-
-### `sampler::*` — realistic distributions
-- `pareto(id, key, alpha, scale)` — power law (follower counts, org sizes)
-- `lognormal(id, key, mu, sigma)` — right-skewed (income, response times)
-- `exponential(id, key, rate)` — waiting times between events
-- `categorical(id, key, &[weights]) -> usize` — weighted choice, auto-normalizes
-
-### `trajectory::*` — time-varying values
-- `smooth(id, t, amplitude, timescale)` — value-noise in `[-amp, amp]`, smooth within timescale (mood, focus)
-- `oscillate(id, t, period, amplitude, phase)` — sine wave (activity cycles)
-- `step(id, t, &events, &magnitudes)` — piecewise-constant (discrete life events). `id` is unused — events fully determine the output. Events MUST be ascending; debug-asserts otherwise.
-
-`oscillate` also ignores `id`. To make oscillations vary per-entity, derive `phase` from `hash_float(id, key) * 2π` yourself.
-
-**Stability radii** (for temporal range queries — tells you how far you can step before value changes by ε):
-- `smooth_stability_radius(id, t, amp, ts, eps) -> Duration`
-- `oscillate_stability_radius(...)`, `step_stability_radius(...)`
-- `stability_radius_quadratic(abs_df, abs_d2f, eps)` — generic Taylor bound
-- `stability::min_of(&[&fn], id, t, eps)` — composition helper for `f = Σ f_i`. Splits ε evenly and returns the min δ across components (conservative; triangle-inequality safe).
-
-### `edge::*` — pairwise similarity / connection probability
-- `geometric(a, b, radius, soft)` — Euclidean; hard threshold or sigmoid
-- `cosine(a, b, threshold)` — cosine similarity, clamped to `[0, 1]` (negative cosine maps to 0); values below `threshold` also clamp to 0
-- `hyperbolic((r_a, θ_a), (r_b, θ_b), r_disk, temperature)` — Poincaré-disk model (realistic social graphs: scale-free, small-world, clustered)
-- `block(group_a, group_b, p_in, p_out)` — stochastic block model
-
-## Layer 0.5 — `graph` (NEW 2026-05-14)
-
-Framework primitives for social graphs. Domain-agnostic; consumers
-provide the ontology (what's a venue, what kinds of ties exist).
-
-- `graph::Tie` — edge struct (peer, kind, strength, since, last_contact).
-- `graph::canonical_pair(a, b)` — symmetric pair-keying for hash-based
-  procedural derivation.
-- `graph::pair_hash_float(a, b, key)` — symmetric pair-keyed hash.
-- `graph::VenueSpace` — cohort enumeration over a registered Space
-  (members_of / venues_of / role_of, with `Space::find()` pushdown).
-- `graph::TieStrengthProfile` + `graph::tie_strength(profile, t_days)` —
-  composable strength function (base floor + cohabit peak +
-  post-cohabit exponential decay).
-- `graph::PersonalityProjection` + `graph::CommIntensity` +
-  `graph::comm_intensity(strength, self_p, peer_p, t)` — per-mode
-  event rates (mail/chat/calendar) with diurnal + chronotype +
-  weekly modulation.
-- `graph::CommEvent` + `graph::enumerate_events(a, b, namespace, λ, t1, t2)` —
-  deterministic inhomogeneous-Poisson event enumeration via the
-  time-rescaling theorem + hash-derived exponential gaps. Symmetric
-  in `(a, b)`. v1 limitation: per-call event index resets at
-  `t_start`, so slicing the window does NOT recombine; documented
-  in `procedural_core/tests/graph_integration.rs::event_enumeration_slice_recombinability` (`#[ignore]`) and tracked for v2.
-- `graph::stable_roommates_match(cohort, pref)` — Irving's pairing,
-  gender-agnostic, symmetric in argument order by construction. v1
-  is a simple greedy proposing impl (not full rotation-elimination);
-  adequate for cohort sizes ≤ ~250.
-
-Spec: `docs/superpowers/specs/2026-05-14-social-graph-substrate.md` §5.
-Implementation plan: `docs/superpowers/plans/2026-05-14-phase-0-graph-primitives.md`.
+- `key::Key`: structured keys and counter-based uniforms (`with`, `with2`, `with3`, `unit`, `below`). The worlds draw everything through keys.
+- `hash::{hash_int, hash_float, hash_vec, hash_gaussian}`: hash-derived values of an id and a string key (xxh3), generic over `word::BitWord` (`u64`, `u128`, `U256`, `U512`).
 
 ## Layer 0.6 — Exact counts, fits and streams (Phase 0 and 2026-10-01)
 
@@ -1057,6 +592,7 @@ Every function here is a pure function of its inputs, with golden tests. Float m
 - `step_at_most` and `step_below`: piecewise-constant by inclusive or exclusive bounds.
 - `interval_value`: the value of the first interval containing x.
 - `first_above(lo, hi, f, v)`: the first integer where `f` exceeds `v`.
+- `inverse_decreasing(n, x(i), y(i), v)` (2026-10-04): where a piecewise-linear nonincreasing curve first falls to `v` (a survival curve's inverse, so a uniform `v` draws from it).
 
 **`life`: life tables and hazards.**
 - `survival(n, h)`: Π(1 − h).
@@ -1086,9 +622,42 @@ Every function here is a pure function of its inputs, with golden tests. Float m
 - `lazy_conditional(own, bound, required, draw, (k1, k2))`: an exact draw conditioned on a costly constraint, with a cheap first stage.
 
 **Small helpers.**
+- `perm::AffinePerm` (2026-10-03, the monotone world's class permutation): `r ↦ (a·r + b) mod n` with `a` the golden multiplier coprime to `n`.
+  - `fwd`/`inv` take 3–6 ns, and `inv_range` steps by one addition per element.
+  - `count(lo, hi, c, d)` (how many `r` in an interval map into an interval) is two floor sums; `select` is a bisection.
+  - `golden_pair(n)` gives `(a, a⁻¹)` once; store it and build with `from_pair` (no Euclid). `with_parts` takes an explicit `a`.
+- `life::HazardTable` (2026-10-03): a cumulative hazard tabulated at fixed ages (from a `Siler`), linear between, with an exact inverse (`age_at`, one binary search) and `conditional_death_age`. No Newton steps. `remaining_life(from)`: life expectancy past `from`, exact for the piecewise-exponential law (the monotone world's group scaling).
+- `fit::rake_columns_dense(row_total, q, targets, max_passes, tol)`: `rake_columns` over dense inputs, stopping at a tolerance; bit-identical to `rake_columns` for the passes it ran.
+- `lattice::RationalBeatty::count_member(n)`: count and membership with one division. `InterleaveTable` stores 16 bytes per internal node (lengths carried down the walk) and locates with one division per level.
+- `quantile` (2026-10-03, the speed pass): `OctaveTable` / `OctaveShape`, a monotone function of a tail probability `w = 1 − u` tabulated on geometric octaves of `w` (256 cells in the first octave, halving to 16 from the fifth), evaluated from the bits of `w` with one linear interpolation (no `ln`, no search), exactly monotone.
+  - `threshold(pass)` / `threshold_near(v, pass)`: the least float `w` whose value passes a monotone predicate, exact (a knot search, then a gallop from the inverted interpolation);
+  - `slot_w(ρ, n) = (2(n − ρ) − 1)/(2n)` and `count_from_threshold(n, w)`: exact counts of quantile slots on one side of a threshold;
+  - `OctaveShape::tabulate_into` fills tables of one shape in one arena.
+- `perm` additions (the speed pass): `CompactPerm4` (the compact Feistel network with 4 rounds; `CompactPermR<R>` is the family, `CompactPerm` is 6 rounds with its golden values unchanged); `rem_by_inverse` / `divmod_by_inverse` (division by a stored `⌊(2⁶⁴−1)/n⌋`, one correction); Feistel rounds below 2³⁰ fold mix64's first xorshift into the key (bit-identical); `AffinePerm::fwd`/`inv` use 64-bit arithmetic when the product fits.
+- `partition::SystematicShares::{offset, part_of_offset, end_of_offset}`: store a split's systematic offset instead of hashing its key per call.
 - `perm::least_cost_assignment(k ≤ 3, cost)`: the first-minimum permutation.
 - `stream::Epochs::keyed(start, span, key)`, with `index(t)` and `start(e)`: fixed epochs with a keyed phase.
-- `bits::ones(mask)`: the set-bit positions.
+
+**`lattice`: exact counts over lattice patterns.**
+- `floor_sum(n, m, a, b)`: `Σ⌊(a·i + b)/m⌋` in O(log) (Euclid on the line; 64-bit fast path, else 128-bit). It is how `AffinePerm::count` counts.
+- `RationalBeatty { t, len, tau }`: exactly `t` members of `len` positions, evenly spread, with `count`, `member`, `select` and the complement's `select_out`.
+- `ExactInterleave { categories, prefix, key }`: categories of integer sizes interleaved by a balanced tree of rational Beatty splits. Every category gets exactly its size, any prefix holds it within the tree depth of its share, and `locate`, `count` and `select` cost O(log categories). The monotone world lays out each wife cohort's husbands with it.
+
+**Further additions (2026-10-02, still in core):**
+- `partition`:
+  - `proportional_owner(j, c, m) = ⌊j·m/c⌋` and its dual `proportional_range(i, c, m)` (children choose mothers);
+  - `residue_count` / `residue_select`;
+  - `cyclic_next` / `cyclic_run_before`;
+  - `quantile_rank_count(n, f) = ⌈n·f − ½⌉`.
+- `curve`:
+  - `algebraic_sigmoid` and its inverse;
+  - `truncated_sigmoid_cdf` / `_inv`;
+  - `log_logistic_quantile`.
+- `life`:
+  - `Siler::{cumulative_hazard, age_at_cumulative_hazard, conditional_death_age, survival}`;
+  - `remaining_share(ever, cdf)`.
+- `pmf::band_quantile(bands, share, q, default)`.
+- `perm`: `staggered_blocks` / `StaggeredBlocks`, `PermShape`, `CompactPerm::shaped`, `SegmentedPerm` (built for the removed worlds; unused today).
 
 **`stream`: regeneration.**
 - `regen_state` is the single-level form (Phase 0).
@@ -1096,162 +665,11 @@ Every function here is a pure function of its inputs, with golden tests. Float m
 - `nested_regen_state(levels, t, last_before, initial(k, parent), draw(k, regen, key, parent), &mut out)` gives each level's state: the draw at its last regeneration, under the parent level's state.
 - Each costs one `last_before` per level, with no replay, and matches a full replay exactly (`stream::tests`).
 
-## Layer 1 — `Space<W>` (domain container)
-
-Holds a `BitLayout<W>` plus registered attributes, relations, and similarity contexts.
-
-```rust
-let mut space = Space::new("people", layout);
-space.attribute("personality_o", |id: u64| hash_float(id, "personality_o"))?;
-space.temporal_attribute("mood", |id, t: DateTime<Utc>| smooth(id, t, 1.0, Duration::hours(6)))?;
-space.indexable_attribute("age", "age_idx", |v: u64| 18 + v as u32)?;
-// Composite indexable: decoder reads its own field's bits PLUS the bits of
-// each shared dependency field (in declaration order). Lets one attribute's
-// value depend on multiple bit fields while every involved field stays
-// independently queryable.
-space.indexable_composite_attribute(
-    "first_name", "name_idx", &["country_idx"],
-    |own_bits, shared: &[u64]| names_for_country(shared[0])[own_bits as usize].to_string(),
-)?;
-space.cross_space_attribute("employer", |id, world: &World<u64>| { ... })?;
-space.cross_space_temporal_attribute("inbox_count", |id, t, world| { ... })?;
-```
-
-**Relations:**
-```rust
-space.relation("parents", Arity::Fixed(2), |id, _t, i| parent_id_for(id, i))?;
-// Note the lowercase `dynamic` helper — `Arity::Dynamic` directly takes
-// an `Arc<dyn Fn>` and won't accept a bare closure.
-space.relation("children", Arity::dynamic(|id, _t| num_children(id)), |id, t, i| ...)?;
-```
-
-**Contexts** (for similarity search):
-```rust
-use procedural_core::space::context::{ContextDim, Metric, Normalization};
-space.context("lifestyle", vec![
-    ContextDim { attribute: "age".into(),           weight: 1.0, normalize: Normalization::None },
-    ContextDim { attribute: "personality_o".into(), weight: 0.5, normalize: Normalization::None },
-], Metric::Euclidean)?;
-```
-
-`Metric` variants: `Cosine`, `Euclidean`, `Weighted` (alias for `Euclidean` — per-dim weights are applied upstream during vector build), `Hyperbolic` (**reserved — panics at `take()` in v0.1**). `Normalization` variants: only `None` is implemented.
-
-`Space::context()` validates at registration: dim attribute types must be numeric (`f64/f32/u8..u64/i8..i64/bool`) and `normalize` must be `Normalization::None`. Errors are typed (`SpaceError::UnsupportedDimType` / `UnsupportedNormalization`) — no `take()`-time panic for these cases. The `Hyperbolic` metric panic remains at `take()` time.
-
-**Introspection helpers:** `attribute_names() -> Vec<String>`, `relation_names()`, `context_names()`, `is_temporal(name) -> Option<bool>`, `attribute_type_id(name) -> Option<TypeId>` and `attribute_type_name(name) -> Option<&'static str>` (so external crates, such as a mutation overlay, can validate writes against the registered attribute type), `attribute_indexable_fields(name) -> Option<Vec<String>>` (own + deps for composites; empty Vec for non-indexable; `None` for unknown), `relation_arity_kind(name) -> Option<&'static str>` (`"fixed"` | `"dynamic"`).
-
-**Queries on a space:**
-- `space.entity(id, Some(t))` → `EntitySnapshot` with all attributes evaluated
-- `space.attribute_value<V>(id, name, Some(t))` → single attribute
-- `space.related(id, rel_name, t)` → iterator over relation members
-- `space.find()` → `Query<Unbounded>` (typestate builder)
-- `space.candidates(id, context_name)` → `CandidateQuery` (similarity)
-
-## Layer 2 — `World<W>` (cross-space container)
-
-```rust
-let mut world = World::new();
-world.register(people_space)?;
-world.register(companies_space)?;
-world.register_global("trending_topic", |t: DateTime<Utc>| topic_at(t))?;
-
-world.attribute_value::<Company>("people", id, "employer", Some(t))?;
-world.global::<String>("trending_topic", t)?;
-world.related("people", id, "coworkers", t)?;
-```
-
-## The Search Engine (`search::*`) — the real magic
-
-### `BitPattern` — compact set of ids via pinned+free bits
-```rust
-let pat = BitPattern::exact(value=24, width=6);      // matches one value
-let pat = BitPattern::any(width=6);                   // matches everything
-pat.matches(candidate) -> bool
-pat.cardinality(width) -> u64                         // 2^free_bits
-pat.enumerate(width) -> PatternEnumerator             // Iterator<Item = u64>
-```
-
-### `range_to_prefixes(lo, hi, bits) -> Vec<BitPattern>`
-Decomposes a closed numeric range into minimal bit-prefix patterns. Worst-case 2*bits patterns.
-
-### `minimize_patterns(&[values], width) -> Vec<BitPattern>`
-Quine-McCluskey minimization of a value set into patterns. `width ≤ 26`.
-
-### `Query<'a, W, State>` — typestate find() builder
-```rust
-let results = space.find()
-    .where_eq("age_idx", 24)                    // Unbounded → Bounded
-    .where_range("signup_offset", 10, 20)
-    .where_in("country_idx", &[1, 3, 5])
-    .filter_static("is_verified", |id| ...)     // post-enum filter
-    .filter_temporal("mood_happy", |id, t| ...) // needs .at(t)
-    .filter_exists_in_range("was_happy_this_week",
-        |id, t| smooth(id, t, 1.0, hours(6)),
-        Op::Gt, threshold=0.5, StabilityMode::BinarySearch { probes: 8 })
-    .at_any(start, end)                          // for *_in_range filters
-    .scan_budget(10_000)                         // cap
-    .execute();                                  // only on Bounded
-
-for id in results {
-    ...
-}
-results.termination()  // Pending | Exhaustive | Budgeted { evaluated }
-results.evaluated()     // candidates drawn so far
-```
-
-**`where_in` does NOT minimize.** It emits one `BitPattern::exact` per distinct value (Quine-McCluskey can produce overlapping prime implicants → duplicate IDs). Use `minimize_patterns(...)` directly + `BitPattern`s only when you can guarantee no overlap.
-
-**Panic conditions on `find()`:**
-- Unknown field name in `where_*` → panic.
-- Two predicates on the same field → panic ("v0.1 only supports one predicate per field").
-- Total free bits across all cursors ≥ 64 → panic at `execute()` ("query yields ≥ 2^64 candidates").
-- `filter_temporal` without `.at(t)`, or `filter_*_in_range` without `.at_any(start, end)`, or mixing `at` with `*_in_range` filters / `at_any` with `filter_temporal` → panic at `execute()`.
-- `at_any(start, end)` with `start >= end` → panic at `execute()`.
-
-### `Op` — threshold operator for temporal range filters
-`Lt | Le | Gt | Ge | Eq | Ne`. `op.check(value, threshold) -> bool`.
-
-### `StabilityMode<'a, W>` — temporal sweep strategy
-- `Analytic(Box<Fn(id, t, eps) -> Duration>)` — user-supplied δ
-- `BinarySearch { probes: usize }` — shrinking step (works on arbitrary functions, may miss oscillating satisfying instants)
-
-### `CandidateQuery<'a, W>` — similarity search
-```rust
-let results = space.candidates(id, "lifestyle")
-    .budget(1024)                  // candidates to draw (default 1024)
-    .envelope("country_idx")        // restrict to same country
-    .at(t)                          // time anchor
-    .min_score(0.5)
-    .take(10);                      // top-10 by score
-
-for (other_id, score) in results.hits { ... }
-results.evaluated, results.budget, results.total_considered
-```
-
-## Typical Patterns
-
-**Declaring a Space from scratch:**
-1. Design `BitLayout` — put narrowly-constrained attributes LAST.
-2. Register attributes; prefer `indexable_attribute` over `attribute` when the value lives in a bit field (enables pattern pushdown).
-3. Register relations for each kind of connection.
-4. Register contexts for similarity dimensions.
-
-**Efficient equality search:** `indexable_attribute` → `where_eq` → `BitPattern::exact` → `PatternEnumerator`. O(k) where k is results drawn, not O(|keyspace|).
-
-**Efficient range search:** `where_range(lo, hi)` → `range_to_prefixes` internally → union of `BitPattern`s.
-
-**Similarity search:** register a `context` with weighted dimensions → `CandidateQuery` draws candidates via pattern enumeration, scores via the metric, returns top-k.
-
-**Temporal window query:** `filter_exists_in_range` / `filter_forall_in_range` + `at_any(start, end)` + `StabilityMode`. The stability radius drives the sweep step — analytic form is tight; binary search is general.
-
 ## Design principles (don't violate)
 
 1. **Everything is a pure function of (id, key) or (id, key, t).** No state.
-2. **Bit-backed fields are free to filter on.** Hash-derived attributes require scan.
-3. **Put narrowly-constrained fields last in the layout.** Odometer iteration varies last-declared fastest.
-4. **Stability radii are how temporal ranges are efficient.** Don't sweep naively; use the radius or BinarySearch.
-5. **Cross-space attributes go through `World`**, never `Space` directly.
-6. **For mutation, keep the core read-only:** agent actions live in a session-scoped overlay, rebuilt when the first mutating service needs one (the old `procedural_overlay` crate is in git history). If the overlay allocates ids, the bit layout must reserve the top bit (`total_width() ≤ W::BITS - 1`) so session-allocated ids carry a sentinel.
+2. **Counts a search asks for must be closed form** (the monotone world's rules): couplings between index spaces preserve order, and at most one affine permutation acts inside a class.
+3. **For mutation, keep the core read-only:** agent actions live in a session-scoped overlay, rebuilt when the first mutating service needs one (the old `procedural_overlay` crate is in git history).
 
 ## Stage Manager paradigm (for consumer crates)
 
@@ -1268,7 +686,5 @@ When designing a new service crate's AVM + renderer, copy mail's pattern: typed 
 
 ## Known sharp edges
 
-- The search builder `panic`s on misuse (unknown field, duplicate-field predicate, anchor/filter mismatch); attribute / context / relation registration returns `Result`. Different error contracts in similar API positions — do not assume `find()` is `Result`-safe.
-- **`BitLayout::extract` and `BitLayout::compose` go through `u64`.** Declaring a single field wider than 64 bits succeeds at construction time but panics at `extract`. If you need a wider logical field (e.g., embedding a 96-bit thread_id inside a 127-bit message_id), split it into `_lo` (≤64) and `_hi` (≤63) and pack/unpack via raw `u128` shifts. `BitLayout::compose` also accepts only `u64` per field for the same reason.
-- `Metric::Hyperbolic` is registered cleanly but panics inside `candidates(...).take()` (v0.1). The other validation gaps (dim type, `Normalization`) are now caught at `Space::context()` registration.
-- The `EvalFn` dispatch ladder is open-coded in 5 places (`Space::entity`, `Space::attribute_value`, `World::entity`, `World::attribute_value`, `candidates::eval_attribute`). Adding a new variant means editing all five — easy to miss one.
+- `AffinePerm::new(n, key)` runs an extended Euclid near `n/φ` (Euclid's worst case for steps), about 70–270 ns. On hot paths, store `golden_pair(n)` per class and build with `AffinePerm::from_pair`.
+- `HazardTable` is linear in the cumulative hazard between knots (a piecewise-exponential law): close to its `Siler`, not bit-equal between knots.
